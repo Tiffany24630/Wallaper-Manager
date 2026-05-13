@@ -3,9 +3,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+
     container_name: wallpaper-manager-frontend
+
     ports:
       - "5173:5173"
+
     volumes:
       - ./frontend:/app
-      - /app/node_modules
+      - frontend_node_modules:/app/node_modules
+
+volumes:
+  frontend_node_modules:
