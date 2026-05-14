@@ -5,12 +5,12 @@ export default function HomePage() {
     <MainLayout>
       <div className="space-y-8">
         <div>
-          <h1 className="text-5xl font-bold tracking-tight">
-            Wallpaper Dashboard
+          <h1 className="text-6xl font-bold tracking-tight text-soft">
+            Lumina Dashboard
           </h1>
 
-          <p className="text-zinc-400 mt-3 text-lg">
-            Manage animated wallpapers, playlists and monitor rendering.
+          <p className="text-muted mt-4 text-lg">
+            Animated wallpapers, playlists and real-time rendering.
           </p>
         </div>
 
@@ -18,52 +18,66 @@ export default function HomePage() {
           <DashboardCard
             title="Wallpapers"
             value="24"
-            subtitle="Images and videos"
+            subtitle="Animated & Static"
           />
 
           <DashboardCard
             title="Playlists"
             value="5"
-            subtitle="Carousel collections"
+            subtitle="Carousel Collections"
           />
 
           <DashboardCard
-            title="Active Monitors"
+            title="Monitors"
             value="2"
-            subtitle="GPU accelerated"
+            subtitle="GPU Accelerated"
           />
         </div>
 
         <div className="grid grid-cols-2 gap-6">
-          <div className="bg-zinc-800 rounded-3xl p-6 border border-zinc-700">
+          <div className="rounded-[32px] p-6 bg-white/5 border border-white/10 backdrop-blur-xl">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-2xl font-semibold">
-                  Active Wallpaper
+                <h2 className="text-3xl font-semibold">
+                  Current Wallpaper
                 </h2>
 
-                <p className="text-zinc-400 mt-2">
-                  Cyberpunk City Loop
+                <p className="text-muted mt-2">
+                  Purple Sakura Lights
                 </p>
               </div>
 
-              <button className="bg-blue-600 hover:bg-blue-500 transition px-5 py-3 rounded-2xl">
+              <button className="px-6 py-3 rounded-2xl bg-primary hover:bg-secondary transition-all shadow-glow">
                 Change
               </button>
             </div>
 
-            <div className="mt-6 aspect-video rounded-2xl bg-gradient-to-br from-blue-600 to-purple-700" />
+            <div className="mt-6 rounded-[28px] overflow-hidden aspect-video bg-gradient-to-br from-primary via-secondary to-accent shadow-glow" />
           </div>
 
-          <div className="bg-zinc-800 rounded-3xl p-6 border border-zinc-700">
-            <h2 className="text-2xl font-semibold">
+          <div className="rounded-[32px] p-6 bg-white/5 border border-white/10 backdrop-blur-xl">
+            <h2 className="text-3xl font-semibold">
               Performance
             </h2>
 
-            <div className="mt-6 space-y-5">
-              <PerformanceBar label="CPU" value="24%" width="24%" />
-              <PerformanceBar label="GPU" value="51%" width="51%" />
-              <PerformanceBar label="RAM" value="37%" width="37%" />
+            <div className="mt-8 space-y-6">
+              <PerformanceBar
+                label="CPU"
+                value="24%"
+                width="24%"
+              />
+
+              <PerformanceBar
+                label="GPU"
+                value="58%"
+                width="58%"
+              />
+
+              <PerformanceBar
+                label="RAM"
+                value="37%"
+                width="37%"
+              />
             </div>
           </div>
         </div>
@@ -82,16 +96,16 @@ function DashboardCard({
   subtitle: string;
 }) {
   return (
-    <div className="bg-zinc-800 rounded-3xl p-6 border border-zinc-700 hover:border-blue-500 transition-all">
-      <p className="text-zinc-400 text-sm">
+    <div className="rounded-[32px] p-6 bg-white/5 border border-white/10 backdrop-blur-xl hover:scale-[1.02] hover:border-soft/40 transition-all duration-300">
+      <p className="text-muted">
         {title}
       </p>
 
-      <h2 className="text-5xl font-bold mt-4">
+      <h2 className="text-6xl font-bold mt-5 text-soft">
         {value}
       </h2>
 
-      <p className="text-zinc-500 mt-4">
+      <p className="mt-5 text-muted">
         {subtitle}
       </p>
     </div>
@@ -109,17 +123,19 @@ function PerformanceBar({
 }) {
   return (
     <div>
-      <div className="flex items-center justify-between mb-2">
-        <span>{label}</span>
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-lg">
+          {label}
+        </span>
 
-        <span className="text-zinc-400">
+        <span className="text-muted">
           {value}
         </span>
       </div>
 
-      <div className="h-3 rounded-full bg-zinc-700 overflow-hidden">
+      <div className="h-4 rounded-full bg-white/10 overflow-hidden">
         <div
-          className="h-full bg-blue-500 rounded-full"
+          className="h-full rounded-full bg-gradient-to-r from-primary via-secondary to-accent shadow-glow"
           style={{ width }}
         />
       </div>

@@ -16,13 +16,27 @@ body,
 }
 
 body {
-  background: #09090b;
-  color: white;
+  background:
+    radial-gradient(circle at top left, rgba(212, 167, 249, 0.15), transparent 25%),
+    radial-gradient(circle at bottom right, rgba(153, 123, 248, 0.12), transparent 25%),
+    #332063;
+
+  color: #fbdbfb;
+
   font-family: Inter, sans-serif;
+
   overflow: hidden;
 }
 
-a {
-  text-decoration: none;
-  color: inherit;
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #332063;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #7559cb;
+  border-radius: 999px;
 }

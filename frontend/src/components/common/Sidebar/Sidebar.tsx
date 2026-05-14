@@ -40,14 +40,14 @@ export default function Sidebar() {
   const location = useLocation();
 
   return (
-    <aside className="w-72 h-full bg-zinc-950 border-r border-zinc-800 p-6 flex flex-col">
+    <aside className="w-72 h-full bg-[#2A184F]/90 backdrop-blur-xl border-r border-white/10 p-6 flex flex-col">
       <div className="mb-10">
-        <h1 className="text-3xl font-bold tracking-tight">
-          Wallpaper
+        <h1 className="text-4xl font-bold tracking-tight text-soft">
+          Lumina
         </h1>
 
-        <p className="text-zinc-500 text-sm mt-1">
-          Desktop Manager
+        <p className="text-muted text-sm mt-2">
+          Wallpaper Manager
         </p>
       </div>
 
@@ -61,10 +61,10 @@ export default function Sidebar() {
             <Link
               key={link.to}
               to={link.to}
-              className={`flex items-center gap-4 px-4 py-3 rounded-2xl transition-all duration-200 ${
+              className={`flex items-center gap-4 px-5 py-4 rounded-3xl transition-all duration-300 ${
                 active
-                  ? "bg-blue-600 text-white shadow-lg"
-                  : "hover:bg-zinc-800 text-zinc-300"
+                  ? "bg-primary shadow-glow text-white"
+                  : "hover:bg-white/10 text-text"
               }`}
             >
               <Icon size={22} />
@@ -78,13 +78,19 @@ export default function Sidebar() {
       </nav>
 
       <div className="mt-auto">
-        <div className="bg-zinc-900 rounded-2xl p-4 border border-zinc-800">
-          <p className="text-sm text-zinc-400">
-            GPU Rendering Enabled
-          </p>
+        <div className="bg-white/5 border border-white/10 rounded-[28px] p-5 backdrop-blur-xl">
+          <div className="flex items-center justify-between">
+            <span className="text-sm text-muted">
+              GPU Rendering
+            </span>
 
-          <div className="mt-3 h-2 rounded-full bg-zinc-700 overflow-hidden">
-            <div className="w-4/5 h-full bg-blue-500 rounded-full" />
+            <span className="text-accent font-semibold">
+              ON
+            </span>
+          </div>
+
+          <div className="mt-4 h-3 rounded-full bg-white/10 overflow-hidden">
+            <div className="h-full w-[78%] bg-gradient-to-r from-primary to-accent rounded-full" />
           </div>
         </div>
       </div>
