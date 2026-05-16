@@ -1,71 +1,18 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+body {
+  background:
+    radial-gradient(circle at top left, rgba(149,99,222,.35), transparent 25%),
+    radial-gradient(circle at bottom right, rgba(212,167,249,.2), transparent 25%),
+    #140F2D;
+}
 
-:root {
-  --bg-main: #332063;
-  --bg-secondary: #4c4c9c;
-  --card-bg: rgba(255, 255, 255, 0.06);
-
-  --accent-primary: #7559cb;
-  --accent-secondary: #9563de;
-
-  --text-primary: #fbdbfb;
-  --text-secondary: #d4a7f9;
-
-  --border-color: rgba(255, 255, 255, 0.1);
+button {
+  cursor: pointer;
+  border: none;
 }
 
 * {
-  box-sizing: border-box;
-}
-
-html,
-body,
-#root {
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  padding: 0;
-}
-
-body {
-  overflow: hidden;
-
-  color: var(--text-primary);
-
-  font-family:
-    Inter,
-    system-ui,
-    sans-serif;
-
-  background:
-    radial-gradient(
-      circle at top left,
-      rgba(149, 99, 222, 0.3),
-      transparent 30%
-    ),
-    radial-gradient(
-      circle at bottom right,
-      rgba(212, 167, 249, 0.2),
-      transparent 25%
-    ),
-    linear-gradient(
-      135deg,
-      #332063,
-      #4c4c9c
-    );
-}
-
-::-webkit-scrollbar {
-  width: 10px;
-}
-
-::-webkit-scrollbar-thumb {
-  background: #7559cb;
-  border-radius: 999px;
-}
-
-::-webkit-scrollbar-track {
-  background: transparent;
+  transition:
+    background .25s ease,
+    border .25s ease,
+    transform .25s ease;
 }

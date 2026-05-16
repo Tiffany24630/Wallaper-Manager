@@ -1,4 +1,4 @@
-import { Activity, Image, List, Monitor, Zap, TrendingUp, Play, Clock, Star } from 'lucide-react';
+import { Activity, Image, List, Monitor, Zap, TrendingUp } from 'lucide-react';
 import { motion } from 'motion/react';
 
 const stats = [
@@ -16,19 +16,12 @@ const recentWallpapers = [
   { id: 5, url: 'https://images.unsplash.com/photo-1656188505561-19f1a1b6cda8?w=400', title: 'Gradient' },
 ];
 
-const quickActions = [
-  { icon: Image, label: 'Browse Library', color: 'from-purple-500 to-pink-500' },
-  { icon: Play, label: 'Start Playlist', color: 'from-blue-500 to-cyan-500' },
-  { icon: Zap, label: 'Optimize Performance', color: 'from-yellow-500 to-orange-500' },
-  { icon: Monitor, label: 'Multi-Monitor Setup', color: 'from-green-500 to-emerald-500' },
-];
-
-export default function Home() {
+export default function Dashboard() {
   return (
     <div className="space-y-8">
       <div>
-        <h1 className="text-4xl mb-2">Welcome back, John</h1>
-        <p className="text-[var(--text-secondary)]">Your desktop is looking great today</p>
+        <h1 className="text-4xl mb-2">Welcome back</h1>
+        <p className="text-[var(--text-secondary)]">Manage your desktop wallpapers with precision</p>
       </div>
 
       <div className="grid grid-cols-4 gap-6">
@@ -59,13 +52,7 @@ export default function Home() {
           background: 'linear-gradient(135deg, rgba(94, 58, 162, 0.4), rgba(117, 89, 203, 0.2))',
           border: '1px solid var(--border-color)',
         }}>
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-xl">Current Wallpaper</h3>
-            <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-green-500/20 border border-green-500/30">
-              <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
-              <span className="text-sm text-green-300">Active</span>
-            </div>
-          </div>
+          <h3 className="text-xl mb-4">Current Wallpaper</h3>
           <div className="relative aspect-video rounded-2xl overflow-hidden group">
             <img
               src="https://images.unsplash.com/photo-1656427833582-b276ee575f16?w=1200"
@@ -73,40 +60,15 @@ export default function Home() {
               className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
             />
             <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
-            <div className="absolute bottom-4 left-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-lg mb-1">Abstract Pattern</div>
-                  <div className="text-sm text-[var(--text-secondary)]">7680x4320 • 60 FPS • Video</div>
-                </div>
-                <button className="px-6 py-2 rounded-full bg-gradient-to-r from-[var(--accent-primary)] to-[var(--accent-secondary)] hover:shadow-lg hover:shadow-purple-500/50 transition-all">
-                  Change
-                </button>
-              </div>
-            </div>
           </div>
-          <div className="mt-4 grid grid-cols-3 gap-4">
-            <div className="p-3 rounded-xl bg-white/5 border border-[var(--border-color)]">
-              <div className="flex items-center gap-2 mb-1">
-                <Clock className="w-4 h-4 text-[var(--accent-primary)]" />
-                <span className="text-sm text-[var(--text-secondary)]">Uptime</span>
-              </div>
-              <div>3h 24m</div>
+          <div className="mt-4 flex items-center justify-between">
+            <div>
+              <div className="text-lg">Abstract Pattern</div>
+              <div className="text-sm text-[var(--text-secondary)]">7680x4320 • 60 FPS • Video</div>
             </div>
-            <div className="p-3 rounded-xl bg-white/5 border border-[var(--border-color)]">
-              <div className="flex items-center gap-2 mb-1">
-                <Zap className="w-4 h-4 text-yellow-400" />
-                <span className="text-sm text-[var(--text-secondary)]">FPS</span>
-              </div>
-              <div>60</div>
-            </div>
-            <div className="p-3 rounded-xl bg-white/5 border border-[var(--border-color)]">
-              <div className="flex items-center gap-2 mb-1">
-                <Star className="w-4 h-4 text-[var(--accent-primary)]" />
-                <span className="text-sm text-[var(--text-secondary)]">Rating</span>
-              </div>
-              <div>4.8/5</div>
-            </div>
+            <button className="px-6 py-2 rounded-full bg-gradient-to-r from-[var(--accent-primary)] to-[var(--accent-secondary)] hover:shadow-lg hover:shadow-purple-500/50 transition-all">
+              Change
+            </button>
           </div>
         </div>
 
@@ -160,42 +122,19 @@ export default function Home() {
             </div>
             <div className="space-y-3">
               <div className="flex justify-between text-sm">
+                <span className="text-[var(--text-secondary)]">FPS</span>
+                <span>60</span>
+              </div>
+              <div className="flex justify-between text-sm">
                 <span className="text-[var(--text-secondary)]">Resolution</span>
                 <span>4K</span>
               </div>
               <div className="flex justify-between text-sm">
-                <span className="text-[var(--text-secondary)]">Refresh Rate</span>
-                <span>144Hz</span>
-              </div>
-              <div className="flex justify-between text-sm">
-                <span className="text-[var(--text-secondary)]">Active Since</span>
-                <span>Today 9:42 AM</span>
+                <span className="text-[var(--text-secondary)]">Uptime</span>
+                <span>3h 24m</span>
               </div>
             </div>
           </div>
-        </div>
-      </div>
-
-      <div className="rounded-3xl p-6 backdrop-blur-xl" style={{
-        background: 'linear-gradient(135deg, rgba(94, 58, 162, 0.4), rgba(117, 89, 203, 0.2))',
-        border: '1px solid var(--border-color)',
-      }}>
-        <h3 className="text-xl mb-4">Quick Actions</h3>
-        <div className="grid grid-cols-4 gap-4">
-          {quickActions.map((action, index) => (
-            <motion.button
-              key={action.label}
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ delay: index * 0.05 }}
-              className="p-6 rounded-2xl bg-white/5 border border-[var(--border-color)] hover:bg-white/10 transition-all text-left group"
-            >
-              <div className={`w-12 h-12 rounded-xl bg-gradient-to-br ${action.color} flex items-center justify-center mb-3 group-hover:scale-110 transition-transform`}>
-                <action.icon className="w-6 h-6" />
-              </div>
-              <div className="text-sm">{action.label}</div>
-            </motion.button>
-          ))}
         </div>
       </div>
 
@@ -222,7 +161,7 @@ export default function Home() {
                 <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors duration-300" />
                 <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-300">
                   <div className="w-10 h-10 rounded-full bg-white/20 backdrop-blur-sm flex items-center justify-center">
-                    <Play className="w-5 h-5" />
+                    <Activity className="w-5 h-5" />
                   </div>
                 </div>
               </div>
