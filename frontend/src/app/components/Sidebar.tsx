@@ -3,8 +3,11 @@ import {
   Image,
   Activity,
   Settings,
-  MonitorPlay
+  MonitorPlay,
+  Monitor,
+  Sparkles
 } from "lucide-react";
+import heroImage from "../../assets/hero.png";
 
 const items = [
   {
@@ -34,29 +37,41 @@ export default function Sidebar() {
   return (
     <aside
       className="
-        w-[300px]
-        h-full
-        p-6
-        border-r
+        border-b
         border-white/10
-        backdrop-blur-xl
+        bg-slate-950/80
+        p-4
+        backdrop-blur-2xl
+        lg:flex
+        lg:h-full
+        lg:w-[264px]
+        lg:flex-col
+        lg:border-b-0
+        lg:border-r
+        lg:p-5
       "
-      style={{
-        background:
-          "linear-gradient(180deg, rgba(42,24,79,.95), rgba(20,15,45,.85))"
-      }}
     >
-      <div className="mb-10">
-        <h1 className="text-5xl font-bold tracking-tight">
-          Lumina
-        </h1>
+      <div className="flex items-center gap-3 lg:mb-7">
+        <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-cyan-300/20 bg-cyan-300/10">
+          <img
+            src={heroImage}
+            alt=""
+            className="h-8 w-8 object-contain"
+          />
+        </div>
 
-        <p className="text-[#D4A7F9] mt-2">
-          Wallpaper Manager
-        </p>
+        <div className="min-w-0">
+          <h1 className="truncate text-xl font-semibold tracking-normal text-white">
+            Lumina
+          </h1>
+
+          <p className="truncate text-xs text-slate-400">
+            Wallpaper Manager
+          </p>
+        </div>
       </div>
 
-      <nav className="space-y-4">
+      <nav className="mt-4 flex gap-2 overflow-x-auto pb-1 lg:mt-0 lg:flex-col lg:overflow-visible lg:pb-0">
         {items.map((item) => {
           const Icon = item.icon;
 
@@ -64,26 +79,29 @@ export default function Sidebar() {
             <button
               key={item.label}
               className={`
-                w-full
                 flex
+                min-w-max
                 items-center
-                gap-4
-                px-5
-                py-4
-                rounded-3xl
-                transition-all
-                duration-300
+                gap-3
+                rounded-lg
+                border
+                px-3
+                py-2.5
+                text-sm
+                transition
+                duration-200
+                lg:w-full
 
                 ${
                   item.active
-                    ? "bg-[#7559CB] shadow-2xl"
-                    : "bg-white/5 hover:bg-white/10"
+                    ? "border-cyan-300/30 bg-cyan-300/15 text-cyan-50 shadow-glow"
+                    : "border-transparent text-slate-400 hover:border-white/10 hover:bg-white/[0.06] hover:text-slate-100"
                 }
               `}
             >
-              <Icon size={24} />
+              <Icon size={19} />
 
-              <span className="text-lg">
+              <span>
                 {item.label}
               </span>
             </button>
@@ -91,31 +109,47 @@ export default function Sidebar() {
         })}
       </nav>
 
-      <div className="mt-10">
+      <div className="mt-auto hidden space-y-3 lg:block">
+        <div className="rounded-lg border border-white/10 bg-white/[0.04] p-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-400/10 text-emerald-300">
+              <Monitor size={18} />
+            </div>
+
+            <div>
+              <p className="text-sm font-medium text-white">
+                3 displays
+              </p>
+
+              <p className="text-xs text-slate-400">
+                Synced at 144 Hz
+              </p>
+            </div>
+          </div>
+        </div>
+
         <div
           className="
-            rounded-[32px]
-            p-6
+            rounded-lg
             border
             border-white/10
+            bg-white/[0.04]
+            p-4
           "
-          style={{
-            background:
-              "linear-gradient(135deg, rgba(94,58,162,.45), rgba(117,89,203,.15))"
-          }}
         >
           <div className="flex items-center justify-between">
-            <span className="text-[#D4A7F9]">
+            <span className="flex items-center gap-2 text-sm text-slate-400">
+              <Sparkles size={16} className="text-amber-300" />
               GPU Rendering
             </span>
 
-            <span className="text-[#FBDBFB] font-semibold">
+            <span className="text-sm font-semibold text-emerald-300">
               Active
             </span>
           </div>
 
-          <div className="mt-5 h-3 bg-white/10 rounded-full overflow-hidden">
-            <div className="w-[78%] h-full bg-gradient-to-r from-[#9563DE] to-[#D4A7F9]" />
+          <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-800">
+            <div className="h-full w-[78%] rounded-full bg-gradient-to-r from-cyan-300 via-emerald-300 to-amber-300" />
           </div>
         </div>
       </div>

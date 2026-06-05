@@ -1,18 +1,59 @@
+@import "./fonts.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --app-bg: #080b13;
+  --app-panel: rgba(15, 23, 42, 0.78);
+  --app-panel-strong: rgba(17, 24, 39, 0.92);
+  --app-border: rgba(148, 163, 184, 0.18);
+  --app-muted: #94a3b8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
 body {
+  margin: 0;
   background:
-    radial-gradient(circle at top left, rgba(149,99,222,.35), transparent 25%),
-    radial-gradient(circle at bottom right, rgba(212,167,249,.2), transparent 25%),
-    #140F2D;
+    linear-gradient(135deg, #080b13 0%, #101827 42%, #16172a 72%, #07131d 100%);
+  color: #f8fafc;
+  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  text-rendering: geometricPrecision;
+}
+
+button,
+input {
+  font: inherit;
 }
 
 button {
   cursor: pointer;
-  border: none;
+  border: 0;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid rgba(34, 211, 238, 0.85);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: rgba(34, 211, 238, 0.28);
+  color: #f8fafc;
 }
 
 * {
-  transition:
-    background .25s ease,
-    border .25s ease,
-    transform .25s ease;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(34, 211, 238, 0.45) rgba(15, 23, 42, 0.6);
 }
