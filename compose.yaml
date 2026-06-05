@@ -7,7 +7,7 @@ services:
     container_name: wallpaper-manager-frontend
 
     ports:
-      - "5173:5173"
+      - "5174:5174"
 
     volumes:
       - ./frontend:/app
