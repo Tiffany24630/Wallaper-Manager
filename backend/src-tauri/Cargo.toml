@@ -1,8 +1,8 @@
 [package]
-name = "tauri-app"
+name = "wallpaper-manager-backend"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Lumina wallpaper manager desktop backend"
+authors = ["Tiffa"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -22,13 +22,6 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.52.3", features = ["full"] }
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite"] }
-anyhow = "1.0.102"
-thiserror = "2.0.18"
-image = "0.25.10"
-opencv = "0.98.2"
-uuid = "1.23.1"
-tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }

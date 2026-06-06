@@ -1,7 +1,26 @@
-# Tauri + Vanilla
+# Lumina Backend
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Javascript.
+Backend de escritorio para Wallaper Manager construido con Tauri 2.
 
-## Recommended IDE Setup
+## Funcionalidad
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+- Escanea `backend/wallpapers/images`, `videos` y `animated`.
+- Importa archivos locales a la biblioteca.
+- Guarda favoritos y wallpaper activo en `backend/config/state.json`.
+- Aplica imagenes estaticas al escritorio en Windows.
+
+## Comandos Tauri
+
+- `get_backend_status`
+- `list_wallpapers`
+- `import_wallpaper`
+- `set_active_wallpaper`
+- `toggle_favorite`
+
+## Desarrollo
+
+Ejecuta desde `backend/src-tauri`:
+
+```bash
+cargo run
+```
