@@ -4,7 +4,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::Manager;
 
@@ -45,10 +45,49 @@ struct BackendStatus {
     cache_root: String,
     log_root: String,
     total_wallpapers: usize,
+    total_playlists: usize,
     active_wallpaper: Option<Wallpaper>,
     uptime_seconds: u64,
     supported_images: Vec<&'static str>,
     supported_videos: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Playlist {
+    id: String,
+    name: String,
+    wallpaper_ids: Vec<String>,
+    created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(rename_all = "camelCase")]
+struct AppSettings {
+    launch_at_startup: bool,
+    minimize_to_tray: bool,
+    hardware_acceleration: bool,
+    pause_on_battery: bool,
+    pause_when_maximized: bool,
+    fps_limit: u16,
+    quality: String,
+    scaling_mode: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            launch_at_startup: false,
+            minimize_to_tray: true,
+            hardware_acceleration: true,
+            pause_on_battery: true,
+            pause_when_maximized: false,
+            fps_limit: 60,
+            quality: "Ultra".to_string(),
+            scaling_mode: "Fill".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +104,8 @@ struct StoredConfig {
     active_wallpaper_id: Option<String>,
     favorites: Vec<String>,
     last_imported_path: Option<String>,
+    playlists: Vec<Playlist>,
+    settings: AppSettings,
 }
 
 struct RuntimeState {
@@ -204,6 +245,128 @@ fn toggle_favorite(
         .ok_or_else(|| "Wallpaper not found.".to_string())
 }
 
+#[tauri::command]
+fn list_playlists(state: tauri::State<'_, RuntimeState>) -> Result<Vec<Playlist>, String> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| "Config lock poisoned".to_string())?;
+    Ok(config.playlists.clone())
+}
+
+#[tauri::command]
+fn create_playlist(
+    name: String,
+    state: tauri::State<'_, RuntimeState>,
+) -> Result<Playlist, String> {
+    let backend_root = backend_root();
+    ensure_directories(&backend_root)?;
+
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Playlist name cannot be empty.".to_string());
+    }
+
+    let mut config = state
+        .config
+        .lock()
+        .map_err(|_| "Config lock poisoned".to_string())?;
+    let playlist = Playlist {
+        id: playlist_id(name),
+        name: name.to_string(),
+        wallpaper_ids: Vec::new(),
+        created_at: unix_timestamp(),
+    };
+
+    config.playlists.push(playlist.clone());
+    save_config(&backend_root, &config)?;
+
+    Ok(playlist)
+}
+
+#[tauri::command]
+fn delete_playlist(
+    playlist_id: String,
+    state: tauri::State<'_, RuntimeState>,
+) -> Result<Vec<Playlist>, String> {
+    let backend_root = backend_root();
+    ensure_directories(&backend_root)?;
+
+    let mut config = state
+        .config
+        .lock()
+        .map_err(|_| "Config lock poisoned".to_string())?;
+    let initial_len = config.playlists.len();
+    config.playlists.retain(|playlist| playlist.id != playlist_id);
+
+    if config.playlists.len() == initial_len {
+        return Err("Playlist not found.".to_string());
+    }
+
+    save_config(&backend_root, &config)?;
+    Ok(config.playlists.clone())
+}
+
+#[tauri::command]
+fn add_wallpaper_to_playlist(
+    playlist_id: String,
+    wallpaper_id: String,
+    state: tauri::State<'_, RuntimeState>,
+) -> Result<Playlist, String> {
+    let backend_root = backend_root();
+    ensure_directories(&backend_root)?;
+
+    let mut config = state
+        .config
+        .lock()
+        .map_err(|_| "Config lock poisoned".to_string())?;
+    let wallpapers = scan_wallpapers(&backend_root, &config)?;
+
+    if !wallpapers.iter().any(|wallpaper| wallpaper.id == wallpaper_id) {
+        return Err("Wallpaper not found.".to_string());
+    }
+
+    let playlist = config
+        .playlists
+        .iter_mut()
+        .find(|playlist| playlist.id == playlist_id)
+        .ok_or_else(|| "Playlist not found.".to_string())?;
+
+    if !playlist.wallpaper_ids.contains(&wallpaper_id) {
+        playlist.wallpaper_ids.push(wallpaper_id);
+    }
+
+    let playlist = playlist.clone();
+    save_config(&backend_root, &config)?;
+    Ok(playlist)
+}
+
+#[tauri::command]
+fn get_settings(state: tauri::State<'_, RuntimeState>) -> Result<AppSettings, String> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| "Config lock poisoned".to_string())?;
+    Ok(config.settings.clone())
+}
+
+#[tauri::command]
+fn save_settings(
+    settings: AppSettings,
+    state: tauri::State<'_, RuntimeState>,
+) -> Result<AppSettings, String> {
+    let backend_root = backend_root();
+    ensure_directories(&backend_root)?;
+
+    let mut config = state
+        .config
+        .lock()
+        .map_err(|_| "Config lock poisoned".to_string())?;
+    config.settings = settings;
+    save_config(&backend_root, &config)?;
+    Ok(config.settings.clone())
+}
+
 fn build_status(
     backend_root: &Path,
     uptime_seconds: u64,
@@ -224,6 +387,7 @@ fn build_status(
         cache_root: path_to_string(&backend_root.join("cache")),
         log_root: path_to_string(&backend_root.join("logs")),
         total_wallpapers: wallpapers.len(),
+        total_playlists: config.playlists.len(),
         active_wallpaper,
         uptime_seconds,
         supported_images: IMAGE_EXTENSIONS.to_vec(),
@@ -470,6 +634,32 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
+fn playlist_id(name: &str) -> String {
+    let slug = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    format!("{}-{}", slug, unix_timestamp())
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
 fn to_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -530,7 +720,13 @@ pub fn run() {
             list_wallpapers,
             import_wallpaper,
             set_active_wallpaper,
-            toggle_favorite
+            toggle_favorite,
+            list_playlists,
+            create_playlist,
+            delete_playlist,
+            add_wallpaper_to_playlist,
+            get_settings,
+            save_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

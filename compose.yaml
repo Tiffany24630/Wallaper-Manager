@@ -15,6 +15,33 @@ services:
 
     stdin_open: true
     tty: true
+  backend:
+    build:
+      context: ./backend/api
+      dockerfile: Dockerfile
+    container_name: wallpaper-manager-backend
+    depends_on:
+      - db
+    ports:
+      - "4000:4000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/wallpaper_manager
+    volumes:
+      - ./backend/database:/usr/src/app/../database
+      - backend_uploads:/tmp/uploads
+
+  db:
+    image: postgres:16-alpine
+    container_name: wallpaper-manager-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wallpaper_manager
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - db_data:/var/lib/postgresql/data
 
 volumes:
   frontend_node_modules:
+  backend_uploads:
+  db_data:
