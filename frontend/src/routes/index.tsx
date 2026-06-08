@@ -1,19 +1,48 @@
-import { Routes, Route } from "react-router-dom";
+import {createBrowserRouter,} from "react-router-dom";
+import MainLayout from "../layouts/MainLayout/MainLayout";
+import Dashboard from "../pages/Dashboard/Dashboard";
+import Library from "../pages/Library/Library";
+import MultiMonitor from "../pages/MultiMonitor/MultiMonitor";
+import Settings from "../pages/Settings/Settings";
+import Playlists from "../pages/Playlists/Playlists";
+import Performance from "../pages/Performance/Performance";
 
-import HomePage from "../pages/Home/Home";
-import LibraryPage from "../pages/Library/Library";
-import SettingsPage from "../pages/Settings/Settings";
-import PlaylistsPage from "../pages/Playlists/Playlists";
-import PerformancePage from "../pages/Performance/Performance";
+export const router =
+  createBrowserRouter([
+    {
+      path: "/",
+      element: <MainLayout />,
 
-export function AppRouter() {
-  return (
-    <Routes>
-      <Route path="/" element={<HomePage />} />
-      <Route path="/library" element={<LibraryPage />} />
-      <Route path="/playlists" element={<PlaylistsPage />} />
-      <Route path="/settings" element={<SettingsPage />} />
-      <Route path="/performance" element={<PerformancePage />} />
-    </Routes>
-  );
-}
+      children: [
+        {
+          index: true,
+          element: <Dashboard />,
+        },
+
+        {
+          path: "library",
+          element: <Library />,
+        },
+
+        {
+          path: "monitors",
+          element: <MultiMonitor />,
+        },
+
+        {
+          path: "settings",
+          element: <Settings />,
+        },
+
+        {
+          path: "playlists",
+          element: <Playlists />,
+        },
+
+        {
+          path: "performance",
+          element: <Performance />,
+        },
+      ],
+    },
+  ]);

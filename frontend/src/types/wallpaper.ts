@@ -5,5 +5,6 @@ export interface Wallpaper {
   thumbnail?: string;
   favorite: boolean;
   active: boolean;
+  sizeBytes?: number;
   createdAt?: string;
 }

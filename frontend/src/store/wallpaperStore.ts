@@ -12,6 +12,7 @@ interface WallpaperState {
   toggleFavorite: (id: string) => Promise<void>;
   importWallpaper: (path: string) => Promise<void>;
   deleteWallpaper: (id: string) => Promise<void>;
+  selectAndImportWallpaper: () => Promise<void>;
 }
 
 export const useWallpaperStore = create<WallpaperState>((set) => ({
@@ -60,5 +61,21 @@ export const useWallpaperStore = create<WallpaperState>((set) => ({
     await wallpaperService.deleteWallpaper(id);
     const wallpapers = await wallpaperService.getAll();
     set({ wallpapers });
+  },
+
+  selectAndImportWallpaper: async () => {
+    const file =
+      await wallpaperService.selectWallpaperFile();
+
+    if (!file) return;
+
+    await wallpaperService.importWallpaper(file);
+
+    const wallpapers =
+      await wallpaperService.getAll();
+
+    set({
+      wallpapers,
+    });
   },
 }));

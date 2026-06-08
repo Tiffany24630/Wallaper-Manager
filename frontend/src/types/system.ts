@@ -6,4 +6,7 @@ export interface SystemInfo {
   usedStorage: number;
   osName: string;
   hostname: string;
+  uptime: number;
+  wallpaperCount: number;
+  activeWallpaper?: string;
 }

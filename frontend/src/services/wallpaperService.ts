@@ -1,5 +1,6 @@
 import { tauriInvoke } from "./tauri";
 import type { Wallpaper } from "../types/wallpaper";
+import { open } from "@tauri-apps/plugin-dialog";
 
 export const wallpaperService = {
   async getAll(): Promise<Wallpaper[]> {
@@ -28,5 +29,26 @@ export const wallpaperService = {
     return tauriInvoke("delete_wallpaper", {
       wallpaperId: id,
     });
+  },
+
+  async selectWallpaperFile(): Promise<string | null> {
+    const file = await open({
+      multiple: false,
+
+      filters: [
+        {
+          name: "Images",
+          extensions: [
+            "jpg",
+            "jpeg",
+            "png",
+            "webp",
+            "bmp"
+          ],
+        },
+      ],
+    });
+
+    return file as string | null;
   },
 };
