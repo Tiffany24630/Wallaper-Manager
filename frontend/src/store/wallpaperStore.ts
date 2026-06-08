@@ -1,13 +1,64 @@
 import { create } from "zustand";
+import type { Wallpaper } from "../types/wallpaper";
+import { wallpaperService } from "../services/wallpaperService";
 
 interface WallpaperState {
-  currentWallpaper: string | null;
-  setWallpaper: (path: string) => void;
+  wallpapers: Wallpaper[];
+  loading: boolean;
+  error: string | null;
+
+  loadWallpapers: () => Promise<void>;
+  setActive: (id: string) => Promise<void>;
+  toggleFavorite: (id: string) => Promise<void>;
+  importWallpaper: (path: string) => Promise<void>;
+  deleteWallpaper: (id: string) => Promise<void>;
 }
 
 export const useWallpaperStore = create<WallpaperState>((set) => ({
-  currentWallpaper: null,
+  wallpapers: [],
+  loading: false,
+  error: null,
 
-  setWallpaper: (path) =>
-    set({ currentWallpaper: path })
+  loadWallpapers: async () => {
+    try {
+      set({ loading: true });
+
+      const wallpapers = await wallpaperService.getAll();
+
+      set({
+        wallpapers,
+        loading: false,
+        error: null,
+      });
+    } catch (error) {
+      set({
+        loading: false,
+        error: String(error),
+      });
+    }
+  },
+
+  setActive: async (id) => {
+    await wallpaperService.setActive(id);
+    const wallpapers = await wallpaperService.getAll();
+    set({ wallpapers });
+  },
+
+  toggleFavorite: async (id) => {
+    await wallpaperService.toggleFavorite(id);
+    const wallpapers = await wallpaperService.getAll();
+    set({ wallpapers });
+  },
+
+  importWallpaper: async (path) => {
+    await wallpaperService.importWallpaper(path);
+    const wallpapers = await wallpaperService.getAll();
+    set({ wallpapers });
+  },
+
+  deleteWallpaper: async (id) => {
+    await wallpaperService.deleteWallpaper(id);
+    const wallpapers = await wallpaperService.getAll();
+    set({ wallpapers });
+  },
 }));
