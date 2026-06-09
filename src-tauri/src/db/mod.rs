@@ -24,6 +24,12 @@ pub fn get_connection() -> Result<Connection> {
             pause_when_maximized INTEGER DEFAULT 1,
             scaling_mode TEXT DEFAULT 'fill'
         );
+
+        CREATE TABLE IF NOT EXISTS playlists(
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         ",
     )?;
 
