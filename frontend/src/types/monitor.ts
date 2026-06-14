@@ -5,4 +5,5 @@ export interface Monitor {
   height: number;
   refreshRate: number;
   primary: boolean;
+  wallpaperId?: string;
 }

@@ -8,72 +8,111 @@ interface WallpaperState {
   error: string | null;
 
   loadWallpapers: () => Promise<void>;
+  refresh: () => Promise<void>;
   setActive: (id: string) => Promise<void>;
   toggleFavorite: (id: string) => Promise<void>;
   importWallpaper: (path: string) => Promise<void>;
-  deleteWallpaper: (id: string) => Promise<void>;
   selectAndImportWallpaper: () => Promise<void>;
+  deleteWallpaper: (id: string) => Promise<void>;
+  scanFolder: () => Promise<void>;
+  rotateWallpaper: () => Promise<void>;
+  assignWallpaperToMonitor: (monitorId: string, wallpaperId: string) => Promise<void>;
 }
 
-export const useWallpaperStore = create<WallpaperState>((set) => ({
-  wallpapers: [],
-  loading: false,
-  error: null,
+export const useWallpaperStore =
+  create<WallpaperState>((set) => ({
+    wallpapers: [],
+    loading: false,
+    error: null,
 
-  loadWallpapers: async () => {
-    try {
-      set({ loading: true });
+    refresh: async () => {
+      try {
+        const wallpapers = await wallpaperService.getAll();
 
+        set({
+          wallpapers,
+          error: null,
+        });
+      } catch (error) {
+        set({
+          error: String(error),
+        });
+      }
+    },
+
+    loadWallpapers: async () => {
+      try {
+        set({
+          loading: true,
+          error: null,
+        });
+
+        const wallpapers = await wallpaperService.getAll();
+
+        set({
+          wallpapers,
+          loading: false,
+        });
+      } catch (error) {
+        set({
+          loading: false,
+          error: String(error),
+        });
+      }
+    },
+
+    setActive: async (id) => {
+      await wallpaperService.setActive(id);
       const wallpapers = await wallpaperService.getAll();
+      set({ wallpapers });
+    },
 
-      set({
-        wallpapers,
-        loading: false,
-        error: null,
-      });
-    } catch (error) {
-      set({
-        loading: false,
-        error: String(error),
-      });
-    }
-  },
+    toggleFavorite: async (id) => {
+      await wallpaperService.toggleFavorite(id);
+      const wallpapers = await wallpaperService.getAll();
+      set({ wallpapers });
+    },
 
-  setActive: async (id) => {
-    await wallpaperService.setActive(id);
-    const wallpapers = await wallpaperService.getAll();
-    set({ wallpapers });
-  },
+    importWallpaper: async (path) => {
+      await wallpaperService.importWallpaper(path);
+      const wallpapers = await wallpaperService.getAll();
+      set({ wallpapers });
+    },
 
-  toggleFavorite: async (id) => {
-    await wallpaperService.toggleFavorite(id);
-    const wallpapers = await wallpaperService.getAll();
-    set({ wallpapers });
-  },
+    selectAndImportWallpaper: async () => {
+      const file = await wallpaperService.selectWallpaperFile();
 
-  importWallpaper: async (path) => {
-    await wallpaperService.importWallpaper(path);
-    const wallpapers = await wallpaperService.getAll();
-    set({ wallpapers });
-  },
+      if (!file) return;
 
-  deleteWallpaper: async (id) => {
-    await wallpaperService.deleteWallpaper(id);
-    const wallpapers = await wallpaperService.getAll();
-    set({ wallpapers });
-  },
+      await wallpaperService.importWallpaper(file);
+      const wallpapers = await wallpaperService.getAll();
+      set({ wallpapers });
+    },
 
-  selectAndImportWallpaper: async () => {
-    const file = await wallpaperService.selectWallpaperFile();
+    deleteWallpaper: async (id) => {
+      await wallpaperService.deleteWallpaper(id);
+      const wallpapers = await wallpaperService.getAll();
+      set({ wallpapers });
+    },
 
-    if (!file) return;
+    scanFolder: async () => {
+      await wallpaperService.scanFolder();
+      const wallpapers = await wallpaperService.getAll();
+      set({ wallpapers });
+    },
 
-    await wallpaperService.importWallpaper(file);
+    rotateWallpaper: async () => {
+      await wallpaperService.rotateWallpaper();
+      const wallpapers = await wallpaperService.getAll();
+      set({ wallpapers });
+    },
 
-    const wallpapers = await wallpaperService.getAll();
-
-    set({
-      wallpapers,
-    });
-  },
-}));
+    assignWallpaperToMonitor: async (
+      monitorId,
+      wallpaperId
+    ) => {
+      await wallpaperService.assignWallpaperToMonitor(monitorId, wallpaperId);
+      const wallpapers = await wallpaperService.getAll();
+      set({ wallpapers });
+    },
+  }));

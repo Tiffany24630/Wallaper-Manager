@@ -257,10 +257,40 @@ pub fn rotate_wallpaper()
     }
 
     use rand::seq::SliceRandom;
-
     let random = ids.choose(&mut rand::thread_rng()).unwrap();
-
     set_active_wallpaper(random.clone())?;
-    
     Ok(())
+}
+
+#[tauri::command]
+pub fn upscale_wallpaper(
+    wallpaper_id: String,
+) -> Result<String, String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+
+    let source_path: String =
+        conn.query_row(
+            "
+            SELECT path
+            FROM wallpapers
+            WHERE id = ?1
+            ",
+            [wallpaper_id],
+            |row| row.get(0)
+        )
+        .map_err(|e| e.to_string())?;
+
+    let output_path = source_path.replace(".jpg", "_upscaled.jpg",);
+    
+    let status =
+        std::process::Command::new("resources/realesrgan/realesrgan-ncnn-vulkan.exe")
+        .args(["-i", &source_path, "-o", &output_path,]).status().map_err(|e| e.to_string())?;
+
+    if !status.success() {
+        return Err(
+            "Upscaling failed".into()
+        );
+    }
+
+    Ok(output_path)
 }

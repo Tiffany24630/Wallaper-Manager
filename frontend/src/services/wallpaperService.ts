@@ -1,6 +1,7 @@
 import { tauriInvoke } from "./tauri";
 import type { Wallpaper } from "../types/wallpaper";
 import { open } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 
 export const wallpaperService = {
   async getAll(): Promise<Wallpaper[]> {
@@ -48,7 +49,41 @@ export const wallpaperService = {
         },
       ],
     });
-
     return file as string | null;
+  },
+
+  async upscaleWallpaper(wallpaperId: string) {
+    return invoke(
+      "upscale_wallpaper",
+      {
+        wallpaperId,
+      }
+    );
+  },
+
+  async scanFolder(): Promise<void> {
+    return tauriInvoke(
+      "scan_wallpaper_folder"
+    );
+  },
+
+  async rotateWallpaper(): Promise<void> {
+    return tauriInvoke(
+      "rotate_wallpaper"
+    );
+  },
+
+  async assignWallpaperToMonitor(
+    monitorId: string,
+    wallpaperId: string
+  ): Promise<void> {
+
+    return tauriInvoke(
+      "assign_wallpaper_to_monitor",
+      {
+        monitorId,
+        wallpaperId,
+      }
+    );
   },
 };

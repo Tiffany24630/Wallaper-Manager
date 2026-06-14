@@ -1,60 +1,90 @@
 import { create } from "zustand";
+
 import type { Playlist } from "../types/playlist";
+
 import { playlistService } from "../services/playlistService";
 
 interface PlaylistState {
   playlists: Playlist[];
   loading: boolean;
-  error: string | null;  
-  
+  error: string | null;
+
   loadPlaylists: () => Promise<void>;
   createPlaylist: (name: string) => Promise<void>;
   deletePlaylist: (id: string) => Promise<void>;
 }
 
-export const usePlaylistStore = create<PlaylistState>((set) => ({
-  playlists: [],
-  loading: false,
-  error: null,
+export const usePlaylistStore =
+  create<PlaylistState>((set) => ({
+    playlists: [],
+    loading: false,
+    error: null,
 
-  loadPlaylists: async () => {
-    try {
-      set({
-        loading: true,
-      });
+    loadPlaylists: async () => {
+      try {
+        set({
+          loading: true,
+        });
 
-      const playlists = await playlistService.getAll();
+        const playlists = await playlistService.getAll();
 
-      set({
-        playlists,
-        loading: false,
-        error: null,
-      });
-    } catch (error) {
-      set({
-        loading: false,
-        error: String(error),
-      });
-    }
-  },
+        set({
+          playlists,
+          loading: false,
+          error: null,
+        });
 
-  createPlaylist: async (name) => {
-    await playlistService.create(name);
+      } catch (error) {
+        set({
+          loading: false,
+          error: String(error),
+        });
+      }
+    },
 
-    const playlists = await playlistService.getAll();
+    createPlaylist: async (name) => {
+      try {
+        set({
+          loading: true,
+        });
 
-    set({
-      playlists,
-    });
-  },
+        await playlistService.create(name);
+        const playlists = await playlistService.getAll();
 
-  deletePlaylist: async (id) => {
-    await playlistService.delete(id);
+        set({
+          playlists,
+          loading: false,
+          error: null,
+        });
 
-    const playlists = await playlistService.getAll();
+      } catch (error) {
+        set({
+          loading: false,
+          error: String(error),
+        });
+      }
+    },
 
-    set({
-      playlists,
-    });
-  },
-}));
+    deletePlaylist: async (id) => {
+      try {
+        set({
+          loading: true,
+        });
+
+        await playlistService.delete(id);
+        const playlists = await playlistService.getAll();
+
+        set({
+          playlists,
+          loading: false,
+          error: null,
+        });
+        
+      } catch (error) {
+        set({
+          loading: false,
+          error: String(error),
+        });
+      }
+    },
+  }));
