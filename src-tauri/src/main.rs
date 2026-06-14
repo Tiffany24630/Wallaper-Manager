@@ -28,6 +28,8 @@ fn main() {
                 get_playlists,
                 create_playlist,
                 delete_playlist,
+                scan_wallpaper_folder,
+                assign_wallpaper_to_monitor,
             ]
         )
         .run(tauri::generate_context!(),).expect("error");

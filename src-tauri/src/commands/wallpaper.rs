@@ -55,12 +55,39 @@ pub fn import_wallpaper(
         return Err("File not found".into());
     }
 
-    fs::create_dir_all("../wallpapers").map_err(|e| e.to_string())?;
-    let id = Uuid::new_v4().to_string();
-    let file_name = source.file_name().unwrap().to_string_lossy();
-    let destination = format!("../wallpapers/{}", file_name);
-    fs::copy(source, &destination).map_err(|e| e.to_string())?;
+    fs::create_dir_all("../wallpapers/originals").map_err(|e| e.to_string())?;
+    fs::create_dir_all("../wallpapers/thumbnails").map_err(|e| e.to_string())?;
+
+    let hash = file_hash(&source_path)?;
     let conn = get_connection().map_err(|e| e.to_string())?;
+
+    let exists: i64 = conn
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM wallpapers
+            WHERE hash=?1
+            ",
+            [hash.clone()],
+            |row| row.get(0)
+        )
+        .unwrap_or(0);
+
+    if exists > 0 {
+        return Err("Wallpaper already imported".into());
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let extension = source.extension().unwrap().to_string_lossy();
+    let original_path = format!("../wallpapers/originals/{}.{}", id, extension);
+
+    fs::copy(source, &original_path).map_err(|e| e.to_string())?;
+
+    let thumbnail_path = format!("../wallpapers/thumbnails/{}.jpg", id);
+
+    generate_thumbnail(&original_path, &thumbnail_path)?;
+
+    let metadata = fs::metadata(&original_path).map_err(|e| e.to_string())?;
 
     conn.execute(
         "
@@ -68,16 +95,30 @@ pub fn import_wallpaper(
             id,
             name,
             path,
+            thumbnail,
+            size_bytes,
+            hash,
             created_at
         )
-        VALUES(?1, ?2, ?3, ?4)
+        VALUES(
+            ?1,
+            ?2,
+            ?3,
+            ?4,
+            ?5,
+            ?6,
+            ?7
+        )
         ",
         (
             id,
-            file_name.to_string(),
-            destination,
+            source.file_name().unwrap().to_string_lossy().to_string(),
+            original_path,
+            thumbnail_path,
+            metadata.len(),
+            hash,
             Utc::now().to_rfc3339(),
-        ),
+        )
     )
     .map_err(|e| e.to_string())?;
 
@@ -174,5 +215,23 @@ pub fn delete_wallpaper(
     )
     .map_err(|e| e.to_string())?;
 
+    Ok(())
+}
+
+#[tauri::command]
+pub fn scan_wallpaper_folder()
+-> Result<(), String> {
+    use walkdir::WalkDir;
+
+    for entry in WalkDir::new(
+        "../wallpapers/import"
+    ) {
+        let entry = entry.map_err(|e| e.to_string())?;
+
+        if entry.path().is_file() {
+            let path = entry.path().to_string_lossy().to_string();
+            let _ = import_wallpaper(path);
+        }
+    }
     Ok(())
 }

@@ -31,6 +31,29 @@ pub fn get_monitors(
             primary: is_primary,
         });
     }
-
     Ok(monitors)
+}
+
+#[tauri::command]
+pub fn assign_wallpaper_to_monitor(
+    monitor_id: String,
+    wallpaper_id: String,
+) -> Result<(), String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "
+        INSERT OR REPLACE
+        INTO monitor_wallpapers(
+            monitor_id,
+            wallpaper_id
+        )
+        VALUES(?1,?2)
+        ",
+        (
+            monitor_id,
+            wallpaper_id
+        )
+    ).map_err(|e| e.to_string())?;
+    Ok(())
 }

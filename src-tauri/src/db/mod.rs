@@ -7,22 +7,28 @@ pub fn get_connection() -> Result<Connection> {
         "
         CREATE TABLE IF NOT EXISTS wallpapers(
             id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            path TEXT NOT NULL,
-            thumbnail TEXT,
-            favorite INTEGER DEFAULT 0,
-            active INTEGER DEFAULT 0,
-            created_at TEXT
-        );
 
-        CREATE TABLE IF NOT EXISTS settings(
-            id INTEGER PRIMARY KEY,
-            launch_at_startup INTEGER DEFAULT 0,
-            minimize_to_tray INTEGER DEFAULT 1,
-            hardware_acceleration INTEGER DEFAULT 1,
-            pause_on_battery INTEGER DEFAULT 0,
-            pause_when_maximized INTEGER DEFAULT 1,
-            scaling_mode TEXT DEFAULT 'fill'
+            name TEXT NOT NULL,
+
+            path TEXT NOT NULL UNIQUE,
+
+            thumbnail TEXT,
+
+            favorite INTEGER DEFAULT 0,
+
+            active INTEGER DEFAULT 0,
+
+            width INTEGER,
+
+            height INTEGER,
+
+            size_bytes INTEGER,
+
+            file_type TEXT,
+
+            hash TEXT UNIQUE,
+
+            created_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS playlists(
@@ -30,9 +36,29 @@ pub fn get_connection() -> Result<Connection> {
             name TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
-        ",
-    )?;
 
+        CREATE TABLE IF NOT EXISTS monitor_wallpapers(
+            monitor_id TEXT PRIMARY KEY,
+            wallpaper_id TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS settings(
+            id INTEGER PRIMARY KEY,
+
+            launch_at_startup INTEGER DEFAULT 0,
+
+            minimize_to_tray INTEGER DEFAULT 1,
+
+            hardware_acceleration INTEGER DEFAULT 1,
+
+            pause_on_battery INTEGER DEFAULT 0,
+
+            pause_when_maximized INTEGER DEFAULT 1,
+
+            scaling_mode TEXT DEFAULT 'fill'
+        );
+        "
+    )?;
     Ok(conn)
 }
 
