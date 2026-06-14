@@ -64,15 +64,13 @@ export const useWallpaperStore = create<WallpaperState>((set) => ({
   },
 
   selectAndImportWallpaper: async () => {
-    const file =
-      await wallpaperService.selectWallpaperFile();
+    const file = await wallpaperService.selectWallpaperFile();
 
     if (!file) return;
 
     await wallpaperService.importWallpaper(file);
 
-    const wallpapers =
-      await wallpaperService.getAll();
+    const wallpapers = await wallpaperService.getAll();
 
     set({
       wallpapers,

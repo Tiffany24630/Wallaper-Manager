@@ -15,6 +15,20 @@ export default function Library() {
     selectAndImportWallpaper,
   } = useWallpaperStore();
 
+  const onDrop = async (
+    e: React.DragEvent
+  ) => {
+    e.preventDefault();
+
+    const file = e.dataTransfer.files[0];
+
+    if (!file) return;
+
+    await importWallpaper(
+      file.path
+    );
+  };
+
   useEffect(() => {
     loadWallpapers();
   }, []);
@@ -53,6 +67,11 @@ export default function Library() {
       >
         Importar wallpaper
       </button>
+
+      <div
+        onDrop={onDrop}
+        onDragOver={(e)=>e.preventDefault()}
+      ></div>
 
       {wallpapers.length === 0 ? (
         <div

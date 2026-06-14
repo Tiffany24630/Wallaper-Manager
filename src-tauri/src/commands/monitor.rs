@@ -27,7 +27,10 @@ pub fn get_monitors(
             name: monitor.name().unwrap_or_default(),
             width: monitor.size().width,
             height: monitor.size().height,
-            refresh_rate: 60,
+            refresh_rate:
+                monitor.refresh_rate_millihertz()
+                    .unwrap_or(60000)
+                    / 1000,
             primary: is_primary,
         });
     }

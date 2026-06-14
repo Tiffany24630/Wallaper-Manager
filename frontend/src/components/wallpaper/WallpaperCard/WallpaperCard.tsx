@@ -3,11 +3,8 @@ import type { Wallpaper } from "../../../types/wallpaper";
 
 interface Props {
   wallpaper: Wallpaper;
-
   onActivate: (id: string) => void;
-
   onFavorite: (id: string) => void;
-
   onDelete: (id: string) => void;
 }
 

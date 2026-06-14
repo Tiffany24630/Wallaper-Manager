@@ -235,3 +235,32 @@ pub fn scan_wallpaper_folder()
     }
     Ok(())
 }
+
+#[tauri::command]
+pub fn rotate_wallpaper()
+-> Result<(), String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+
+    let mut stmt =
+        conn.prepare(
+            "
+            SELECT id
+            FROM wallpapers
+            "
+        ).map_err(|e| e.to_string())?;
+
+    let wallpapers = stmt.query_map([], |row| {row.get::<_, String>(0)}).map_err(|e| e.to_string())?;
+    let ids: Vec<String> = wallpapers.filter_map(Result::ok).collect();
+
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    use rand::seq::SliceRandom;
+
+    let random = ids.choose(&mut rand::thread_rng()).unwrap();
+
+    set_active_wallpaper(random.clone())?;
+    
+    Ok(())
+}

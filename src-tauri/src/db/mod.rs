@@ -57,6 +57,14 @@ pub fn get_connection() -> Result<Connection> {
 
             scaling_mode TEXT DEFAULT 'fill'
         );
+
+        CREATE TABLE wallpaper_scheduler(
+            id INTEGER PRIMARY KEY,
+
+            enabled INTEGER,
+
+            interval_minutes INTEGER
+        );
         "
     )?;
     Ok(conn)

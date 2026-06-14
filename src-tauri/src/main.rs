@@ -32,5 +32,6 @@ fn main() {
                 assign_wallpaper_to_monitor,
             ]
         )
+        .plugin(tauri_plugin_dialog::init())
         .run(tauri::generate_context!(),).expect("error");
 }
