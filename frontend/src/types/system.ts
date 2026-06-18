@@ -17,10 +17,14 @@ export interface GpuInfo {
 }
 
 export interface SystemInfo {
-  os: string;
+  cpuUsage: number;
+  totalMemory: number;
+  usedMemory: number;
+  totalStorage: number;
+  usedStorage: number;
+  osName: string;
   hostname: string;
   uptime: number;
-  cpu: CpuInfo;
-  memory: MemoryInfo;
-  gpu: GpuInfo[];
+  wallpaperCount: number;
+  activeWallpaper?: string;
 }

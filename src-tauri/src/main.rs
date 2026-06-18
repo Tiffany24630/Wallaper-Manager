@@ -30,6 +30,8 @@ fn main() {
                 delete_playlist,
                 scan_wallpaper_folder,
                 assign_wallpaper_to_monitor,
+                rotate_wallpaper,
+                upscale_wallpaper,
             ]
         )
         .plugin(tauri_plugin_dialog::init())

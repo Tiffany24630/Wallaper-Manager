@@ -12,6 +12,8 @@ interface PlaylistState {
   loadPlaylists: () => Promise<void>;
   createPlaylist: (name: string) => Promise<void>;
   deletePlaylist: (id: string) => Promise<void>;
+  addWallpaperToPlaylist: (playlistId: string, wallpaperId: string) => Promise<void>;
+  getPlaylistWallpapers: (playlistId: string) => Promise<string[]>;
 }
 
 export const usePlaylistStore =
@@ -85,6 +87,29 @@ export const usePlaylistStore =
           loading: false,
           error: String(error),
         });
+      }
+    },
+
+    addWallpaperToPlaylist: async (playlistId, wallpaperId) => {
+      try {
+        await playlistService.addWallpaper(playlistId, wallpaperId);
+        const playlists = await playlistService.getAll();
+        set({ playlists });
+      } catch (error) {
+        set({
+          error: String(error),
+        });
+      }
+    },
+
+    getPlaylistWallpapers: async (playlistId) => {
+      try {
+        return await playlistService.getPlaylistWallpapers(playlistId);
+      } catch (error) {
+        set({
+          error: String(error),
+        });
+        return [];
       }
     },
   }));

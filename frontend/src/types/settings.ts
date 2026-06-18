@@ -1,11 +1,8 @@
 export interface Settings {
-  id: string;
-  startWithWindows: boolean;
-  autoRotate: boolean;
-  rotationIntervalMinutes: number;
-  minimizeToTray: boolean;
-  pauseOnBattery: boolean;
-  pauseOnFullscreen: boolean;
-  createdAt: string;
-  updatedAt: string;
+  launch_at_startup: boolean;
+  minimize_to_tray: boolean;
+  hardware_acceleration: boolean;
+  pause_on_battery: boolean;
+  pause_when_maximized: boolean;
+  scaling_mode: string;
 }

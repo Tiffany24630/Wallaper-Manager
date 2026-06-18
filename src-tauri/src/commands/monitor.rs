@@ -1,14 +1,5 @@
 use serde::Serialize;
-
-#[derive(Serialize)]
-pub struct MonitorInfo {
-    pub id: String,
-    pub name: String,
-    pub width: u32,
-    pub height: u32,
-    pub refresh_rate: u32,
-    pub primary: bool,
-}
+use crate::db::get_connection;
 
 #[tauri::command]
 pub fn get_monitors(
@@ -58,28 +49,5 @@ pub fn assign_wallpaper_to_monitor(
             wallpaper_id
         )
     ).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn apply_monitor_wallpaper(
-    monitor_id: String,
-    wallpaper_id: String,
-) -> Result<(), String> {
-    let conn = get_connection().map_err(|e| e.to_string())?;
-
-    let wallpaper_path: String =
-        conn.query_row(
-            "
-            SELECT path
-            FROM wallpapers
-            WHERE id = ?1
-            ",
-            [wallpaper_id],
-            |row| row.get(0)
-        ).map_err(|e| e.to_string())?;
-
-    set_monitor_wallpaper(&monitor_id, &wallpaper_path,).map_err(|e| e.to_string())?;
-    
     Ok(())
 }

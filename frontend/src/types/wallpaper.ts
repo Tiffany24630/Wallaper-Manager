@@ -1,12 +1,10 @@
 export interface Wallpaper {
   id: string;
-  title: string;
+  name: string;
   path: string;
-  relativePath: string;
-  kind: string;
-  sizeBytes: number;
-  active: boolean;
+  thumbnail?: string;
   favorite: boolean;
-  canApplyToDesktop: boolean;
-  createdAt: string;
+  active: boolean;
+  sizeBytes?: number;
+  createdAt?: string;
 }

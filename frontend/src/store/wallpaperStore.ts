@@ -16,6 +16,7 @@ interface WallpaperState {
   deleteWallpaper: (id: string) => Promise<void>;
   scanFolder: () => Promise<void>;
   rotateWallpaper: () => Promise<void>;
+  upscaleWallpaper: (id: string) => Promise<string>;
   assignWallpaperToMonitor: (monitorId: string, wallpaperId: string) => Promise<void>;
 }
 
@@ -38,6 +39,10 @@ export const useWallpaperStore =
           error: String(error),
         });
       }
+    },
+
+    upscaleWallpaper: async (id) => {
+      return await wallpaperService.upscaleWallpaper(id);
     },
 
     loadWallpapers: async () => {
@@ -107,10 +112,7 @@ export const useWallpaperStore =
       set({ wallpapers });
     },
 
-    assignWallpaperToMonitor: async (
-      monitorId,
-      wallpaperId
-    ) => {
+    assignWallpaperToMonitor: async (monitorId, wallpaperId) => {
       await wallpaperService.assignWallpaperToMonitor(monitorId, wallpaperId);
       const wallpapers = await wallpaperService.getAll();
       set({ wallpapers });

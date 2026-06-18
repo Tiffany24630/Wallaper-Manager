@@ -17,4 +17,17 @@ export const playlistService = {
       playlistId: id,
     });
   },
+
+  addWallpaper(playlistId: string, wallpaperId: string): Promise<void> {
+    return tauriInvoke("add_wallpaper_to_playlist", {
+      playlistId,
+      wallpaperId,
+    });
+  },
+
+  getPlaylistWallpapers(playlistId: string): Promise<string[]> {
+    return tauriInvoke<string[]>("get_playlist_wallpapers", {
+      playlistId,
+    });
+  },
 };

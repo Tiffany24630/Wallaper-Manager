@@ -24,9 +24,7 @@ export default function Library() {
 
     if (!file) return;
 
-    await importWallpaper(
-      file.path
-    );
+    await selectAndImportWallpaper();
   };
 
   useEffect(() => {
@@ -50,63 +48,65 @@ export default function Library() {
   }
 
   return (
-    <div className="flex items-center justify-between mb-8">
-      <h1 className="text-3xl font-bold">
-        Biblioteca
-      </h1>
+    <div className="p-6 space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-3xl font-bold">
+          Biblioteca
+        </h1>
 
-      <button
-        onClick={selectAndImportWallpaper}
-        className="
-          px-4
-          py-2
-          rounded-lg
-          bg-cyan-600
-          hover:bg-cyan-700
-        "
-      >
-        Importar wallpaper
-      </button>
-
-      <div
-        onDrop={onDrop}
-        onDragOver={(e)=>e.preventDefault()}
-      ></div>
-
-      {wallpapers.length === 0 ? (
-        <div
+        <button
+          onClick={selectAndImportWallpaper}
           className="
-            border
-            border-dashed
-            border-zinc-700
-            rounded-xl
-            p-10
-            text-center
+            px-4
+            py-2
+            rounded-lg
+            bg-cyan-600
+            hover:bg-cyan-700
           "
         >
-          No hay wallpapers registrados.
-        </div>
-      ) : (
+          Importar wallpaper
+        </button>
+
         <div
-          className="
-            grid
-            grid-cols-1
-            md:grid-cols-2
-            xl:grid-cols-3
-            gap-6
-          "
-        >
-          {wallpapers.map((wallpaper) => (
-            <WallpaperCard
-              key={wallpaper.id}
-              wallpaper={wallpaper}
-              onActivate={setActive}
-              onFavorite={toggleFavorite}
-              onDelete={deleteWallpaper}
-            />
-          ))}
-        </div>
-      )}
+          onDrop={onDrop}
+          onDragOver={(e)=>e.preventDefault()}
+        ></div>
+
+        {wallpapers.length === 0 ? (
+          <div
+            className="
+              border
+              border-dashed
+              border-zinc-700
+              rounded-xl
+              p-10
+              text-center
+            "
+          >
+            No hay wallpapers registrados.
+          </div>
+        ) : (
+          <div
+            className="
+              grid
+              grid-cols-1
+              md:grid-cols-2
+              xl:grid-cols-3
+              gap-6
+            "
+          >
+            {wallpapers.map((wallpaper) => (
+              <WallpaperCard
+                key={wallpaper.id}
+                wallpaper={wallpaper}
+                onActivate={setActive}
+                onFavorite={toggleFavorite}
+                onDelete={deleteWallpaper}
+              />
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
