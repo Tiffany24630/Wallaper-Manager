@@ -55,7 +55,7 @@ pub fn get_system_info() -> Result<SystemInfo, String> {
         .ok();
 
     Ok(SystemInfo {
-        cpu_usage: system.global_cpu_usage(),
+        cpu_usage: system.global_cpu_info().cpu_usage(),
         total_memory: system.total_memory(),
         used_memory: system.used_memory(),
         total_storage,

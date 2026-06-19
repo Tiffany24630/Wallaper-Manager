@@ -4,7 +4,6 @@ use chrono::Utc;
 use uuid::Uuid;
 use crate::db::get_connection;
 use crate::models::wallpaper::Wallpaper;
-use tauri::api::path::resource_dir;
 
 #[tauri::command]
 pub fn list_wallpapers() -> Result<Vec<Wallpaper>, String> {
@@ -281,11 +280,11 @@ pub fn upscale_wallpaper(
         )
         .map_err(|e| e.to_string())?;
 
-    let output_path = format!("{}_upscaled.jpg", source_path);
-        
-    let status =
-        std::process::Command::new("resources/realesrgan/realesrgan-ncnn-vulkan.exe")
-        .args(["-i", &source_path, "-o", &output_path,]).status().map_err(|e| e.to_string())?;
+    let source = Path::new(&source_path);
+    let stem = source.file_stem().unwrap().to_string_lossy();
+    let output_path = source.with_file_name(format!("{}_upscaled.jpg", stem)).to_string_lossy().to_string();
+    let exe_path = std::env::current_dir().map_err(|e| e.to_string())?.join("resources").join("realesrgan").join("realesrgan-ncnn-vulkan.exe");
+    let status = std::process::Command::new(&exe_path).args(["-i", &source_path, "-o", &output_path, "-n", "realesrgan-x4plus",]).status().map_err(|e| e.to_string())?;
 
     if !status.success() {
         return Err(

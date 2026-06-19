@@ -1,5 +1,7 @@
 use serde::Serialize;
 use crate::db::get_connection;
+use crate::models::monitor::MonitorInfo;
+use tauri::Manager;
 
 #[tauri::command]
 pub fn get_monitors(

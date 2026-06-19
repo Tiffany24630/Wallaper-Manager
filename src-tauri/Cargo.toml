@@ -1,5 +1,10 @@
+[package]
+name = "lumina"
+version = "0.1.0"
+edition = "2021"
+
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 serde = { version = "1", features = ["derive"] }
 tauri-plugin-opener = "2"
 walkdir = "2.5"
@@ -9,9 +14,11 @@ uuid = { version = "1", features = ["v4"] }
 sysinfo = "0.30"
 wallpaper = "3"
 image = "0.25"
-walkdir = "2"
 sha2 = "0.10"
 tauri-plugin-dialog = "2"
 rand = "0.8"
 windows = "0.58"
 chrono = { version = "0.4", features = ["serde"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
