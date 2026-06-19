@@ -6,6 +6,7 @@ interface SettingsState {
   settings: Settings | null;
   loading: boolean;
   error: string | null;
+  
   loadSettings: () => Promise<void>;
   saveSettings: (settings: Settings) => Promise<void>;
 }

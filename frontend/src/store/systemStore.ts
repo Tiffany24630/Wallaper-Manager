@@ -2,6 +2,8 @@ import { create } from "zustand";
 import type {SystemInfo} from "../types/system";
 import {systemService} from "../services/systemService";
 
+let pollingId: ReturnType<typeof setInterval> | null = null;
+
 interface SystemState {
   systemInfo: SystemInfo | null;
   loading: boolean;
@@ -9,6 +11,7 @@ interface SystemState {
 
   refresh: () => Promise<void>;
   startPolling: () => void;
+  stopPolling: () => void;
 }
 
 export const useSystemStore =
@@ -40,10 +43,21 @@ export const useSystemStore =
     },
 
     startPolling: () => {
+      if (pollingId)
+        return;
+
       get().refresh();
 
-      setInterval(() => {
-        get().refresh();
-      }, 5000);
+      pollingId = setInterval(() => {
+          get().refresh();
+        }, 5000);
+    },
+
+    stopPolling: () => {
+      if (pollingId) {
+        clearInterval(pollingId);
+
+        pollingId = null;
+      }
     },
 }));

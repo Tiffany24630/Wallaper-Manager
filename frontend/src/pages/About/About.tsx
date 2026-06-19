@@ -1,5 +1,5 @@
 import { Sparkles, Zap, Shield, Heart, Github, Twitter, Globe, Star } from 'lucide-react';
-import { motion } from 'motion/react';
+import { motion } from "framer-motion";
 
 const features = [
   { icon: Zap, title: 'High Performance', description: 'GPU-accelerated rendering for smooth 4K/8K wallpapers at 144+ FPS' },
@@ -44,7 +44,7 @@ export default function About() {
       <div className="grid grid-cols-4 gap-6">
         {features.map((feature, index) => (
           <motion.div
-            key={feature.name}
+            key={feature.title}
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: index * 0.1 }}

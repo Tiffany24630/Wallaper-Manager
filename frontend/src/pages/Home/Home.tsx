@@ -1,5 +1,7 @@
 import { Activity, Image, List, Monitor, Zap, TrendingUp, Play, Clock, Star } from 'lucide-react';
-import { motion } from 'motion/react';
+import { motion } from "framer-motion";
+import { useEffect } from "react";
+import { useSystemStore } from "../../store/systemStore";
 
 const stats = [
   { label: 'Wallpapers', value: '1,247', icon: Image, color: 'from-purple-500 to-pink-500' },
@@ -24,6 +26,16 @@ const quickActions = [
 ];
 
 export default function Home() {
+  const {startPolling, stopPolling,} = useSystemStore();
+
+  useEffect(() => {
+    startPolling();
+
+    return () => {
+      stopPolling();
+    };
+  }, []);
+
   return (
     <div className="space-y-8">
       <div>

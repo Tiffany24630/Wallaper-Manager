@@ -1,5 +1,5 @@
 import { Sparkles, Zap, Image as ImageIcon, ArrowRight, Settings } from 'lucide-react';
-import { motion } from 'motion/react';
+import { motion } from "framer-motion";
 import { useState } from 'react';
 
 export default function AIUpscaling() {

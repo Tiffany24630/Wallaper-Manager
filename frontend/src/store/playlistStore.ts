@@ -1,7 +1,5 @@
 import { create } from "zustand";
-
 import type { Playlist } from "../types/playlist";
-
 import { playlistService } from "../services/playlistService";
 
 interface PlaylistState {

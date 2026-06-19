@@ -1,9 +1,34 @@
 import { Settings as SettingsIcon, Palette, Cpu, Volume2, Sparkles, Zap } from 'lucide-react';
-import { motion } from 'motion/react';
-import { useState } from 'react';
+import { motion } from "framer-motion";
+import { useEffect, useState } from 'react';
+import { useWallpaperStore } from "../../store/wallpaperStore";
 
 export default function Settings() {
   const [activeTab, setActiveTab] = useState('general');
+  const {wallpapers, loadWallpapers, upscaleWallpaper} = useWallpaperStore();
+
+  useEffect(() => {
+    loadWallpapers();
+  }, []);
+
+  const handleUpscale = async (
+    id: string
+  ) => {
+    try {
+      const result = await upscaleWallpaper(id);
+
+      alert(
+        `Upscaling completado:\n${result}`
+      );
+
+    } catch (error) {
+      console.error(error);
+
+      alert(
+        "No fue posible ejecutar RealESRGAN"
+      );
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -272,6 +297,41 @@ export default function Settings() {
               border: '1px solid var(--border-color)',
             }}>
               <h3 className="text-xl mb-4">AI Upscaling</h3>
+              <div className="space-y-3 mb-6">
+                {wallpapers.map((wallpaper) => (
+                  <div
+                    key={wallpaper.id}
+                    className="
+                      flex
+                      items-center
+                      justify-between
+                      p-3
+                      rounded-xl
+                      bg-white/5
+                    "
+                  >
+                    <span>
+                      {wallpaper.name}
+                    </span>
+
+                    <button
+                      onClick={() =>
+                        handleUpscale(
+                          wallpaper.id
+                        )
+                      }
+                      className="
+                        px-3
+                        py-2
+                        rounded-lg
+                        bg-[var(--accent-primary)]
+                      "
+                    >
+                      Upscale
+                    </button>
+                  </div>
+                ))}
+              </div>
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
                   <span>Enable AI Enhancement</span>
