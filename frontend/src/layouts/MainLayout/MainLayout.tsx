@@ -3,10 +3,10 @@ import Sidebar from "../../components/common/Sidebar/Sidebar";
 
 export default function MainLayout() {
   return (
-    <div className="flex min-h-screen">
+    <div className="app-shell">
       <Sidebar />
 
-      <main className="flex-1 bg-zinc-950">
+      <main className="app-content">
         <Outlet />
       </main>
     </div>
