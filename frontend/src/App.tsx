@@ -1,3 +1,6 @@
+import { RouterProvider } from "react-router-dom";
+import { router } from "./routes";
+
 export default function App() {
-  return <div>Wallpaper Manager</div>;
+  return <RouterProvider router={router} />;
 }
