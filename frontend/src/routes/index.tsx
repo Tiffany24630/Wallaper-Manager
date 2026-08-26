@@ -1,4 +1,4 @@
-import {createBrowserRouter,} from "react-router-dom";
+import { createHashRouter } from "react-router-dom";
 import MainLayout from "../layouts/MainLayout/MainLayout";
 import Dashboard from "../pages/Dashboard/Dashboard";
 import Library from "../pages/Library/Library";
@@ -6,9 +6,10 @@ import MultiMonitor from "../pages/MultiMonitor/MultiMonitor";
 import Settings from "../pages/Settings/Settings";
 import Playlists from "../pages/Playlists/Playlists";
 import Performance from "../pages/Performance/Performance";
+import AIUpscaling from "../pages/AIUpscaling/AIUpscaling";
 
 export const router =
-  createBrowserRouter([
+  createHashRouter([
     {
       path: "/",
       element: <MainLayout />,
@@ -42,6 +43,10 @@ export const router =
         {
           path: "performance",
           element: <Performance />,
+        },
+        {
+          path: "enhance",
+          element: <AIUpscaling />,
         },
       ],
     },
