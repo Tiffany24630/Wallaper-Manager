@@ -48,6 +48,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
       set({
         error: String(error),
       });
+      throw error;
     }
   },
 }));

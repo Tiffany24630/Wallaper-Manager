@@ -30,4 +30,8 @@ export const playlistService = {
       playlistId,
     });
   },
+
+  removeWallpaper(playlistId: string, wallpaperId: string): Promise<void> {
+    return tauriInvoke("remove_wallpaper_from_playlist", { playlistId, wallpaperId });
+  },
 };

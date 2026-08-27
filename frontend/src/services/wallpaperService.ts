@@ -52,11 +52,12 @@ export const wallpaperService = {
     return file as string | null;
   },
 
-  async upscaleWallpaper(id: string) {
+  async upscaleWallpaper(id: string, scale = 4) {
     return invoke<string>(
       "upscale_wallpaper",
       {
         wallpaperId: id,
+        scale,
       }
     );
   },

@@ -21,16 +21,4 @@ export const monitorService = {
     );
   },
 
-  async applyWallpaper(
-    monitorId: string,
-    wallpaperId: string
-  ): Promise<void> {
-    return tauriInvoke(
-      "apply_monitor_wallpaper",
-      {
-        monitorId,
-        wallpaperId,
-      }
-    );
-  },
 };
