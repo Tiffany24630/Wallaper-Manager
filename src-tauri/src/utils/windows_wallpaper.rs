@@ -1,8 +1,10 @@
+#[cfg(target_os = "windows")]
 use windows::{
     core::*,
     Win32::{System::Com::*, UI::Shell::*},
 };
 
+#[cfg(target_os = "windows")]
 pub fn set_monitor_wallpaper(monitor_id: &str, wallpaper_path: &str) -> Result<()> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
@@ -16,4 +18,9 @@ pub fn set_monitor_wallpaper(monitor_id: &str, wallpaper_path: &str) -> Result<(
         result?;
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_monitor_wallpaper(_monitor_id: &str, _wallpaper_path: &str) -> Result<(), String> {
+    Err("La asignación por monitor solo está disponible en Windows".into())
 }

@@ -8,7 +8,7 @@ pub fn run_migrations() {
         ALTER TABLE wallpapers
         ADD COLUMN hash TEXT
         ",
-        []
+        [],
     );
 
     let _ = conn.execute(
@@ -16,7 +16,7 @@ pub fn run_migrations() {
         ALTER TABLE wallpapers
         ADD COLUMN width INTEGER
         ",
-        []
+        [],
     );
 
     let _ = conn.execute(
@@ -24,7 +24,7 @@ pub fn run_migrations() {
         ALTER TABLE wallpapers
         ADD COLUMN height INTEGER
         ",
-        []
+        [],
     );
 
     let _ = conn.execute(
@@ -32,7 +32,7 @@ pub fn run_migrations() {
         ALTER TABLE wallpapers
         ADD COLUMN size_bytes INTEGER
         ",
-        []
+        [],
     );
 
     let _ = conn.execute(
@@ -40,6 +40,6 @@ pub fn run_migrations() {
         ALTER TABLE wallpapers
         ADD COLUMN file_type TEXT
         ",
-        []
+        [],
     );
 }
