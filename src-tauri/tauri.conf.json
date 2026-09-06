@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.tiffa.wallpaper-manager",
   "build": {
-    "beforeDevCommand": "cd ../../frontend && npm run dev -- --host 127.0.0.1",
-    "beforeBuildCommand": "cd ../../frontend && npm run build",
+    "beforeDevCommand": "cd ../frontend && npm run dev -- --host 127.0.0.1",
+    "beforeBuildCommand": "cd ../frontend && npm run build",
     "devUrl": "http://127.0.0.1:5174",
-    "frontendDist": "../../frontend/dist"
+    "frontendDist": "../frontend/dist"
   },
   "app": {
     "withGlobalTauri": true,
@@ -25,7 +25,7 @@
         "enable": true,
         "scope": [
           "$APPDATA/**",
-          "../wallpapers/**"
+          "$RESOURCE/**"
         ]
       }
     }
