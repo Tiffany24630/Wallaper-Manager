@@ -62,6 +62,7 @@ export const usePlaylistStore =
           loading: false,
           error: String(error),
         });
+        throw error;
       }
     },
 
@@ -85,6 +86,7 @@ export const usePlaylistStore =
           loading: false,
           error: String(error),
         });
+        throw error;
       }
     },
 

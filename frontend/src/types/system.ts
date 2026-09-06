@@ -27,4 +27,7 @@ export interface SystemInfo {
   uptime: number;
   wallpaperCount: number;
   activeWallpaper?: string;
+  cpuName: string;
+  logicalCores: number;
+  appMemory: number;
 }

@@ -6,5 +6,8 @@ export interface Wallpaper {
   favorite: boolean;
   active: boolean;
   sizeBytes?: number;
+  width?: number;
+  height?: number;
+  fileType?: string;
   createdAt?: string;
 }

@@ -15,12 +15,13 @@ export function formatBytes(bytes: number): string {
 }
 
 export function formatPercent(value: number): string {
-  return `${value.toFixed(1)}%`;
+  return `${(Number.isFinite(value) ? value : 0).toFixed(1)}%`;
 }
 
 export function formatUptime(seconds: number): string {
-  const hours = Math.floor(seconds / 3600);
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
 
-  return `${hours}h ${minutes}m`;
+  return days ? `${days}d ${hours}h` : `${hours}h ${minutes}m`;
 }
