@@ -8,4 +8,6 @@ pub struct Settings {
     pub pause_on_battery: bool,
     pub pause_when_maximized: bool,
     pub scaling_mode: String,
+    pub accent_color: String,
+    pub ui_scale: u16,
 }
