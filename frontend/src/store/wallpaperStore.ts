@@ -11,8 +11,8 @@ interface WallpaperState {
   refresh: () => Promise<void>;
   setActive: (id: string) => Promise<void>;
   toggleFavorite: (id: string) => Promise<void>;
-  importWallpaper: (path: string) => Promise<void>;
-  selectAndImportWallpaper: () => Promise<void>;
+  importWallpaper: (path: string) => Promise<string>;
+  selectAndImportWallpaper: () => Promise<string | null>;
   deleteWallpaper: (id: string) => Promise<void>;
   scanFolder: () => Promise<void>;
   rotateWallpaper: () => Promise<void>;
@@ -82,19 +82,21 @@ export const useWallpaperStore =
     },
 
     importWallpaper: async (path) => {
-      await wallpaperService.importWallpaper(path);
+      const id = await wallpaperService.importWallpaper(path);
       const wallpapers = await wallpaperService.getAll();
       set({ wallpapers });
+      return id;
     },
 
     selectAndImportWallpaper: async () => {
       const file = await wallpaperService.selectWallpaperFile();
 
-      if (!file) return;
+      if (!file) return null;
 
-      await wallpaperService.importWallpaper(file);
+      const id = await wallpaperService.importWallpaper(file);
       const wallpapers = await wallpaperService.getAll();
       set({ wallpapers });
+      return id;
     },
 
     deleteWallpaper: async (id) => {

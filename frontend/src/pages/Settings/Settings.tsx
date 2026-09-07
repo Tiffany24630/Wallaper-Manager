@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useSettingsStore } from "../../store/settingsStore";
 import type { Settings as SettingsType } from "../../types/settings";
 
-const defaults: SettingsType = { launch_at_startup: false, minimize_to_tray: true, hardware_acceleration: true, pause_on_battery: false, pause_when_maximized: true, scaling_mode: "fill" };
+const defaults: SettingsType = { launch_at_startup: false, minimize_to_tray: true, hardware_acceleration: true, pause_on_battery: false, pause_when_maximized: true, scaling_mode: "fill", accent_color: "violet", ui_scale: 100 };
 
 function Switch({ checked, onChange, label, description }: { checked: boolean; onChange: (value: boolean) => void; label: string; description: string }) {
   return <label className="flex cursor-pointer items-center justify-between gap-5 border-b border-white/[.07] py-4 last:border-0"><span><span className="block text-sm font-medium">{label}</span><span className="mt-1 block text-xs leading-5 muted">{description}</span></span><input className="sr-only" type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)}/><span className={`relative h-6 w-11 shrink-0 rounded-full transition ${checked ? "bg-violet-500" : "bg-white/15"}`}><span className={`absolute top-1 h-4 w-4 rounded-full bg-white transition ${checked ? "left-6" : "left-1"}`}/></span></label>;
@@ -31,6 +31,13 @@ export default function Settings() {
         <Switch checked={draft.pause_on_battery} onChange={v => patch("pause_on_battery", v)} label="Reducir actividad con batería" description="Preferencia de ahorro cuando el dispositivo no está conectado."/>
         <Switch checked={draft.pause_when_maximized} onChange={v => patch("pause_when_maximized", v)} label="Reducir actividad con pantalla completa" description="Evita trabajo de fondo innecesario mientras usas otras aplicaciones."/>
         <label className="mt-4 block text-sm font-medium">Modo de ajuste</label><select className="input mt-2" value={draft.scaling_mode} onChange={e => patch("scaling_mode", e.target.value)}><option value="fill">Rellenar pantalla</option><option value="fit">Ajustar completa</option><option value="stretch">Estirar</option><option value="center">Centrar</option></select>
+      </section>
+      <section className="panel panel-pad lg:col-span-2">
+        <div className="mb-4 flex items-center gap-2"><Settings2 size={18} className="text-violet-300"/><h2 className="font-semibold">Apariencia</h2></div>
+        <div className="grid gap-5 md:grid-cols-2">
+          <div><label className="block text-sm font-medium">Color de acento</label><div className="mt-3 flex flex-wrap gap-2">{(["violet", "cyan", "rose", "emerald"] as const).map(color => <button key={color} type="button" onClick={() => patch("accent_color", color)} className={`accent-swatch accent-${color} ${draft.accent_color === color ? "is-selected" : ""}`} aria-label={`Usar acento ${color}`} />)}</div></div>
+          <div><label className="block text-sm font-medium">Tamaño de interfaz: {draft.ui_scale}%</label><input className="mt-4 w-full" type="range" min="85" max="115" step="5" value={draft.ui_scale} onChange={e => patch("ui_scale", Number(e.target.value))}/></div>
+        </div>
       </section>
     </div>
     <div className="panel panel-pad text-sm leading-6 muted"><strong className="text-slate-200">Transparencia:</strong> estas opciones ya se guardan en SQLite. Las integraciones del sistema que requieren ejecución en segundo plano —inicio automático, bandeja y detección de batería/ventana maximizada— se conservan como preferencias, pero no se presentan como activas hasta que exista ese servicio residente.</div>

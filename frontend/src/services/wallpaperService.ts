@@ -20,8 +20,8 @@ export const wallpaperService = {
     });
   },
 
-  async importWallpaper(path: string): Promise<void> {
-    return tauriInvoke("import_wallpaper", {
+  async importWallpaper(path: string): Promise<string> {
+    return tauriInvoke<string>("import_wallpaper", {
       sourcePath: path,
     });
   },

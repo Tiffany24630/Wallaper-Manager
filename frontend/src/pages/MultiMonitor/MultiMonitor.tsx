@@ -31,7 +31,7 @@ export default function MultiMonitor() {
     <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
       {monitors.map(m => <button key={m.id} onClick={() => { setMonitorId(m.id); setSynced(false); }} className={`panel panel-pad text-left transition ${monitorId === m.id && !synced ? "ring-2 ring-violet-400/60" : "hover:border-white/20"}`}>
         <div className="flex items-start justify-between"><div className="grid h-11 w-11 place-items-center rounded-xl bg-violet-500/15 text-violet-300"><Monitor/></div>{m.primary && <span className="rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-300">Principal</span>}</div>
-        <div className="mt-5 font-semibold">{m.name || "Pantalla sin nombre"}</div><div className="mt-1 text-sm muted">{m.width} × {m.height} · {m.refreshRate} Hz</div>
+        <div className="mt-5 font-semibold">{m.name || "Pantalla sin nombre"}</div><div className="mt-1 text-sm muted">{m.width} × {m.height} · {m.refreshRate ? `${m.refreshRate} Hz` : "frecuencia no disponible"}</div>
       </button>)}
       {!loading && monitors.length === 0 && <div className="empty md:col-span-2 xl:col-span-3">Windows no reportó monitores disponibles.</div>}
     </section>
