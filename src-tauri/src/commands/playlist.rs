@@ -1,11 +1,9 @@
-use serde::{Deserialize, Serialize};
+use crate::{db::get_connection, models::playlist::Playlist};
 use chrono::Utc;
 use uuid::Uuid;
-use crate::{db::get_connection, models::playlist::Playlist,};
 
 #[tauri::command]
-pub fn get_playlists()
--> Result<Vec<Playlist>, String> {
+pub fn get_playlists() -> Result<Vec<Playlist>, String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
 
     let mut stmt = conn
@@ -34,15 +32,12 @@ pub fn get_playlists()
 }
 
 #[tauri::command]
-pub fn add_wallpaper_to_playlist(
-    playlist_id: String,
-    wallpaper_id: String,
-) -> Result<(), String> {
+pub fn add_wallpaper_to_playlist(playlist_id: String, wallpaper_id: String) -> Result<(), String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
 
     conn.execute(
         "
-        INSERT INTO
+        INSERT OR IGNORE INTO
         playlist_wallpapers(
             playlist_id,
             wallpaper_id
@@ -52,10 +47,7 @@ pub fn add_wallpaper_to_playlist(
             ?2
         )
         ",
-        (
-            playlist_id,
-            wallpaper_id,
-        ),
+        (playlist_id, wallpaper_id),
     )
     .map_err(|e| e.to_string())?;
 
@@ -63,29 +55,32 @@ pub fn add_wallpaper_to_playlist(
 }
 
 #[tauri::command]
-pub fn get_playlist_wallpapers(
-    playlist_id: String,
-) -> Result<Vec<String>, String> {
+pub fn get_playlist_wallpapers(playlist_id: String) -> Result<Vec<String>, String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
 
-    let mut stmt =
-        conn.prepare(
+    let mut stmt = conn
+        .prepare(
             "
             SELECT wallpaper_id
             FROM playlist_wallpapers
             WHERE playlist_id = ?1
-            "
-        ).map_err(|e| e.to_string())?;
+            ",
+        )
+        .map_err(|e| e.to_string())?;
 
-    let rows = stmt.query_map([playlist_id], |row| row.get(0)).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([playlist_id], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
 
     Ok(rows.filter_map(Result::ok).collect())
 }
 
 #[tauri::command]
-pub fn create_playlist(
-    name: String,
-) -> Result<(), String> {
+pub fn create_playlist(name: String) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("El nombre de la lista no puede estar vacío".into());
+    }
     let conn = get_connection().map_err(|e| e.to_string())?;
 
     conn.execute(
@@ -101,11 +96,7 @@ pub fn create_playlist(
             ?3
         )
         ",
-        (
-            Uuid::new_v4().to_string(),
-            name,
-            Utc::now().to_rfc3339(),
-        ),
+        (Uuid::new_v4().to_string(), name, Utc::now().to_rfc3339()),
     )
     .map_err(|e| e.to_string())?;
 
@@ -113,9 +104,7 @@ pub fn create_playlist(
 }
 
 #[tauri::command]
-pub fn delete_playlist(
-    playlist_id: String,
-) -> Result<(), String> {
+pub fn delete_playlist(playlist_id: String) -> Result<(), String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
 
     conn.execute(
@@ -127,5 +116,19 @@ pub fn delete_playlist(
     )
     .map_err(|e| e.to_string())?;
 
+    Ok(())
+}
+
+#[tauri::command]
+pub fn remove_wallpaper_from_playlist(
+    playlist_id: String,
+    wallpaper_id: String,
+) -> Result<(), String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM playlist_wallpapers WHERE playlist_id = ?1 AND wallpaper_id = ?2",
+        (playlist_id, wallpaper_id),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
