@@ -1,9 +1,6 @@
-use serde::{Serialize, Deserialize,};
+use serde::{Deserialize, Serialize};
 
-#[derive(
-    Serialize,
-    Deserialize,
-)]
+#[derive(Serialize, Deserialize)]
 pub struct PlaylistWallpaper {
     pub playlist_id: String,
     pub wallpaper_id: String,
