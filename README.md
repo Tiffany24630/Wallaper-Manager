@@ -43,8 +43,28 @@ Los artefactos quedan en `src-tauri/target/release/bundle`.
 
 ## Compilación reproducible con Docker
 
+Abre Docker Desktop y espera a que el motor Linux esté listo. Desde la raíz del proyecto:
+
 ```powershell
-docker build --tag lumina-build .
+docker info
+docker compose config --quiet
+docker compose up --build --abort-on-container-exit --exit-code-from lumina-build
+```
+
+El servicio `lumina-build` compila el proyecto, verifica que existan el frontend generado y el ejecutable Linux, y termina. **`Exited (0)` es el resultado esperado**, no un fallo: no hay un servidor ni una interfaz gráfica que deban permanecer ejecutándose. Consulta el resultado con `docker compose ps -a` y `docker compose logs lumina-build`.
+
+Para ejecutar también las pruebas de Rust dentro del entorno de compilación:
+
+```powershell
+docker compose run --rm lumina-build cargo test --locked
+```
+
+Si `docker info` muestra `dockerDesktopLinuxEngine` junto con `The system cannot find the file specified`, el CLI no puede conectar con el motor de Docker Desktop. Inicia Docker Desktop, comprueba que use contenedores Linux y vuelve a ejecutar `docker info` antes de compilar. No es necesario borrar imágenes ni volúmenes.
+
+Como alternativa, para construir únicamente la imagen de artefactos (sin un comando de ejecución):
+
+```powershell
+docker build --tag lumina-checks .
 ```
 
 La imagen compila el frontend de producción y una versión Linux del núcleo Tauri. Esto sirve como comprobación reproducible del proyecto. Docker no puede producir ni ejecutar correctamente una aplicación gráfica nativa de Windows; el instalador MSI/NSIS debe generarse con `npm run desktop:build` en Windows.

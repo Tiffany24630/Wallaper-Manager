@@ -1,0 +1,15 @@
+services:
+  lumina-build:
+    build:
+      context: .
+      target: desktop-build
+    image: lumina-build:latest
+    restart: "no"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        test -s /workspace/frontend/dist/index.html
+        test -x /workspace/src-tauri/target/debug/lumina
+        echo "Verificación correcta: frontend y ejecutable Tauri (Linux) disponibles."
+
