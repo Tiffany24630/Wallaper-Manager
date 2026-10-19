@@ -104,6 +104,21 @@ fn main() {
                     }
                 });
             }
+            if std::env::var_os("LUMINA_NATIVE_ANIMATED_TEST").is_some() {
+                match animated_wallpaper::open_native_animated_prototype_test(app.handle().clone(), 0) {
+                    Ok(()) => eprintln!("Native animated WebView2 smoke test started"),
+                    Err(error) => eprintln!("Native animated WebView2 smoke test failed: {error}"),
+                }
+            }
+            if std::env::var_os("LUMINA_ANIMATED_DESKTOP_INSPECT").is_some() {
+                match animated_wallpaper::inspect_animated_desktop_host() {
+                    Ok(value) => eprintln!(
+                        "Animated desktop structure:\n{}",
+                        serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+                    ),
+                    Err(error) => eprintln!("Animated desktop inspection failed: {error}"),
+                }
+            }
             scheduler_for_setup.restart();
             Ok(())
         })
@@ -160,6 +175,9 @@ fn main() {
             download_and_import_synced_resource,
             animated_wallpaper::open_animated_prototype,
             animated_wallpaper::open_animated_prototype_test,
+            animated_wallpaper::inspect_animated_desktop_host,
+            animated_wallpaper::open_native_animated_prototype_test,
+            animated_wallpaper::close_native_animated_prototype,
             animated_wallpaper::close_animated_prototype,
         ])
         .plugin(tauri_plugin_dialog::init())

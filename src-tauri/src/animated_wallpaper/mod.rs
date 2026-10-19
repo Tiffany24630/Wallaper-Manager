@@ -10,6 +10,11 @@ use image::{
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use uuid::Uuid;
 
+#[cfg(target_os = "windows")]
+mod desktop_host;
+#[cfg(target_os = "windows")]
+mod native_window;
+
 const MAX_PROTOTYPE_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,7 +218,10 @@ pub async fn open_animated_prototype(
     let media_query = encode_query_component(&copied_media.to_string_lossy());
     let url = WebviewUrl::App(format!("index.html#/animated-prototype?media={media_query}").into());
     let cleanup_path = copied_media.clone();
-    let options = if let Ok(value) = std::env::var("LUMINA_ANIMATED_SMOKE_VARIANT") {
+    let workerw_mode = std::env::var_os("LUMINA_ANIMATED_SMOKE_WORKERW").is_some();
+    let options = if workerw_mode {
+        smoke_variant_options(5)?
+    } else if let Ok(value) = std::env::var("LUMINA_ANIMATED_SMOKE_VARIANT") {
         smoke_variant_options(
             value
                 .parse()
@@ -250,6 +258,23 @@ pub async fn open_animated_prototype(
         format!("No se pudo crear la superficie WebView2: {e}")
     })?;
 
+    if workerw_mode {
+        #[cfg(target_os = "windows")]
+        if let Err(error) = desktop_host::attach_to_worker_w(&window, bounds) {
+            let _ = window.close();
+            let _ = fs::remove_file(&cleanup_path);
+            return Err(format!(
+                "No se pudo activar el host WorkerW experimental: {error}"
+            ));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = window.close();
+            let _ = fs::remove_file(&cleanup_path);
+            return Err("El host WorkerW experimental solo está disponible en Windows".into());
+        }
+    }
+
     if let Err(error) = window.set_ignore_cursor_events(options.ignore_cursor_events) {
         let _ = window.close();
         let _ = fs::remove_file(&cleanup_path);
@@ -272,6 +297,60 @@ pub async fn open_animated_prototype(
     }
     eprintln!("Animated prototype window shown: {label}");
     Ok(())
+}
+
+#[tauri::command]
+pub fn inspect_animated_desktop_host() -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let inspection = desktop_host::inspect_desktop_structure()?;
+        return Ok(serde_json::to_value(inspection).map_err(|error| {
+            format!("No se pudo serializar el diagnóstico de Explorer: {error}")
+        })?);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("La inspección de Progman/WorkerW solo está disponible en Windows".into())
+    }
+}
+
+#[tauri::command]
+pub fn open_native_animated_prototype_test(
+    app: AppHandle,
+    monitor_index: usize,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let monitors = app
+            .get_webview_window("main")
+            .ok_or("No se encontró la ventana principal de Lumina")?
+            .available_monitors()
+            .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
+        let monitor = monitors
+            .get(monitor_index)
+            .ok_or("El monitor seleccionado ya no está disponible")?;
+        let position = monitor.position();
+        let size = monitor.size();
+        let bounds = bounds_from_geometry(position.x, position.y, size.width, size.height)?;
+        return native_window::open(&app, bounds);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, monitor_index);
+        Err("El renderer HWND nativo solo está disponible en Windows".into())
+    }
+}
+
+#[tauri::command]
+pub fn close_native_animated_prototype() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        return native_window::close();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("El renderer HWND nativo solo está disponible en Windows".into())
+    }
 }
 
 #[tauri::command]
