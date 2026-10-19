@@ -18,9 +18,11 @@ async function processNext() {
   const item = items.find(candidate => candidate.state === "pending" || candidate.state === "retry");
   if (!item || !await syncQueueService.claim(item.id).catch(() => false)) return false;
   processing = true; window.dispatchEvent(new Event("lumina:sync-state"));
+  const sessionAtStart = accountService.hasSession();
   try {
     const result = await accountService.syncLibrary();
-    await syncQueueService.finish(item.id, result.errors.length === 0, result.errors.join("; "));
+    const sessionStillValid = sessionAtStart && accountService.hasSession();
+    await syncQueueService.finish(item.id, sessionStillValid && result.errors.length === 0, sessionStillValid ? result.errors.join("; ") : "La sesión terminó durante la sincronización");
   } catch (error) {
     await syncQueueService.finish(item.id, false, String(error)).catch(() => undefined);
   } finally {

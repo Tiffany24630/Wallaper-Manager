@@ -11,6 +11,7 @@ export const playlistService = {
     const id = await tauriInvoke<string>("create_playlist", {
       name,
     });
+    await tauriInvoke("mark_playlist_local_change", { playlistId: id, deleted: false });
     await notifyLocalChange("playlist_update", id);
     return id;
   },
@@ -19,6 +20,7 @@ export const playlistService = {
     await tauriInvoke("delete_playlist", {
       playlistId: id,
     });
+    await tauriInvoke("mark_playlist_local_change", { playlistId: id, deleted: true });
     await notifyLocalChange("playlist_delete", id);
   },
 
@@ -27,6 +29,7 @@ export const playlistService = {
       playlistId,
       wallpaperId,
     });
+    await tauriInvoke("mark_playlist_local_change", { playlistId, deleted: false });
     await notifyLocalChange("playlist_item_update", playlistId);
   },
 
@@ -38,6 +41,7 @@ export const playlistService = {
 
   async removeWallpaper(playlistId: string, wallpaperId: string): Promise<void> {
     await tauriInvoke("remove_wallpaper_from_playlist", { playlistId, wallpaperId });
+    await tauriInvoke("mark_playlist_local_change", { playlistId, deleted: false });
     await notifyLocalChange("playlist_item_update", playlistId);
   },
 };

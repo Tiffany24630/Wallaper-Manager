@@ -8,6 +8,7 @@ const apiKey = "lumina.account.apiUrl";
 const deviceKey = "lumina.account.deviceId";
 let tokenCache: string | null | undefined;
 export type SyncResponse = { records: Array<{ record_id: string; kind: string; revision: number; payload: Record<string, unknown>; deleted?: boolean }>; files: Array<{ id: string; record_id: string; sha256: string; kind: string; original_name?: string; extension?: string }>; conflicts: unknown[] };
+type PlaylistSyncState = { playlistId: string; lastRemoteRevision?: number; basePayload?: string; localDirty: boolean; deletedPending: boolean };
 const apiUrl = () => localStorage.getItem(apiKey) || "http://127.0.0.1:8765";
 async function ensureToken(): Promise<string | null> {
   if (tokenCache !== undefined) return tokenCache;
@@ -20,6 +21,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (token) headers.set("Authorization", `Bearer ${token}`);
   const response = await fetch(`${apiUrl()}${path}`, { ...init, headers });
   const data = await response.json().catch(() => ({ error: "Respuesta no válida del servidor" }));
+  if (response.status === 401) { tokenCache = null; localStorage.removeItem("lumina.account.authenticated"); await invoke("delete_secure_session_token").catch(() => undefined); window.dispatchEvent(new Event("lumina:auth-changed")); }
   if (!response.ok) throw new Error(data.error || `Error HTTP ${response.status}`);
   return data as T;
 }
@@ -60,16 +62,41 @@ export const accountService = {
   syncLibrary: async () => {
     const wallpapers = await wallpaperService.getAll(); const cursors = await cursorService.list(); const playlists = await playlistService.getAll();
     const remote = await accountService.sync(); const revisions = new Map(remote.records.map(record => [record.record_id, record.revision]));
+    const states = await invoke<PlaylistSyncState[]>("list_sync_playlist_states").catch(() => [] as PlaylistSyncState[]);
+    const stateMap = new Map(states.map(state => [state.playlistId, state]));
+    const localPlaylistMap = new Map(playlists.map(playlist => [playlist.id, playlist]));
+    const localPlaylistPayloads = new Map<string, Record<string, unknown>>();
+    for (const playlist of playlists) localPlaylistPayloads.set(playlist.id, { name: playlist.name, wallpaper_ids: await playlistService.getPlaylistWallpapers(playlist.id) });
+    for (const record of remote.records.filter(item => item.kind === "playlist")) {
+      const local = localPlaylistMap.get(record.record_id); const state = stateMap.get(record.record_id);
+      if (!local) {
+        if (!state?.deletedPending && !record.deleted) {
+          await invoke("apply_synced_playlist", { playlistId: record.record_id, name: String(record.payload.name || "Lista sincronizada"), wallpaperIds: Array.isArray(record.payload.wallpaper_ids) ? record.payload.wallpaper_ids.filter((id): id is string => typeof id === "string") : [] });
+          await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload });
+        }
+        continue;
+      }
+      if (!state) continue;
+      if (state.localDirty) {
+        let remoteUnchanged = false;
+        try { remoteUnchanged = !!state.basePayload && JSON.stringify(JSON.parse(state.basePayload)) === JSON.stringify(record.payload); } catch { remoteUnchanged = false; }
+        if (!remoteUnchanged && record.revision > (state.lastRemoteRevision ?? 0)) await invoke("record_playlist_conflict", { playlistId: record.record_id, localPayload: localPlaylistPayloads.get(record.record_id), remotePayload: record.payload, baseRevision: state.lastRemoteRevision ?? null, remoteRevision: record.revision });
+      } else if (record.deleted) {
+        await invoke("delete_playlist", { playlistId: record.record_id }).catch(() => undefined);
+        await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload });
+      } else if (record.revision > (state.lastRemoteRevision ?? 0)) {
+        await invoke("apply_synced_playlist", { playlistId: record.record_id, name: String(record.payload.name || local.name), wallpaperIds: Array.isArray(record.payload.wallpaper_ids) ? record.payload.wallpaper_ids.filter((id): id is string => typeof id === "string") : [] });
+        await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload });
+      }
+    }
     const changes = wallpapers.map(wallpaper => ({ id: wallpaper.id, kind: "wallpaper", base_revision: revisions.get(wallpaper.id) ?? 0, payload: { name: wallpaper.name, hash: wallpaper.hash ?? null, size_bytes: wallpaper.sizeBytes ?? null, width: wallpaper.width ?? null, height: wallpaper.height ?? null, file_type: wallpaper.fileType ?? null, favorite: wallpaper.favorite } }));
     const cursorChanges = cursors.map(cursor => ({ id: cursor.id, kind: "cursor", base_revision: revisions.get(cursor.id) ?? 0, payload: { name: cursor.name, resource_type: cursor.resourceType, hotspot_x: cursor.hotspotX, hotspot_y: cursor.hotspotY } }));
-    const playlistChanges = await Promise.all(playlists.map(async playlist => ({ id: playlist.id, kind: "playlist", base_revision: revisions.get(playlist.id) ?? 0, payload: { name: playlist.name, wallpaper_ids: await playlistService.getPlaylistWallpapers(playlist.id) } })));
+    const playlistChanges = playlists.map(playlist => ({ id: playlist.id, kind: "playlist", base_revision: stateMap.get(playlist.id)?.lastRemoteRevision ?? 0, payload: localPlaylistPayloads.get(playlist.id) }));
     const tombstones = await invoke<Array<[string, string]>>("list_sync_tombstones").catch(() => []);
-    const deletedChanges = tombstones.map(([id, kind]) => ({ id, kind, base_revision: revisions.get(id) ?? 0, deleted: true, payload: {} }));
+    const deletedChanges = tombstones.map(([id, kind]) => ({ id, kind, base_revision: stateMap.get(id)?.lastRemoteRevision ?? revisions.get(id) ?? 0, deleted: true, payload: {} }));
     const result = await accountService.sync([...changes, ...cursorChanges, ...playlistChanges, ...deletedChanges]);
-    const localPlaylistIds = new Set(playlists.map(playlist => playlist.id));
-    for (const record of result.records.filter(item => item.kind === "playlist" && !item.deleted && !localPlaylistIds.has(item.record_id))) {
-      await invoke("import_synced_playlist", { playlistId: record.record_id, name: String(record.payload.name || "Lista sincronizada"), wallpaperIds: Array.isArray(record.payload.wallpaper_ids) ? record.payload.wallpaper_ids.filter((id): id is string => typeof id === "string") : [] }).catch(() => undefined);
-    }
+    const conflictIds = new Set(result.conflicts.map(conflict => String((conflict as { id?: string }).id || "")));
+    for (const record of result.records.filter(item => item.kind === "playlist" && !conflictIds.has(item.record_id))) await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload }).catch(() => undefined);
     const uploaded: string[] = []; const errors: string[] = [];
     for (const wallpaper of wallpapers) {
       if (result.files.some(file => file.record_id === wallpaper.id && file.sha256 === (wallpaper.hash ?? ""))) continue;
@@ -87,8 +114,8 @@ export const accountService = {
     return request<{ file_id: string; sha256: string }>(`/v1/files/upload/${encodeURIComponent(init.upload_id)}/complete`, { method: "POST" });
   },
   downloadFile: async (fileId: string) => (await fileRequest(`/v1/files/${encodeURIComponent(fileId)}`)).blob(),
-  restoreWallpaper: async (fileId: string, name: string, extension: string, expectedHash: string, remoteId?: string) => { const buffer = await accountService.downloadFile(fileId).then(file => file.arrayBuffer()); const bytes = Array.from(new Uint8Array(buffer as ArrayBuffer)); return invoke<string>("import_synced_wallpaper", { bytes, name, extension, expectedHash, remoteId }); },
-  restoreCursor: async (fileId: string, name: string, extension: string, expectedHash: string, hotspotX = 0, hotspotY = 0) => { const buffer = await accountService.downloadFile(fileId).then(file => file.arrayBuffer()); const bytes = Array.from(new Uint8Array(buffer as ArrayBuffer)); return invoke<string>("import_synced_cursor", { bytes, name, extension, expectedHash, hotspotX, hotspotY }); },
+  restoreWallpaper: async (fileId: string, name: string, extension: string, expectedHash: string) => invoke<string>("download_and_import_synced_resource", { apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey), fileId, kind: "wallpaper", name, extension, expectedHash }),
+  restoreCursor: async (fileId: string, name: string, extension: string, expectedHash: string, hotspotX = 0, hotspotY = 0) => invoke<string>("download_and_import_synced_resource", { apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey), fileId, kind: "cursor", name, extension, expectedHash, hotspotX, hotspotY }),
   revokeDevice: (id: string) => request(`/v1/devices/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };
 

@@ -162,7 +162,7 @@ class Api(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.end_headers()
 
     def do_POST(self):
@@ -170,6 +170,8 @@ class Api(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path in ("/v1/auth/register", "/v1/auth/login") and not self.server.allow_auth_attempt(self.client_address[0]):
                 return self.json(429, {"error": "Demasiados intentos; inténtalo más tarde"})
+            if path.startswith("/v1/files/") and not getattr(self.server, "allow_transfer_attempt", lambda address: True)(self.client_address[0]):
+                return self.json(429, {"error": "Demasiadas transferencias; inténtalo más tarde"})
             data = self.body()
             if path == "/v1/auth/register":
                 return self.register(data)
@@ -193,6 +195,8 @@ class Api(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path.startswith("/v1/files/") and not getattr(self.server, "allow_transfer_attempt", lambda address: True)(self.client_address[0]):
+            return self.json(429, {"error": "Demasiadas transferencias; inténtalo más tarde"})
         user = self.auth()
         if path == "/v1/auth/session":
             if not user:
@@ -213,6 +217,8 @@ class Api(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if not path.startswith("/v1/files/upload/") or path.endswith("/complete"):
             return self.json(404, {"error": "Ruta no encontrada"})
+        if not getattr(self.server, "allow_transfer_attempt", lambda address: True)(self.client_address[0]):
+            return self.json(429, {"error": "Demasiadas transferencias; inténtalo más tarde"})
         try:
             self.upload_chunk(unquote(path[len("/v1/files/upload/"):]))
         except ValueError as error:
@@ -221,7 +227,7 @@ class Api(BaseHTTPRequestHandler):
             self.json(500, {"error": "No se pudo recibir la transferencia"})
 
     def do_DELETE(self):
-        path = urlparse(self.path).path
+        path = unquote(urlparse(self.path).path)
         user = self.auth()
         if not user:
             return self.json(401, {"error": "Sesión no válida"})
@@ -311,7 +317,7 @@ class Api(BaseHTTPRequestHandler):
         self.server.store.conn.execute("UPDATE devices SET last_sync_at=? WHERE id=? AND user_id=?", (now(), device_id, user["id"]))
         self.server.store.conn.commit()
         rows = self.server.store.conn.execute("SELECT record_id,kind,payload,revision,updated_at,deleted FROM sync_records WHERE user_id=?", (user["id"],)).fetchall()
-        files = self.server.store.conn.execute("SELECT id,record_id,kind,mime,size_bytes,sha256 FROM files WHERE user_id=?", (user["id"],)).fetchall()
+        files = self.server.store.conn.execute("SELECT id,record_id,kind,original_name,mime,extension,size_bytes,sha256 FROM files WHERE user_id=?", (user["id"],)).fetchall()
         return self.json(200, {"records": [{**dict(row), "payload": json.loads(row["payload"])} for row in rows], "files": [dict(row) for row in files], "conflicts": conflicts})
 
     def transfer_context(self, upload_id):
@@ -446,6 +452,7 @@ def run(host, port, db):
     (server.files_root / "uploads").mkdir(parents=True, exist_ok=True)
     (server.files_root / "files").mkdir(parents=True, exist_ok=True)
     server.auth_attempts = {}
+    server.transfer_attempts = {}
     server.auth_lock = threading.Lock()
     def allow_auth_attempt(address):
         current = now()
@@ -458,6 +465,17 @@ def run(host, port, db):
             server.auth_attempts[address] = attempts
             return True
     server.allow_auth_attempt = allow_auth_attempt
+    def allow_transfer_attempt(address):
+        current = now()
+        with server.auth_lock:
+            attempts = [value for value in server.transfer_attempts.get(address, []) if current - value < 60]
+            if len(attempts) >= 120:
+                server.transfer_attempts[address] = attempts
+                return False
+            attempts.append(current)
+            server.transfer_attempts[address] = attempts
+            return True
+    server.allow_transfer_attempt = allow_transfer_attempt
     print(f"Lumina sync API escuchando en http://{host}:{port}", flush=True)
     server.serve_forever()
 

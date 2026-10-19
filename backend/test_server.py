@@ -40,6 +40,7 @@ class FileTransferTests(unittest.TestCase):
         self.http.auth_attempts = {}
         self.http.auth_lock = threading.Lock()
         self.http.allow_auth_attempt = lambda address: True
+        self.http.allow_transfer_attempt = lambda address: True
         self.thread = threading.Thread(target=self.http.serve_forever, daemon=True); self.thread.start()
         self.base = f"http://127.0.0.1:{self.http.server_port}"
 
@@ -93,6 +94,19 @@ class FileTransferTests(unittest.TestCase):
             payload.update({"device_id": "d@example.com", "record_id": "wall-3", "kind": "wallpaper", "sha256": "0" * 64})
             with self.assertRaises(urllib.error.HTTPError) as error: self.call("/v1/files/upload/init", payload, token)
             self.assertEqual(error.exception.code, 400)
+
+    def test_revision_conflict_list_order_and_device_revocation(self):
+        token = self.account("lists@example.com")
+        first = {"id": "list-1", "kind": "playlist", "base_revision": 0, "payload": {"name": "Orden A", "wallpaper_ids": ["wall-1", "wall-2"]}}
+        _, result = self.call("/v1/sync", {"device_id": "lists@example.com", "changes": [first]}, token)
+        self.assertEqual(result["records"][0]["payload"]["wallpaper_ids"], ["wall-1", "wall-2"])
+        conflict = {"id": "list-1", "kind": "playlist", "base_revision": 0, "payload": {"name": "Cambio concurrente", "wallpaper_ids": ["wall-2", "wall-1"]}}
+        _, result = self.call("/v1/sync", {"device_id": "lists@example.com", "changes": [conflict]}, token)
+        self.assertEqual(result["conflicts"][0]["id"], "list-1")
+        self.call("/v1/devices/lists@example.com", method="DELETE", token=token)
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.call("/v1/sync", {"device_id": "lists@example.com", "changes": []}, token)
+        self.assertEqual(error.exception.code, 403)
 
 
 if __name__ == "__main__":
