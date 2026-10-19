@@ -5,16 +5,19 @@ import type { FormEvent } from "react";
 import { playlistService } from "../../services/playlistService";
 import { usePlaylistStore } from "../../store/playlistStore";
 import { useWallpaperStore } from "../../store/wallpaperStore";
+import { useSettingsStore } from "../../store/settingsStore";
 
 export default function PlaylistsPage() {
   const { playlists, loadPlaylists, createPlaylist, deletePlaylist, error } = usePlaylistStore();
   const { wallpapers, loadWallpapers } = useWallpaperStore();
+  const { settings, loadSettings } = useSettingsStore();
   const [name, setName] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [members, setMembers] = useState<string[]>([]);
   const [wallpaperId, setWallpaperId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
-  useEffect(() => { void loadPlaylists(); void loadWallpapers(); }, [loadPlaylists, loadWallpapers]);
+  useEffect(() => { void loadPlaylists(); void loadWallpapers(); void loadSettings(); }, [loadPlaylists, loadWallpapers, loadSettings]);
+  useEffect(() => { const timer = window.setInterval(() => void loadSettings(), 5000); return () => window.clearInterval(timer); }, [loadSettings]);
   useEffect(() => { if (!selected && playlists[0]) setSelected(playlists[0].id); }, [playlists, selected]);
   useEffect(() => { if (selected) void playlistService.getPlaylistWallpapers(selected).then(setMembers); else setMembers([]); }, [selected]);
   const selectedPlaylist = playlists.find(p => p.id === selected);
@@ -34,7 +37,7 @@ export default function PlaylistsPage() {
         <form className="flex gap-2" onSubmit={create}><input className="input" value={name} onChange={e => setName(e.target.value)} maxLength={80} placeholder="Nueva lista"/><button className="btn btn-primary w-11 px-0" aria-label="Crear"><Plus size={18}/></button></form>
         <div className="mt-5 grid gap-2">
           {playlists.length === 0 && <div className="py-8 text-center text-sm muted">No hay listas todavía.</div>}
-          {playlists.map(list => <div key={list.id} className={`flex items-center rounded-xl border ${selected === list.id ? "border-violet-400/30 bg-violet-500/10" : "border-transparent bg-white/[.03]"}`}><button className="flex-1 truncate px-3 py-3 text-left text-sm" onClick={() => setSelected(list.id)}>{list.name}</button><button className="mr-1 p-2 text-slate-500 hover:text-rose-300" aria-label="Eliminar lista" onClick={() => void removeList(list.id)}><Trash2 size={15}/></button></div>)}
+          {playlists.map(list => <div key={list.id} className={`flex items-center rounded-xl border ${selected === list.id ? "border-violet-400/30 bg-violet-500/10" : "border-transparent bg-white/[.03]"}`}><button className="flex-1 truncate px-3 py-3 text-left text-sm" onClick={() => setSelected(list.id)}>{list.name}{settings?.dynamic_enabled && settings.dynamic_playlist_id === list.id && <span className="ml-2 rounded-full bg-violet-500/20 px-2 py-1 text-[10px] text-violet-200">Fondo dinámico</span>}</button><button className="mr-1 p-2 text-slate-500 hover:text-rose-300" aria-label="Eliminar lista" onClick={() => void removeList(list.id)}><Trash2 size={15}/></button></div>)}
         </div>
       </aside>
       <section className="panel panel-pad min-h-[420px]">

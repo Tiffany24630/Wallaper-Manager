@@ -1,4 +1,4 @@
-import { Activity, Image, LayoutDashboard, ListVideo, Monitor, Settings, Sparkles } from "lucide-react";
+import { Activity, Image, LayoutDashboard, ListVideo, Monitor, MousePointer2, Settings, Sparkles } from "lucide-react";
 import { NavLink } from "react-router-dom";
 
 const items = [
@@ -7,6 +7,7 @@ const items = [
   { path: "/playlists", label: "Listas", icon: ListVideo },
   { path: "/monitors", label: "Pantallas", icon: Monitor },
   { path: "/enhance", label: "Mejorar", icon: Sparkles },
+  { path: "/cursors", label: "Cursores", icon: MousePointer2 },
   { path: "/performance", label: "Rendimiento", icon: Activity },
   { path: "/settings", label: "Ajustes", icon: Settings },
 ];

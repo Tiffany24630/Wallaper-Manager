@@ -10,6 +10,8 @@ export default function Library() {
   const [favorites, setFavorites] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [renameId, setRenameId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
   const [comparison, setComparison] = useState<{ originalId: string; enhancedId: string } | null>(null);
   useEffect(() => { void store.loadWallpapers(); }, [store.loadWallpapers]);
   const visible = useMemo(() => store.wallpapers.filter(w => (!favorites || w.favorite) && w.name.toLowerCase().includes(query.toLowerCase())), [store.wallpapers, query, favorites]);
@@ -21,6 +23,27 @@ export default function Library() {
     finally { setBusy(false); }
   }
   const remove = (id: string) => { if (window.confirm("¿Eliminar este fondo y su copia administrada por Lumina?")) void run(() => store.deleteWallpaper(id), "Fondo eliminado."); };
+
+  function beginRename(id: string) {
+    const wallpaper = store.wallpapers.find(item => item.id === id);
+    if (wallpaper) { setRenameId(id); setRenameValue(wallpaper.name); setMessage(null); }
+  }
+  async function confirmRename() {
+    if (!renameId) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      await store.renameWallpaper(renameId, renameValue);
+      setRenameId(null);
+      setRenameValue("");
+      setMessage("Nombre actualizado.");
+    } catch (error) {
+      setMessage(`Error: ${String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+  const rotate = (id: string, degrees: 0 | 90 | 180 | 270) => void run(() => store.rotateWallpaperVersion(id, degrees), degrees === 0 ? "Se restauró la orientación original." : `Fondo rotado ${degrees}°.`);
 
   async function importAndOfferEnhancement() {
     setBusy(true); setMessage(null);
@@ -68,7 +91,8 @@ export default function Library() {
       <span className="px-2 text-sm muted">{visible.length} de {store.wallpapers.length}</span>
     </div>
     {store.loading ? <div className="empty">Cargando biblioteca…</div> : visible.length === 0 ? <div className="empty"><ImagePlus className="mx-auto mb-3"/> {store.wallpapers.length ? "No hay coincidencias." : "Todavía no hay fondos. Importa tu primera imagen para comenzar."}</div> :
-      <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{visible.map(w => <WallpaperCard key={w.id} wallpaper={w} onActivate={id => void run(() => store.setActive(id), "Fondo aplicado.")} onFavorite={id => void run(() => store.toggleFavorite(id))} onDelete={remove}/>)}</section>}
+      <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{visible.map(w => <WallpaperCard key={w.id} wallpaper={w} busy={busy} onActivate={id => void run(() => store.setActive(id), "Fondo aplicado.")} onFavorite={id => void run(() => store.toggleFavorite(id))} onDelete={remove} onRename={beginRename} onRotate={rotate}/>)}</section>}
+    {renameId && <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="rename-title"><div className="modal-card max-w-lg"><h2 id="rename-title" className="text-xl font-semibold">Renombrar fondo</h2><p className="mt-1 text-sm muted">El nombre visible cambiará en toda la biblioteca, sin mover el archivo.</p><input className="input mt-5" autoFocus value={renameValue} onChange={event => setRenameValue(event.target.value)} maxLength={200} onKeyDown={event => { if (event.key === "Enter") void confirmRename(); if (event.key === "Escape") setRenameId(null); }}/><div className="mt-5 flex justify-end gap-2"><button className="btn" onClick={() => setRenameId(null)} disabled={busy}>Cancelar</button><button className="btn btn-primary" onClick={() => void confirmRename()} disabled={busy}>Guardar</button></div></div></div>}
     {original && enhanced && <UpscaleComparisonDialog original={original} enhanced={enhanced} busy={busy} onChoose={choice => void chooseVersion(choice)}/>}
   </div>;
 }

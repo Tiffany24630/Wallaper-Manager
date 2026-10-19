@@ -1,5 +1,5 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { Heart, MonitorUp, Trash2 } from "lucide-react";
+import { Heart, MonitorUp, Pencil, Trash2 } from "lucide-react";
 import type { Wallpaper } from "../../../types/wallpaper";
 import { formatBytes } from "../../../utils/format";
 
@@ -8,9 +8,12 @@ interface Props {
   onActivate: (id: string) => void;
   onFavorite: (id: string) => void;
   onDelete: (id: string) => void;
+  onRename: (id: string) => void;
+  onRotate: (id: string, degrees: 0 | 90 | 180 | 270) => void;
+  busy?: boolean;
 }
 
-export default function WallpaperCard({ wallpaper, onActivate, onFavorite, onDelete }: Props) {
+export default function WallpaperCard({ wallpaper, onActivate, onFavorite, onDelete, onRename, onRotate, busy }: Props) {
   const preview = wallpaper.thumbnail ? convertFileSrc(wallpaper.thumbnail) : null;
   return (
     <article className={`group overflow-hidden rounded-[18px] border bg-[#121520] transition ${wallpaper.active ? "border-violet-400/70 shadow-lg shadow-violet-500/10" : "border-white/10 hover:border-white/20"}`}>
@@ -25,12 +28,18 @@ export default function WallpaperCard({ wallpaper, onActivate, onFavorite, onDel
           {wallpaper.sizeBytes ? <><span>·</span><span>{formatBytes(wallpaper.sizeBytes)}</span></> : null}
         </div>
         <div className="mt-4 flex gap-2">
-          <button className="btn btn-primary flex-1 text-sm" onClick={() => onActivate(wallpaper.id)} disabled={wallpaper.active}>
+          <button className="btn btn-primary flex-1 text-sm" onClick={() => onActivate(wallpaper.id)} disabled={wallpaper.active || busy}>
             <MonitorUp size={16} /> {wallpaper.active ? "Aplicado" : "Aplicar"}
           </button>
           <button className="btn w-11 px-0" aria-label={wallpaper.favorite ? "Quitar de favoritos" : "Añadir a favoritos"} onClick={() => onFavorite(wallpaper.id)}>
             <Heart size={17} className={wallpaper.favorite ? "fill-rose-400 text-rose-400" : ""} />
           </button>
+          <button className="btn w-11 px-0" aria-label="Renombrar" onClick={() => onRename(wallpaper.id)} disabled={busy}><Pencil size={16}/></button>
+          <label className="sr-only" htmlFor={`rotate-${wallpaper.id}`}>Rotar {wallpaper.name}</label>
+          <select id={`rotate-${wallpaper.id}`} className="input max-w-[100px] px-2 text-xs" defaultValue="" disabled={busy} onChange={event => { const value = event.target.value; event.target.value = ""; if (value) onRotate(wallpaper.id, Number(value) as 0 | 90 | 180 | 270); }}>
+            <option value="" disabled>Rotar</option>
+            <option value="90">90°</option><option value="180">180°</option><option value="270">270°</option><option value="0">Original</option>
+          </select>
           <button className="btn btn-danger w-11 px-0" aria-label="Eliminar" onClick={() => onDelete(wallpaper.id)}><Trash2 size={17} /></button>
         </div>
       </div>

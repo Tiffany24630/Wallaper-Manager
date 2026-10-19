@@ -7,6 +7,7 @@ import Settings from "../pages/Settings/Settings";
 import Playlists from "../pages/Playlists/Playlists";
 import Performance from "../pages/Performance/Performance";
 import AIUpscaling from "../pages/AIUpscaling/AIUpscaling";
+import Cursors from "../pages/Cursors/Cursors";
 
 export const router =
   createHashRouter([
@@ -47,6 +48,10 @@ export const router =
         {
           path: "enhance",
           element: <AIUpscaling />,
+        },
+        {
+          path: "cursors",
+          element: <Cursors />,
         },
       ],
     },
