@@ -3,6 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use image::{
+    codecs::gif::{GifEncoder, Repeat},
+    Delay, Frame, Rgba, RgbaImage,
+};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use uuid::Uuid;
 
@@ -84,6 +88,38 @@ fn copy_to_controlled_storage(
     fs::copy(source, &destination)
         .map_err(|e| format!("No se pudo copiar el medio al almacenamiento temporal: {e}"))?;
     Ok(destination)
+}
+
+fn fill_diagnostic_circle(image: &mut RgbaImage, offset: u32, color: Rgba<u8>) {
+    for y in 45..135 {
+        for x in offset..offset + 90 {
+            let dx = x as i32 - (offset + 45) as i32;
+            let dy = y as i32 - 90;
+            if dx * dx + dy * dy <= 45 * 45 {
+                image.put_pixel(x, y, color);
+            }
+        }
+    }
+}
+
+fn create_diagnostic_gif(path: &Path) -> Result<(), String> {
+    let mut first = RgbaImage::from_pixel(320, 180, Rgba([220, 38, 38, 255]));
+    let mut second = RgbaImage::from_pixel(320, 180, Rgba([37, 99, 235, 255]));
+    fill_diagnostic_circle(&mut first, 35, Rgba([255, 255, 255, 255]));
+    fill_diagnostic_circle(&mut second, 195, Rgba([250, 204, 21, 255]));
+    let file = fs::File::create(path)
+        .map_err(|e| format!("No se pudo crear el GIF de diagnóstico: {e}"))?;
+    let mut encoder = GifEncoder::new(file);
+    encoder
+        .set_repeat(Repeat::Infinite)
+        .map_err(|e| format!("No se pudo configurar el loop del GIF de diagnóstico: {e}"))?;
+    encoder
+        .encode_frames([
+            Frame::from_parts(first, 0, 0, Delay::from_numer_denom_ms(400, 1)),
+            Frame::from_parts(second, 0, 0, Delay::from_numer_denom_ms(400, 1)),
+        ])
+        .map_err(|e| format!("No se pudo escribir el GIF de diagnóstico: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -168,6 +204,24 @@ pub async fn open_animated_prototype(
 }
 
 #[tauri::command]
+pub async fn open_animated_prototype_test(
+    app: AppHandle,
+    monitor_index: usize,
+) -> Result<(), String> {
+    let path = prototype_directory(&app)?.join(format!("diagnostic-{}.gif", Uuid::new_v4()));
+    create_diagnostic_gif(&path)?;
+    let result = open_animated_prototype(
+        app,
+        monitor_index,
+        path.to_string_lossy().into_owned(),
+        true,
+    )
+    .await;
+    let _ = fs::remove_file(path);
+    result
+}
+
+#[tauri::command]
 pub fn close_animated_prototype(app: AppHandle, monitor_index: usize) -> Result<(), String> {
     let label = format!("animated-prototype-{monitor_index}");
     if let Some(window) = app.get_webview_window(&label) {
@@ -188,7 +242,11 @@ pub fn close_all_animated_prototypes(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounds_from_geometry, encode_query_component};
+    use super::{
+        bounds_from_geometry, create_diagnostic_gif, encode_query_component, validate_media_source,
+    };
+    use image::GenericImageView;
+    use uuid::Uuid;
 
     #[test]
     fn accepts_negative_monitor_coordinates() {
@@ -224,5 +282,16 @@ mod tests {
             format!("animated-prototype-{}", 0),
             format!("animated-prototype-{}", 1)
         );
+    }
+
+    #[test]
+    fn diagnostic_gif_is_readable_and_has_expected_dimensions() {
+        let path = std::env::temp_dir().join(format!("lumina-diagnostic-{}.gif", Uuid::new_v4()));
+        create_diagnostic_gif(&path).unwrap();
+        assert_eq!(validate_media_source(&path).unwrap(), "gif");
+        let image = image::open(&path).unwrap();
+        assert_eq!(image.dimensions(), (320, 180));
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        std::fs::remove_file(path).unwrap();
     }
 }

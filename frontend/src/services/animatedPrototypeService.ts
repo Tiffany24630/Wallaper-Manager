@@ -14,6 +14,10 @@ export const animatedPrototypeService = {
     return tauriInvoke("open_animated_prototype", { mediaPath, monitorIndex, diagnostic });
   },
 
+  openGeneratedTest(monitorIndex = 0): Promise<void> {
+    return tauriInvoke("open_animated_prototype_test", { monitorIndex });
+  },
+
   close(monitorIndex = 0): Promise<void> {
     return tauriInvoke("close_animated_prototype", { monitorIndex });
   },

@@ -122,6 +122,21 @@ export default function Settings() {
     }
   }
 
+  async function openGeneratedAnimatedPrototypeTest() {
+    setMessage(null);
+    setPrototypeBusy(true);
+    setPrototypeStatus("Generando GIF de diagnóstico y creando la ventana WebView2…");
+    try {
+      await animatedPrototypeService.openGeneratedTest(prototypeMonitorIndex);
+      setPrototypeStatus("GIF generado y ventana creada; confirma que cambian sus dos fotogramas.");
+    } catch (error) {
+      setPrototypeStatus("No se pudo iniciar la prueba autónoma.");
+      setMessage(String(error));
+    } finally {
+      setPrototypeBusy(false);
+    }
+  }
+
   async function closeAnimatedPrototype() {
     setPrototypeBusy(true);
     try {
@@ -186,6 +201,7 @@ export default function Settings() {
         <div className="mt-4 flex flex-wrap gap-3">
           <button className="btn btn-secondary" type="button" onClick={() => void chooseAnimatedPrototypeMedia()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Seleccionar MP4/GIF</button>
           <button className="btn btn-secondary" type="button" onClick={() => void openAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0 || !prototypeMediaPath}>Abrir prototipo</button>
+          <button className="btn btn-secondary" type="button" onClick={() => void openGeneratedAnimatedPrototypeTest()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Probar GIF autónomo</button>
           <button className="btn btn-secondary" type="button" onClick={() => void closeAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Cerrar superficie</button>
         </div>
       </section>

@@ -94,6 +94,16 @@ fn main() {
                     _ => {}
                 })
                 .build(&handle)?;
+            if std::env::var_os("LUMINA_ANIMATED_SMOKE_TEST").is_some() {
+                let smoke_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) =
+                        animated_wallpaper::open_animated_prototype_test(smoke_handle, 0).await
+                    {
+                        eprintln!("Animated WebView2 smoke test failed: {error}");
+                    }
+                });
+            }
             scheduler_for_setup.restart();
             Ok(())
         })
@@ -149,6 +159,7 @@ fn main() {
             delete_secure_session_token,
             download_and_import_synced_resource,
             animated_wallpaper::open_animated_prototype,
+            animated_wallpaper::open_animated_prototype_test,
             animated_wallpaper::close_animated_prototype,
         ])
         .plugin(tauri_plugin_dialog::init())
