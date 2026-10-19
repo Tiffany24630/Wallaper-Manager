@@ -38,6 +38,8 @@ export default function Settings() {
   const [draftDirty, setDraftDirty] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [prototypeBusy, setPrototypeBusy] = useState(false);
+  const [prototypeMediaPath, setPrototypeMediaPath] = useState<string | null>(null);
+  const [prototypeStatus, setPrototypeStatus] = useState("Selecciona un archivo MP4 o GIF para comenzar.");
   const [prototypeMonitors, setPrototypeMonitors] = useState<Monitor[]>([]);
   const [prototypeMonitorIndex, setPrototypeMonitorIndex] = useState(0);
   const [playlists, setPlaylists] = useState<{ id: string; name: string }[]>([]);
@@ -93,15 +95,27 @@ export default function Settings() {
     try { await saveSettings(next); setDraft(next); setDraftDirty(false); setMessage("Preferencias guardadas."); } catch (e) { setMessage(String(e)); }
   }
 
-  async function openAnimatedPrototype() {
+  async function chooseAnimatedPrototypeMedia() {
     setMessage(null);
     const mediaPath = await animatedPrototypeService.chooseMedia();
     if (!mediaPath) return;
+    setPrototypeMediaPath(mediaPath);
+    setPrototypeStatus(`Archivo seleccionado: ${mediaPath.split(/[\\/]/).pop() ?? mediaPath}`);
+  }
+
+  async function openAnimatedPrototype() {
+    setMessage(null);
+    if (!prototypeMediaPath) {
+      setPrototypeStatus("Selecciona primero un archivo MP4 o GIF.");
+      return;
+    }
     setPrototypeBusy(true);
+    setPrototypeStatus("Creando ventana diagnóstica y cargando WebView2…");
     try {
-      await animatedPrototypeService.open(mediaPath, prototypeMonitorIndex);
-      setMessage("Prototipo WebView2 abierto en el monitor seleccionado.");
+      await animatedPrototypeService.open(prototypeMediaPath, prototypeMonitorIndex, true);
+      setPrototypeStatus("Ventana creada; revisa la superficie para confirmar carga y reproducción.");
     } catch (error) {
+      setPrototypeStatus("No se pudo crear la superficie diagnóstica.");
       setMessage(String(error));
     } finally {
       setPrototypeBusy(false);
@@ -112,6 +126,7 @@ export default function Settings() {
     setPrototypeBusy(true);
     try {
       await animatedPrototypeService.close(prototypeMonitorIndex);
+      setPrototypeStatus("Superficie cerrada.");
       setMessage("Superficie del prototipo cerrada.");
     } catch (error) {
       setMessage(String(error));
@@ -164,8 +179,13 @@ export default function Settings() {
         <select className="input mt-2 max-w-xl" value={prototypeMonitorIndex} onChange={event => setPrototypeMonitorIndex(Number(event.target.value))} disabled={prototypeMonitors.length === 0}>
           {prototypeMonitors.length === 0 ? <option value={0}>No se detectaron monitores</option> : prototypeMonitors.map((monitor, index) => <option key={monitor.id} value={index}>{monitor.name || `Monitor ${index + 1}`} · {monitor.width} × {monitor.height}{monitor.primary ? " · Principal" : ""}</option>)}
         </select>
+        <div className="mt-4 rounded-xl border border-white/10 bg-white/[.03] p-3 text-sm muted">
+          <div>{prototypeStatus}</div>
+          {prototypeMediaPath && <div className="mt-1 truncate text-xs" title={prototypeMediaPath}>Archivo: {prototypeMediaPath.split(/[\\/]/).pop()}</div>}
+        </div>
         <div className="mt-4 flex flex-wrap gap-3">
-          <button className="btn btn-secondary" type="button" onClick={() => void openAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Abrir medio MP4/GIF</button>
+          <button className="btn btn-secondary" type="button" onClick={() => void chooseAnimatedPrototypeMedia()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Seleccionar MP4/GIF</button>
+          <button className="btn btn-secondary" type="button" onClick={() => void openAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0 || !prototypeMediaPath}>Abrir prototipo</button>
           <button className="btn btn-secondary" type="button" onClick={() => void closeAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Cerrar superficie</button>
         </div>
       </section>

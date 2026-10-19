@@ -1,3 +1,4 @@
+mod animated_wallpaper;
 mod commands;
 mod db;
 mod dynamic;
@@ -13,7 +14,7 @@ use dynamic::DynamicScheduler;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    Manager, WindowEvent,
+    Manager, RunEvent, WindowEvent,
 };
 
 fn should_minimize_to_tray() -> bool {
@@ -147,9 +148,21 @@ fn main() {
             set_secure_session_token,
             delete_secure_session_token,
             download_and_import_synced_resource,
+            animated_wallpaper::open_animated_prototype,
+            animated_wallpaper::close_animated_prototype,
         ])
         .plugin(tauri_plugin_dialog::init())
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!());
+    match result {
+        Ok(app) => app.run(|app, event| {
+            if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+                animated_wallpaper::close_all_animated_prototypes(app);
+            }
+        }),
+        Err(error) => {
+            scheduler_for_shutdown.stop();
+            panic!("No se pudo iniciar Lumina: {error}");
+        }
+    }
     scheduler_for_shutdown.stop();
-    result.expect("No se pudo iniciar Lumina");
 }
