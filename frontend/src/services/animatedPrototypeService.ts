@@ -18,6 +18,14 @@ export const animatedPrototypeService = {
     return tauriInvoke("open_animated_prototype_test", { monitorIndex });
   },
 
+  openNativeGeneratedTest(monitorIndex = 0): Promise<void> {
+    return tauriInvoke("open_native_animated_prototype_test", { monitorIndex });
+  },
+
+  closeNative(): Promise<void> {
+    return tauriInvoke("close_native_animated_prototype");
+  },
+
   close(monitorIndex = 0): Promise<void> {
     return tauriInvoke("close_animated_prototype", { monitorIndex });
   },

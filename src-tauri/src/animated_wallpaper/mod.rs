@@ -20,6 +20,64 @@ struct MonitorBounds {
     height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrototypeWindowOptions {
+    decorations: bool,
+    focused: bool,
+    focusable: bool,
+    skip_taskbar: bool,
+    always_on_bottom: bool,
+    ignore_cursor_events: bool,
+}
+
+fn smoke_variant_options(variant: u8) -> Result<PrototypeWindowOptions, String> {
+    let baseline = PrototypeWindowOptions {
+        decorations: true,
+        focused: true,
+        focusable: true,
+        skip_taskbar: false,
+        always_on_bottom: false,
+        ignore_cursor_events: false,
+    };
+    Ok(match variant {
+        0 => baseline,
+        1 => PrototypeWindowOptions {
+            decorations: false,
+            ..baseline
+        },
+        2 => PrototypeWindowOptions {
+            decorations: false,
+            focused: false,
+            focusable: false,
+            ..baseline
+        },
+        3 => PrototypeWindowOptions {
+            decorations: false,
+            focused: false,
+            focusable: false,
+            skip_taskbar: true,
+            ..baseline
+        },
+        4 => PrototypeWindowOptions {
+            decorations: false,
+            focused: false,
+            focusable: false,
+            skip_taskbar: true,
+            always_on_bottom: true,
+            ..baseline
+        },
+        5 => PrototypeWindowOptions {
+            decorations: false,
+            focused: false,
+            focusable: false,
+            skip_taskbar: true,
+            always_on_bottom: true,
+            ignore_cursor_events: true,
+        },
+        _ => return Err("La variante del smoke test debe estar entre 0 y 5".into()),
+    })
+}
+
 fn bounds_from_geometry(x: i32, y: i32, width: u32, height: u32) -> Result<MonitorBounds, String> {
     if width == 0 || height == 0 {
         return Err("El monitor no tiene un área visible válida".into());
@@ -155,16 +213,28 @@ pub async fn open_animated_prototype(
     let media_query = encode_query_component(&copied_media.to_string_lossy());
     let url = WebviewUrl::App(format!("index.html#/animated-prototype?media={media_query}").into());
     let cleanup_path = copied_media.clone();
+    let options = if let Ok(value) = std::env::var("LUMINA_ANIMATED_SMOKE_VARIANT") {
+        smoke_variant_options(
+            value
+                .parse()
+                .map_err(|_| "La variante del smoke test no es numérica".to_string())?,
+        )?
+    } else if diagnostic {
+        smoke_variant_options(0)?
+    } else {
+        smoke_variant_options(5)?
+    };
+    eprintln!("Animated prototype options: {options:?}");
     let mut builder = WebviewWindowBuilder::new(&app, &label, url)
         .title("Lumina animated wallpaper prototype")
-        .decorations(diagnostic)
+        .decorations(options.decorations)
         .resizable(false)
-        .focused(diagnostic)
-        .focusable(diagnostic)
-        .always_on_top(diagnostic)
+        .focused(options.focused)
+        .focusable(options.focusable)
+        .always_on_top(options.focused)
         .position(f64::from(bounds.x), f64::from(bounds.y))
         .inner_size(f64::from(bounds.width), f64::from(bounds.height))
-        .visible(!diagnostic)
+        .visible(false)
         .on_navigation(|url| {
             url.scheme() == "tauri"
                 || (url.scheme() == "http" && url.host_str() == Some("tauri.localhost"))
@@ -172,15 +242,15 @@ pub async fn open_animated_prototype(
                     && url.scheme() == "http"
                     && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost")))
         });
-    if !diagnostic {
-        builder = builder.skip_taskbar(true).always_on_bottom(true);
-    }
+    builder = builder
+        .skip_taskbar(options.skip_taskbar)
+        .always_on_bottom(options.always_on_bottom);
     let window = builder.build().map_err(|e| {
         let _ = fs::remove_file(&cleanup_path);
         format!("No se pudo crear la superficie WebView2: {e}")
     })?;
 
-    if let Err(error) = window.set_ignore_cursor_events(!diagnostic) {
+    if let Err(error) = window.set_ignore_cursor_events(options.ignore_cursor_events) {
         let _ = window.close();
         let _ = fs::remove_file(&cleanup_path);
         return Err(format!(
@@ -200,6 +270,7 @@ pub async fn open_animated_prototype(
             "No se pudo mostrar la superficie WebView2: {error}"
         ));
     }
+    eprintln!("Animated prototype window shown: {label}");
     Ok(())
 }
 
@@ -210,11 +281,12 @@ pub async fn open_animated_prototype_test(
 ) -> Result<(), String> {
     let path = prototype_directory(&app)?.join(format!("diagnostic-{}.gif", Uuid::new_v4()));
     create_diagnostic_gif(&path)?;
+    let diagnostic = std::env::var_os("LUMINA_ANIMATED_SMOKE_WALLPAPER").is_none();
     let result = open_animated_prototype(
         app,
         monitor_index,
         path.to_string_lossy().into_owned(),
-        true,
+        diagnostic,
     )
     .await;
     let _ = fs::remove_file(path);
@@ -243,7 +315,8 @@ pub fn close_all_animated_prototypes(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounds_from_geometry, create_diagnostic_gif, encode_query_component, validate_media_source,
+        bounds_from_geometry, create_diagnostic_gif, encode_query_component, smoke_variant_options,
+        validate_media_source,
     };
     use image::GenericImageView;
     use uuid::Uuid;
@@ -293,5 +366,16 @@ mod tests {
         assert_eq!(image.dimensions(), (320, 180));
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn smoke_variants_add_window_flags_incrementally() {
+        assert!(!smoke_variant_options(0).unwrap().skip_taskbar);
+        assert!(!smoke_variant_options(1).unwrap().skip_taskbar);
+        assert!(!smoke_variant_options(2).unwrap().focusable);
+        assert!(smoke_variant_options(3).unwrap().skip_taskbar);
+        assert!(smoke_variant_options(4).unwrap().always_on_bottom);
+        assert!(smoke_variant_options(5).unwrap().ignore_cursor_events);
+        assert!(smoke_variant_options(6).is_err());
     }
 }

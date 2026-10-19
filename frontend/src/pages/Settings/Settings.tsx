@@ -137,6 +137,34 @@ export default function Settings() {
     }
   }
 
+  async function openNativeAnimatedPrototypeTest() {
+    setMessage(null);
+    setPrototypeBusy(true);
+    setPrototypeStatus("Generando GIF y creando un HWND nativo con WebView2…");
+    try {
+      await animatedPrototypeService.openNativeGeneratedTest(prototypeMonitorIndex);
+      setPrototypeStatus("HWND nativo creado; confirma WebView2, carga del GIF y animación visual.");
+    } catch (error) {
+      setPrototypeStatus("No se pudo iniciar el renderer HWND nativo.");
+      setMessage(String(error));
+    } finally {
+      setPrototypeBusy(false);
+    }
+  }
+
+  async function closeNativeAnimatedPrototype() {
+    setPrototypeBusy(true);
+    try {
+      await animatedPrototypeService.closeNative();
+      setPrototypeStatus("Renderer HWND nativo cerrado.");
+      setMessage("Renderer nativo cerrado.");
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setPrototypeBusy(false);
+    }
+  }
+
   async function closeAnimatedPrototype() {
     setPrototypeBusy(true);
     try {
@@ -203,6 +231,8 @@ export default function Settings() {
           <button className="btn btn-secondary" type="button" onClick={() => void openAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0 || !prototypeMediaPath}>Abrir prototipo</button>
           <button className="btn btn-secondary" type="button" onClick={() => void openGeneratedAnimatedPrototypeTest()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Probar GIF autónomo</button>
           <button className="btn btn-secondary" type="button" onClick={() => void closeAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Cerrar superficie</button>
+          <button className="btn btn-secondary" type="button" onClick={() => void openNativeAnimatedPrototypeTest()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Probar HWND nativo + WebView2</button>
+          <button className="btn btn-secondary" type="button" onClick={() => void closeNativeAnimatedPrototype()} disabled={prototypeBusy}>Cerrar renderer nativo</button>
         </div>
       </section>
     </div>
