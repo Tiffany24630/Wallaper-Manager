@@ -493,6 +493,53 @@ fn validate_generated_image(path: &Path, expected: (u32, u32)) -> Result<(), Str
     Ok(())
 }
 
+fn validate_ai_pixels(
+    path: &Path,
+    expected: (u32, u32),
+    source: &DynamicImage,
+) -> Result<(), String> {
+    let output = image::open(path)
+        .map_err(|e| format!("La salida de Real-ESRGAN no se puede decodificar: {e}"))?;
+    if output.dimensions() != expected {
+        return Err(format!(
+            "La salida mejorada tiene dimensiones {} × {}; se esperaban {} × {}",
+            output.width(),
+            output.height(),
+            expected.0,
+            expected.1
+        ));
+    }
+    let source_has_visible_content = source
+        .to_rgba8()
+        .pixels()
+        .any(|pixel| pixel[3] != 0 && (pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0));
+    let output_has_visible_content = output
+        .to_rgba8()
+        .pixels()
+        .any(|pixel| pixel[3] != 0 && (pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0));
+    if source_has_visible_content && !output_has_visible_content {
+        return Err("Real-ESRGAN produjo una imagen transparente o completamente negra".into());
+    }
+    let color_variation = |image: &DynamicImage| {
+        let pixels = image.to_rgba8();
+        let mut first = None;
+        pixels.pixels().filter(|pixel| pixel[3] != 0).any(|pixel| {
+            let color = [pixel[0], pixel[1], pixel[2]];
+            match first {
+                Some(previous) => previous != color,
+                None => {
+                    first = Some(color);
+                    false
+                }
+            }
+        })
+    };
+    if color_variation(source) && !color_variation(&output) {
+        return Err("Real-ESRGAN produjo una imagen uniforme inválida".into());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 pub struct UpscaleResult {
     pub id: String,
@@ -561,8 +608,14 @@ pub fn upscale_wallpaper(
                     .output()
                     .map_err(|e| format!("No se pudo iniciar Real-ESRGAN: {e}"))?;
                 if result.status.success() {
-                    validate_generated_image(&output_path, expected_dimensions)?;
-                    used_ai = true;
+                    let valid_output = validate_generated_image(&output_path, expected_dimensions)
+                        .is_ok()
+                        && validate_ai_pixels(&output_path, expected_dimensions, &source).is_ok();
+                    if valid_output {
+                        used_ai = true;
+                    } else {
+                        warning = Some("Real-ESRGAN generÃ³ una salida invÃ¡lida; se usÃ³ el respaldo Lanczos.".into());
+                    }
                 } else {
                     let detail = String::from_utf8_lossy(&result.stderr).trim().to_string();
                     warning = Some(if detail.is_empty() {
@@ -571,8 +624,20 @@ pub fn upscale_wallpaper(
                         format!("Real-ESRGAN no pudo ejecutarse ({detail}); se usó el respaldo Lanczos.")
                     });
                 }
+            } else {
+                warning = Some(
+                    "No se encontró el ejecutable Real-ESRGAN; se usó el respaldo Lanczos.".into(),
+                );
             }
+        } else {
+            warning = Some(
+                "No se encontraron los recursos de Real-ESRGAN; se usó el respaldo Lanczos.".into(),
+            );
         }
+    } else {
+        warning = Some(
+            "La aceleración por hardware está desactivada; se usó el respaldo Lanczos.".into(),
+        );
     }
 
     if !used_ai {
@@ -615,7 +680,7 @@ pub fn upscale_wallpaper(
 mod tests {
     use super::{
         rename_wallpaper_in_connection, replace_validated_image, rotate_image, target_dimensions,
-        validate_generated_image, validate_wallpaper_name,
+        validate_ai_pixels, validate_generated_image, validate_wallpaper_name,
     };
     use crate::utils::thumbnail::generate_thumbnail;
     use image::{GenericImageView, RgbImage};
@@ -654,6 +719,36 @@ mod tests {
         assert!(validate_generated_image(&path, (48, 32)).is_err());
         fs::write(&path, b"not an image").unwrap();
         assert!(validate_generated_image(&path, (24, 16)).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_black_ai_output_when_source_has_visible_pixels() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumina-ai-pixel-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = RgbImage::from_fn(4, 3, |x, _| {
+            if x < 2 {
+                image::Rgb([220, 80, 40])
+            } else {
+                image::Rgb([20, 140, 220])
+            }
+        });
+        let source_path = dir.join("source.png");
+        let output_path = dir.join("output.png");
+        source.save(&source_path).unwrap();
+        image::RgbaImage::from_pixel(8, 6, image::Rgba([255, 255, 255, 255]))
+            .save(&output_path)
+            .unwrap();
+
+        assert!(
+            validate_ai_pixels(&output_path, (8, 6), &image::open(&source_path).unwrap()).is_err()
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

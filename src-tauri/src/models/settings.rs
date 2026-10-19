@@ -10,4 +10,11 @@ pub struct Settings {
     pub scaling_mode: String,
     pub accent_color: String,
     pub ui_scale: u16,
+    pub dynamic_enabled: bool,
+    pub dynamic_playlist_id: Option<String>,
+    pub dynamic_interval_minutes: u32,
+    pub dynamic_current_wallpaper_id: Option<String>,
+    pub dynamic_last_error: Option<String>,
+    pub cursor_enabled: bool,
+    pub active_cursor_id: Option<String>,
 }
