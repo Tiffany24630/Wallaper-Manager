@@ -8,6 +8,7 @@ import Playlists from "../pages/Playlists/Playlists";
 import Performance from "../pages/Performance/Performance";
 import AIUpscaling from "../pages/AIUpscaling/AIUpscaling";
 import Cursors from "../pages/Cursors/Cursors";
+import Account from "../pages/Account/Account";
 
 export const router =
   createHashRouter([
@@ -53,6 +54,7 @@ export const router =
           path: "cursors",
           element: <Cursors />,
         },
+        { path: "account", element: <Account /> },
       ],
     },
   ]);

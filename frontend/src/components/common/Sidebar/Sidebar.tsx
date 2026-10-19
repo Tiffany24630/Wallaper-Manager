@@ -1,4 +1,4 @@
-import { Activity, Image, LayoutDashboard, ListVideo, Monitor, MousePointer2, Settings, Sparkles } from "lucide-react";
+import { Activity, Image, LayoutDashboard, ListVideo, Monitor, MousePointer2, Settings, Sparkles, UserRound } from "lucide-react";
 import { NavLink } from "react-router-dom";
 
 const items = [
@@ -10,6 +10,7 @@ const items = [
   { path: "/cursors", label: "Cursores", icon: MousePointer2 },
   { path: "/performance", label: "Rendimiento", icon: Activity },
   { path: "/settings", label: "Ajustes", icon: Settings },
+  { path: "/account", label: "Cuenta", icon: UserRound },
 ];
 
 export default function Sidebar() {
