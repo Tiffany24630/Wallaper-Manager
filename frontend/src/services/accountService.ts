@@ -10,6 +10,19 @@ let tokenCache: string | null | undefined;
 export type SyncResponse = { records: Array<{ record_id: string; kind: string; revision: number; payload: Record<string, unknown>; deleted?: boolean }>; files: Array<{ id: string; record_id: string; sha256: string; kind: string; original_name?: string; extension?: string }>; conflicts: unknown[] };
 type PlaylistSyncState = { playlistId: string; lastRemoteRevision?: number; basePayload?: string; localDirty: boolean; deletedPending: boolean };
 const apiUrl = () => localStorage.getItem(apiKey) || "http://127.0.0.1:8765";
+const normalizeApiUrl = (value: string) => {
+  const normalized = value.trim().replace(/\/+$/, "");
+  let parsed: URL;
+  try { parsed = new URL(normalized); } catch { throw new Error("La URL de la API no es válida. Usa, por ejemplo, http://127.0.0.1:8765."); }
+  if (!parsed.hostname || !["http:", "https:"].includes(parsed.protocol)) throw new Error("La URL de la API debe usar HTTP o HTTPS.");
+  return normalized;
+};
+const networkError = (error: unknown) => {
+  if (error instanceof TypeError && /fetch/i.test(error.message)) {
+    return new Error(`No se pudo contactar con la API de Lumina en ${apiUrl()}. Inicia el backend con «python backend/server.py» o revisa la URL configurada.`);
+  }
+  return error;
+};
 async function ensureToken(): Promise<string | null> {
   if (tokenCache !== undefined) return tokenCache;
   try { tokenCache = await invoke<string | null>("get_secure_session_token"); } catch { tokenCache = null; }
@@ -19,7 +32,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const token = await ensureToken();
   const headers = new Headers(init.headers); headers.set("Content-Type", "application/json");
   if (token) headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch(`${apiUrl()}${path}`, { ...init, headers });
+  let response: Response;
+  try {
+    response = await fetch(`${apiUrl()}${path}`, { ...init, headers });
+  } catch (error) {
+    throw networkError(error);
+  }
   const data = await response.json().catch(() => ({ error: "Respuesta no válida del servidor" }));
   if (response.status === 401) { tokenCache = null; localStorage.removeItem("lumina.account.authenticated"); await invoke("delete_secure_session_token").catch(() => undefined); window.dispatchEvent(new Event("lumina:auth-changed")); }
   if (!response.ok) throw new Error(data.error || `Error HTTP ${response.status}`);
@@ -29,7 +47,12 @@ async function fileRequest(path: string, init: RequestInit = {}) {
   const token = await ensureToken(); const headers = new Headers(init.headers);
   if (token) headers.set("Authorization", `Bearer ${token}`);
   const deviceId = localStorage.getItem(deviceKey); if (deviceId) headers.set("X-Device-ID", deviceId);
-  const response = await fetch(`${apiUrl()}${path}`, { ...init, headers });
+  let response: Response;
+  try {
+    response = await fetch(`${apiUrl()}${path}`, { ...init, headers });
+  } catch (error) {
+    throw networkError(error);
+  }
   if (!response.ok) { const data = await response.json().catch(() => ({ error: `Error HTTP ${response.status}` })); throw new Error(data.error || `Error HTTP ${response.status}`); }
   return response;
 }
@@ -45,7 +68,7 @@ export const accountService = {
     if (!tokenCache) localStorage.removeItem("lumina.account.authenticated");
   },
   hasSession: () => tokenCache != null,
-  getApiUrl: () => apiUrl(), setApiUrl: (url: string) => localStorage.setItem(apiKey, url.replace(/\/$/, "")),
+  getApiUrl: () => apiUrl(), setApiUrl: (url: string) => localStorage.setItem(apiKey, normalizeApiUrl(url)),
   register: async (email: string, password: string) => { const session = await request<Session>("/v1/auth/register", { method: "POST", body: JSON.stringify({ email, password }) }); await invoke("set_secure_session_token", { token: session.token }); tokenCache = session.token; localStorage.setItem("lumina.account.authenticated", "1"); window.dispatchEvent(new Event("lumina:auth-changed")); return session; },
   login: async (email: string, password: string) => { const session = await request<Session>("/v1/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }); await invoke("set_secure_session_token", { token: session.token }); tokenCache = session.token; localStorage.setItem("lumina.account.authenticated", "1"); window.dispatchEvent(new Event("lumina:auth-changed")); return session; },
   session: () => request<{ authenticated: boolean; user?: Session["user"] }>("/v1/auth/session"),

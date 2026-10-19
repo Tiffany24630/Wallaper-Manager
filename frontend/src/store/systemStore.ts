@@ -3,6 +3,8 @@ import type {SystemInfo} from "../types/system";
 import {systemService} from "../services/systemService";
 
 let pollingId: ReturnType<typeof setInterval> | null = null;
+let refreshInFlight = false;
+let refreshGeneration = 0;
 
 interface SystemState {
   systemInfo: SystemInfo | null;
@@ -21,6 +23,9 @@ export const useSystemStore =
     error: null,
 
     refresh: async () => {
+      if (refreshInFlight) return;
+      refreshInFlight = true;
+      const generation = ++refreshGeneration;
       try {
         set({
           loading: true,
@@ -28,17 +33,23 @@ export const useSystemStore =
 
         const info = await systemService.getInfo();
 
-        set({
-          systemInfo: info,
-          loading: false,
-          error: null,
-        });
+        if (generation === refreshGeneration) {
+          set({
+            systemInfo: info,
+            loading: false,
+            error: null,
+          });
+        }
 
       } catch (error) {
-        set({
-          loading: false,
-          error: String(error),
-        });
+        if (generation === refreshGeneration) {
+          set({
+            loading: false,
+            error: String(error),
+          });
+        }
+      } finally {
+        refreshInFlight = false;
       }
     },
 

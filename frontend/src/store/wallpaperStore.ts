@@ -14,6 +14,8 @@ interface WallpaperState {
   toggleFavorite: (id: string) => Promise<void>;
   importWallpaper: (path: string) => Promise<string>;
   selectAndImportWallpaper: () => Promise<string | null>;
+  selectWallpaperFiles: () => Promise<string[]>;
+  importWallpapers: (paths: string[], onProgress?: (current: number, total: number) => void) => Promise<{ imported: string[]; failed: string[] }>;
   deleteWallpaper: (id: string) => Promise<void>;
   renameWallpaper: (id: string, name: string) => Promise<void>;
   rotateWallpaperVersion: (id: string, degrees: 0 | 90 | 180 | 270) => Promise<void>;
@@ -24,19 +26,25 @@ interface WallpaperState {
 }
 
 export const useWallpaperStore =
-  create<WallpaperState>((set) => ({
+  create<WallpaperState>((set) => {
+    let latestFetch = 0;
+
+    const fetchLatest = async (): Promise<Wallpaper[]> => {
+      const fetchId = ++latestFetch;
+      const wallpapers = await wallpaperService.getAll();
+      if (fetchId === latestFetch) set({ wallpapers });
+      return wallpapers;
+    };
+
+    return {
     wallpapers: [],
     loading: false,
     error: null,
 
     refresh: async () => {
       try {
-        const wallpapers = await wallpaperService.getAll();
-
-        set({
-          wallpapers,
-          error: null,
-        });
+        await fetchLatest();
+        set({ error: null });
       } catch (error) {
         set({
           error: String(error),
@@ -46,8 +54,7 @@ export const useWallpaperStore =
 
     upscaleWallpaper: async (id, scale) => {
       const result = await wallpaperService.upscaleWallpaper(id, scale);
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      await fetchLatest();
       return result;
     },
 
@@ -58,12 +65,8 @@ export const useWallpaperStore =
           error: null,
         });
 
-        const wallpapers = await wallpaperService.getAll();
-
-        set({
-          wallpapers,
-          loading: false,
-        });
+        await fetchLatest();
+        set({ loading: false });
       } catch (error) {
         set({
           loading: false,
@@ -74,20 +77,17 @@ export const useWallpaperStore =
 
     setActive: async (id) => {
       await wallpaperService.setActive(id);
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      await fetchLatest();
     },
 
     toggleFavorite: async (id) => {
       await wallpaperService.toggleFavorite(id);
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      await fetchLatest();
     },
 
     importWallpaper: async (path) => {
       const id = await wallpaperService.importWallpaper(path);
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      await fetchLatest();
       return id;
     },
 
@@ -97,44 +97,61 @@ export const useWallpaperStore =
       if (!file) return null;
 
       const id = await wallpaperService.importWallpaper(file);
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      await fetchLatest();
       return id;
+    },
+
+    selectWallpaperFiles: () => wallpaperService.selectWallpaperFiles(),
+
+    importWallpapers: async (paths, onProgress) => {
+      const imported: string[] = [];
+      const failed: string[] = [];
+      for (let index = 0; index < paths.length; index += 1) {
+        const path = paths[index];
+        onProgress?.(index + 1, paths.length);
+        try {
+          imported.push(await wallpaperService.importWallpaper(path));
+        } catch (error) {
+          const fileName = path.split(/[\\/]/).pop() || "archivo";
+          failed.push(`${fileName}: ${String(error)}`);
+        }
+      }
+      await fetchLatest();
+      return { imported, failed };
     },
 
     deleteWallpaper: async (id) => {
       await wallpaperService.deleteWallpaper(id);
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      await fetchLatest();
     },
 
     renameWallpaper: async (id, name) => {
       await wallpaperService.renameWallpaper(id, name);
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      latestFetch += 1;
+      const normalizedName = name.trim();
+      set(state => ({
+        wallpapers: state.wallpapers.map(wallpaper => wallpaper.id === id ? { ...wallpaper, name: normalizedName } : wallpaper),
+      }));
     },
 
     rotateWallpaperVersion: async (id, degrees) => {
       await wallpaperService.rotateWallpaperVersion(id, degrees);
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      await fetchLatest();
     },
 
     scanFolder: async () => {
       await wallpaperService.scanFolder();
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      await fetchLatest();
     },
 
     rotateWallpaper: async () => {
       await wallpaperService.rotateWallpaper();
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      await fetchLatest();
     },
 
     assignWallpaperToMonitor: async (monitorId, wallpaperId) => {
       await wallpaperService.assignWallpaperToMonitor(monitorId, wallpaperId);
-      const wallpapers = await wallpaperService.getAll();
-      set({ wallpapers });
+      await fetchLatest();
     },
-  }));
+    };
+  });

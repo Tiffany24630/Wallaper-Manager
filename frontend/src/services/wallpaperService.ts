@@ -70,6 +70,15 @@ export const wallpaperService = {
     return file as string | null;
   },
 
+  async selectWallpaperFiles(): Promise<string[]> {
+    const files = await open({
+      multiple: true,
+      filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png", "webp", "bmp"] }],
+    });
+    if (!files) return [];
+    return Array.isArray(files) ? files : [files];
+  },
+
   async upscaleWallpaper(id: string, scale = 4): Promise<UpscaleResult> {
     const result = await invoke<UpscaleResult>(
       "upscale_wallpaper",

@@ -6,3 +6,10 @@ export interface Monitor {
   refreshRate: number;
   primary: boolean;
 }
+
+export interface MonitorPlaylist {
+  monitorId: string;
+  playlistId: string;
+  currentWallpaperId?: string | null;
+  lastError?: string | null;
+}

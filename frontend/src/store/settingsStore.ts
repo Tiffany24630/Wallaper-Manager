@@ -11,44 +11,44 @@ interface SettingsState {
   saveSettings: (settings: Settings) => Promise<void>;
 }
 
+let requestVersion = 0;
+let saveInFlight = false;
+
 export const useSettingsStore = create<SettingsState>((set) => ({
   settings: null,
   loading: false,
   error: null,
 
   loadSettings: async () => {
+    if (saveInFlight) return;
+    const version = ++requestVersion;
     try {
-      set({
-        loading: true,
-      });
+      set({ loading: true });
 
       const settings = await settingsService.get();
 
-      set({
-        settings,
-        loading: false,
-        error: null,
-      });
+      if (version !== requestVersion || saveInFlight) return;
+      set({ settings, loading: false, error: null });
     } catch (error) {
-      set({
-        loading: false,
-        error: String(error),
-      });
+      if (version !== requestVersion || saveInFlight) return;
+      set({ loading: false, error: String(error) });
     }
   },
 
   saveSettings: async (settings) => {
+    saveInFlight = true;
+    const version = ++requestVersion;
+    set({ loading: true, error: null });
     try {
       await settingsService.save(settings);
 
-      set({
-        settings,
-      });
+      if (version === requestVersion) set({ settings, loading: false, error: null });
     } catch (error) {
-      set({
-        error: String(error),
-      });
+      if (version === requestVersion) set({ loading: false, error: String(error) });
       throw error;
+    } finally {
+      saveInFlight = false;
+      if (version === requestVersion) set({ loading: false });
     }
   },
 }));
