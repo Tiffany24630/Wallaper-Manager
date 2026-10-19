@@ -13,7 +13,7 @@ use webview2_com::{
     NavigationCompletedEventHandler,
 };
 use windows_webview2::{
-    core::{w, HSTRING, Interface, PCWSTR},
+    core::{w, Interface, HSTRING, PCWSTR},
     Win32::{
         Foundation::{E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         Graphics::Gdi::UpdateWindow,
@@ -129,7 +129,10 @@ fn native_html(media_path: &Path) -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("diagnostic.gif");
-    let uri = html_escape(&format!("https://lumina.local/{}", encode_uri_component(filename)));
+    let uri = html_escape(&format!(
+        "https://lumina.local/{}",
+        encode_uri_component(filename)
+    ));
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><style>
         html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:#111827}}
@@ -139,7 +142,7 @@ fn native_html(media_path: &Path) -> String {
           color:#fff;background:rgba(15,23,42,.9);font-size:16px;z-index:2}}
         </style></head><body>
         <div id="status">Native HWND WebView2 · cargando GIF…</div>
-        <img src="{uri}" alt="GIF de diagnóstico" onload="status.textContent='Native HWND WebView2 · GIF cargado'" onerror="status.textContent='Native HWND WebView2 · error de carga'">
+        <img src="{uri}" alt="GIF de diagnóstico" onload="document.getElementById('status').textContent='Native HWND WebView2 · GIF cargado'" onerror="document.getElementById('status').textContent='Native HWND WebView2 · error de carga'">
         </body></html>"#
     )
 }

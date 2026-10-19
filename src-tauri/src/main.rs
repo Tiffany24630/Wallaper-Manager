@@ -105,7 +105,10 @@ fn main() {
                 });
             }
             if std::env::var_os("LUMINA_NATIVE_ANIMATED_TEST").is_some() {
-                match animated_wallpaper::open_native_animated_prototype_test(app.handle().clone(), 0) {
+                match animated_wallpaper::open_native_animated_prototype_test(
+                    app.handle().clone(),
+                    0,
+                ) {
                     Ok(()) => eprintln!("Native animated WebView2 smoke test started"),
                     Err(error) => eprintln!("Native animated WebView2 smoke test failed: {error}"),
                 }
