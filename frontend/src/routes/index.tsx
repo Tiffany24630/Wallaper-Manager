@@ -9,9 +9,14 @@ import Performance from "../pages/Performance/Performance";
 import AIUpscaling from "../pages/AIUpscaling/AIUpscaling";
 import Cursors from "../pages/Cursors/Cursors";
 import Account from "../pages/Account/Account";
+import AnimatedPrototype from "../pages/AnimatedPrototype/AnimatedPrototype";
 
 export const router =
   createHashRouter([
+    {
+      path: "/animated-prototype",
+      element: <AnimatedPrototype />,
+    },
     {
       path: "/",
       element: <MainLayout />,

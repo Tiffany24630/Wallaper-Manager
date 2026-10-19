@@ -1,11 +1,11 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
-import { ListPlus, Plus, Trash2, X } from "lucide-react";
+import { ImageOff, ListPlus, Plus, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import { playlistService } from "../../services/playlistService";
 import { usePlaylistStore } from "../../store/playlistStore";
 import { useWallpaperStore } from "../../store/wallpaperStore";
 import { useSettingsStore } from "../../store/settingsStore";
+import { wallpaperThumbnailSrc } from "../../utils/wallpaperPreview";
 
 export default function PlaylistsPage() {
   const { playlists, loadPlaylists, createPlaylist, deletePlaylist, error } = usePlaylistStore();
@@ -15,6 +15,7 @@ export default function PlaylistsPage() {
   const [selected, setSelected] = useState<string | null>(null);
   const [members, setMembers] = useState<string[]>([]);
   const [wallpaperId, setWallpaperId] = useState("");
+  const [failedPreviews, setFailedPreviews] = useState<string[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   useEffect(() => { void loadPlaylists(); void loadWallpapers(); void loadSettings(); }, [loadPlaylists, loadWallpapers, loadSettings]);
   useEffect(() => { const timer = window.setInterval(() => void loadSettings(), 5000); return () => window.clearInterval(timer); }, [loadSettings]);
@@ -43,9 +44,9 @@ export default function PlaylistsPage() {
       <section className="panel panel-pad min-h-[420px]">
         {!selectedPlaylist ? <div className="empty"><ListPlus className="mx-auto mb-3"/>Crea o selecciona una lista.</div> : <>
           <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-xl font-semibold">{selectedPlaylist.name}</h2><div className="mt-1 text-sm muted">{members.length} {members.length === 1 ? "imagen" : "imágenes"}</div></div>
-            <div className="flex min-w-[300px] gap-2"><select className="input" value={wallpaperId} onChange={e => setWallpaperId(e.target.value)}><option value="">Selecciona un fondo…</option>{available.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}</select><button className="btn btn-primary" onClick={() => void add()} disabled={!wallpaperId}>Añadir</button></div>
+            <div className="min-w-[300px] flex-1"><div className="grid max-h-36 gap-2 overflow-y-auto rounded-xl border border-white/10 p-2 sm:grid-cols-2">{available.length === 0 ? <div className="p-2 text-sm muted">Todos los fondos ya están en la lista.</div> : available.map(w => { const preview = wallpaperThumbnailSrc(w); const failed = failedPreviews.includes(w.id); return <button key={w.id} type="button" onClick={() => setWallpaperId(w.id)} className={`flex items-center gap-2 rounded-lg border p-1.5 text-left ${wallpaperId === w.id ? "border-violet-400 bg-violet-500/10" : "border-transparent bg-white/[.03]"}`}><div className="h-10 w-14 shrink-0 overflow-hidden rounded bg-white/5">{preview && !failed ? <img src={preview} alt="" className="h-full w-full object-cover" onError={() => setFailedPreviews(old => old.includes(w.id) ? old : [...old, w.id])}/> : <div className="grid h-full place-items-center text-slate-500" title="Miniatura no disponible"><ImageOff size={15}/></div>}</div><span className="truncate text-xs">{w.name}</span></button>; })}</div><button className="btn btn-primary mt-2 w-full" onClick={() => void add()} disabled={!wallpaperId}>Añadir fondo seleccionado</button></div>
           </div>
-          {memberWallpapers.length === 0 ? <div className="empty mt-6">Esta lista está vacía.</div> : <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{memberWallpapers.map(w => w && <article key={w.id} className="relative overflow-hidden rounded-xl border border-white/10 bg-white/[.03]"><div className="aspect-video bg-white/5">{w.thumbnail && <img className="h-full w-full object-cover" src={convertFileSrc(w.thumbnail)} alt={w.name}/>}</div><div className="flex items-center gap-2 p-3"><div className="flex-1 truncate text-sm">{w.name}</div><button className="text-slate-500 hover:text-rose-300" onClick={() => void remove(w.id)} aria-label="Quitar de la lista"><X size={16}/></button></div></article>)}</div>}
+          {memberWallpapers.length === 0 ? <div className="empty mt-6">Esta lista está vacía.</div> : <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{memberWallpapers.map(w => w && <article key={w.id} className="relative overflow-hidden rounded-xl border border-white/10 bg-white/[.03]"><div className="aspect-video bg-white/5">{wallpaperThumbnailSrc(w) && <img className="h-full w-full object-cover" src={wallpaperThumbnailSrc(w)!} alt={w.name}/>}</div><div className="flex items-center gap-2 p-3"><div className="flex-1 truncate text-sm">{w.name}</div><button className="text-slate-500 hover:text-rose-300" onClick={() => void remove(w.id)} aria-label="Quitar de la lista"><X size={16}/></button></div></article>)}</div>}
         </>}
       </section>
     </div>

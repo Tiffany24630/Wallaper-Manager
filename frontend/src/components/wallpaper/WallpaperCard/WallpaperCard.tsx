@@ -1,7 +1,7 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { Heart, MonitorUp, Pencil, Trash2 } from "lucide-react";
 import type { Wallpaper } from "../../../types/wallpaper";
 import { formatBytes } from "../../../utils/format";
+import { wallpaperThumbnailSrc } from "../../../utils/wallpaperPreview";
 
 interface Props {
   wallpaper: Wallpaper;
@@ -14,7 +14,7 @@ interface Props {
 }
 
 export default function WallpaperCard({ wallpaper, onActivate, onFavorite, onDelete, onRename, onRotate, busy }: Props) {
-  const preview = wallpaper.thumbnail ? convertFileSrc(wallpaper.thumbnail) : null;
+  const preview = wallpaperThumbnailSrc(wallpaper);
   return (
     <article className={`group overflow-hidden rounded-[18px] border bg-[#121520] transition ${wallpaper.active ? "border-violet-400/70 shadow-lg shadow-violet-500/10" : "border-white/10 hover:border-white/20"}`}>
       <div className="relative aspect-video overflow-hidden bg-white/5">
@@ -40,7 +40,7 @@ export default function WallpaperCard({ wallpaper, onActivate, onFavorite, onDel
             <option value="" disabled>Rotar</option>
             <option value="90">90°</option><option value="180">180°</option><option value="270">270°</option><option value="0">Original</option>
           </select>
-          <button className="btn btn-danger w-11 px-0" aria-label="Eliminar" onClick={() => onDelete(wallpaper.id)}><Trash2 size={17} /></button>
+          <button className="btn btn-danger w-11 px-0" aria-label="Eliminar" onClick={() => onDelete(wallpaper.id)} disabled={busy}><Trash2 size={17} /></button>
         </div>
       </div>
     </article>

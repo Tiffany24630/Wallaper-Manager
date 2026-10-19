@@ -1,12 +1,32 @@
-import { Save, Settings2, ShieldCheck } from "lucide-react";
-import { useEffect, useState } from "react";
+import { ImageOff, MonitorPlay, Save, Settings2, ShieldCheck } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useSettingsStore } from "../../store/settingsStore";
 import type { Settings as SettingsType } from "../../types/settings";
+import type { Wallpaper } from "../../types/wallpaper";
 import { playlistService } from "../../services/playlistService";
 import { useWallpaperStore } from "../../store/wallpaperStore";
+import { wallpaperThumbnailSrc } from "../../utils/wallpaperPreview";
+import { animatedPrototypeService } from "../../services/animatedPrototypeService";
+import { monitorService } from "../../services/monitorService";
+import type { Monitor } from "../../types/monitor";
 
 const defaults: SettingsType = { launch_at_startup: false, minimize_to_tray: true, hardware_acceleration: true, pause_on_battery: false, pause_when_maximized: true, scaling_mode: "fill", accent_color: "violet", ui_scale: 100, dynamic_enabled: false, dynamic_playlist_id: null, dynamic_interval_minutes: 5, dynamic_current_wallpaper_id: null, dynamic_last_error: null, cursor_enabled: false, active_cursor_id: null };
 const dynamicIntervals = [1, 5, 10, 15, 30, 60, 120, 360, 720, 1440];
+
+function PlaylistWallpaperPreview({ wallpaper, name }: { wallpaper?: Wallpaper; name: string }) {
+  const preview = wallpaper ? wallpaperThumbnailSrc(wallpaper) : null;
+  const [failed, setFailed] = useState(!preview);
+
+  return (
+    <div className="aspect-video bg-white/5">
+      {failed ? (
+        <div className="grid h-full place-items-center text-slate-500" title="Miniatura no disponible"><ImageOff size={20}/></div>
+      ) : (
+        <img src={preview!} alt={name} className="h-full w-full object-cover" onError={() => setFailed(true)}/>
+      )}
+    </div>
+  );
+}
 
 function Switch({ checked, onChange, label, description }: { checked: boolean; onChange: (value: boolean) => void; label: string; description: string }) {
   return <label className="flex cursor-pointer items-center justify-between gap-5 border-b border-white/[.07] py-4 last:border-0"><span><span className="block text-sm font-medium">{label}</span><span className="mt-1 block text-xs leading-5 muted">{description}</span></span><input className="sr-only" type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)}/><span className={`relative h-6 w-11 shrink-0 rounded-full transition ${checked ? "bg-violet-500" : "bg-white/15"}`}><span className={`absolute top-1 h-4 w-4 rounded-full bg-white transition ${checked ? "left-6" : "left-1"}`}/></span></label>;
@@ -15,15 +35,90 @@ function Switch({ checked, onChange, label, description }: { checked: boolean; o
 export default function Settings() {
   const { settings, loading, error, loadSettings, saveSettings } = useSettingsStore();
   const [draft, setDraft] = useState<SettingsType>(defaults);
+  const [draftDirty, setDraftDirty] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [prototypeBusy, setPrototypeBusy] = useState(false);
+  const [prototypeMonitors, setPrototypeMonitors] = useState<Monitor[]>([]);
+  const [prototypeMonitorIndex, setPrototypeMonitorIndex] = useState(0);
   const [playlists, setPlaylists] = useState<{ id: string; name: string }[]>([]);
+  const [playlistMembers, setPlaylistMembers] = useState<string[]>([]);
+  const [playlistMembersLoading, setPlaylistMembersLoading] = useState(false);
+  const playlistMembersCache = useRef(new Map<string, string[]>());
   const { wallpapers, loadWallpapers } = useWallpaperStore();
   useEffect(() => { void loadSettings(); }, [loadSettings]);
   useEffect(() => { void playlistService.getAll().then(setPlaylists).catch(() => setPlaylists([])); void loadWallpapers(); }, [loadWallpapers]);
+  useEffect(() => {
+    void monitorService.getAll().then(monitors => {
+      setPrototypeMonitors(monitors);
+      const primaryIndex = monitors.findIndex(monitor => monitor.primary);
+      setPrototypeMonitorIndex(primaryIndex >= 0 ? primaryIndex : 0);
+    }).catch(() => setPrototypeMonitors([]));
+  }, []);
   useEffect(() => { const timer = window.setInterval(() => void loadSettings(), 5000); return () => window.clearInterval(timer); }, [loadSettings]);
-  useEffect(() => { if (settings) setDraft(settings); }, [settings]);
-  const patch = <K extends keyof SettingsType>(key: K, value: SettingsType[K]) => setDraft(old => ({ ...old, [key]: value }));
-  async function save() { setMessage(null); try { await saveSettings(draft); setMessage("Preferencias guardadas."); } catch (e) { setMessage(String(e)); } }
+  useEffect(() => { if (settings && !draftDirty) setDraft(settings); }, [settings, draftDirty]);
+  useEffect(() => {
+    const playlistId = draft.dynamic_playlist_id;
+    if (!playlistId) {
+      setPlaylistMembers([]);
+      setPlaylistMembersLoading(false);
+      return;
+    }
+    const cached = playlistMembersCache.current.get(playlistId);
+    if (cached) {
+      setPlaylistMembers(cached);
+      setPlaylistMembersLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setPlaylistMembersLoading(true);
+    void playlistService.getPlaylistWallpapers(playlistId).then(memberIds => {
+      playlistMembersCache.current.set(playlistId, memberIds);
+      if (!cancelled) setPlaylistMembers(memberIds);
+    }).catch(() => {
+      if (!cancelled) setPlaylistMembers([]);
+    }).finally(() => {
+      if (!cancelled) setPlaylistMembersLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [draft.dynamic_playlist_id]);
+  const patch = <K extends keyof SettingsType>(key: K, value: SettingsType[K]) => { setDraftDirty(true); setDraft(old => ({ ...old, [key]: value })); };
+  async function save() {
+    setMessage(null);
+    if (draft.dynamic_enabled && !draft.dynamic_playlist_id) {
+      setMessage("Selecciona una playlist antes de activar el fondo dinámico.");
+      return;
+    }
+    const current = useSettingsStore.getState().settings;
+    const next = current ? { ...current, ...draft } : draft;
+    try { await saveSettings(next); setDraft(next); setDraftDirty(false); setMessage("Preferencias guardadas."); } catch (e) { setMessage(String(e)); }
+  }
+
+  async function openAnimatedPrototype() {
+    setMessage(null);
+    const mediaPath = await animatedPrototypeService.chooseMedia();
+    if (!mediaPath) return;
+    setPrototypeBusy(true);
+    try {
+      await animatedPrototypeService.open(mediaPath, prototypeMonitorIndex);
+      setMessage("Prototipo WebView2 abierto en el monitor seleccionado.");
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setPrototypeBusy(false);
+    }
+  }
+
+  async function closeAnimatedPrototype() {
+    setPrototypeBusy(true);
+    try {
+      await animatedPrototypeService.close(prototypeMonitorIndex);
+      setMessage("Superficie del prototipo cerrada.");
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setPrototypeBusy(false);
+    }
+  }
 
   return <div className="page">
     <header className="page-header"><div><div className="eyebrow">Preferencias locales</div><h1 className="page-title">Ajustes</h1><p className="page-subtitle">Configura el comportamiento que Lumina conservará entre sesiones.</p></div><button className="btn btn-primary" onClick={() => void save()} disabled={loading}><Save size={16}/> Guardar cambios</button></header>
@@ -41,6 +136,16 @@ export default function Settings() {
       </section>
       <section className="panel panel-pad lg:col-span-2"><div className="mb-2 flex items-center justify-between gap-3"><div><h2 className="font-semibold">Fondo dinámico</h2><p className="mt-1 text-sm muted">Cambia automáticamente entre los fondos de una lista mientras Lumina está ejecutándose.</p></div><Switch checked={draft.dynamic_enabled} onChange={value => patch("dynamic_enabled", value)} label="Activar" description="Usar la lista seleccionada como fondo global."/></div>
         <div className="grid gap-4 md:grid-cols-2"><div><label className="block text-sm font-medium">Lista de fondos</label><select className="input mt-2" value={draft.dynamic_playlist_id ?? ""} onChange={event => patch("dynamic_playlist_id", event.target.value || null)}><option value="">Selecciona una lista</option>{playlists.map(list => <option key={list.id} value={list.id}>{list.name}</option>)}</select></div><div><label className="block text-sm font-medium">Cambiar cada</label><select className="input mt-2" value={draft.dynamic_interval_minutes} onChange={event => patch("dynamic_interval_minutes", Number(event.target.value))}>{dynamicIntervals.map(minutes => <option key={minutes} value={minutes}>{minutes < 60 ? `${minutes} minuto${minutes === 1 ? "" : "s"}` : minutes < 1440 ? `${minutes / 60} hora${minutes === 60 ? "" : "s"}` : "24 horas"}</option>)}</select></div></div>
+        {draft.dynamic_playlist_id && <div className="mt-5">
+          <div className="mb-2 flex items-center justify-between gap-3"><span className="text-sm font-medium">Imágenes de la lista</span><span className="text-xs muted">{playlistMembers.length} {playlistMembers.length === 1 ? "imagen" : "imágenes"}</span></div>
+          {playlistMembersLoading && playlistMembers.length === 0 ? <div className="rounded-xl border border-white/10 p-4 text-sm muted">Cargando miniaturas…</div> : playlistMembers.length === 0 ? <div className="rounded-xl border border-white/10 p-4 text-sm muted">Esta lista no contiene imágenes.</div> : <div className="grid max-h-72 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">{playlistMembers.map(id => {
+            const wallpaper = wallpapers.find(item => item.id === id);
+            return <article key={id} className="overflow-hidden rounded-xl border border-white/10 bg-white/[.03]">
+              <PlaylistWallpaperPreview wallpaper={wallpaper} name={wallpaper?.name ?? "Wallpaper no disponible"}/>
+              <div className="truncate p-2.5 text-xs" title={wallpaper?.name}>{wallpaper?.name ?? "Wallpaper no disponible"}</div>
+            </article>;
+          })}</div>}
+        </div>}
         {draft.dynamic_enabled && !draft.dynamic_playlist_id && <div className="status-error mt-4">Selecciona una lista antes de guardar el fondo dinámico.</div>}
         {draft.dynamic_last_error && <div className="status-error mt-4">{draft.dynamic_last_error}</div>}
         {draft.dynamic_current_wallpaper_id && <div className="mt-3 text-sm muted">Fondo actual: {wallpapers.find(w => w.id === draft.dynamic_current_wallpaper_id)?.name ?? "no disponible"}</div>}
@@ -50,6 +155,18 @@ export default function Settings() {
         <div className="grid gap-5 md:grid-cols-2">
           <div><label className="block text-sm font-medium">Color de acento</label><div className="mt-3 flex flex-wrap gap-2">{(["violet", "cyan", "rose", "emerald"] as const).map(color => <button key={color} type="button" onClick={() => patch("accent_color", color)} className={`accent-swatch accent-${color} ${draft.accent_color === color ? "is-selected" : ""}`} aria-label={`Usar acento ${color}`} />)}</div></div>
           <div><label className="block text-sm font-medium">Tamaño de interfaz: {draft.ui_scale}%</label><input className="mt-4 w-full" type="range" min="85" max="115" step="5" value={draft.ui_scale} onChange={e => patch("ui_scale", Number(e.target.value))}/></div>
+        </div>
+      </section>
+      <section className="panel panel-pad lg:col-span-2">
+        <div className="mb-2 flex items-center gap-2"><MonitorPlay size={18} className="text-amber-300"/><h2 className="font-semibold">Prototipo técnico WebView2</h2></div>
+        <p className="text-sm leading-6 muted">Prueba aislada de una superficie Win32/WebView2 para medios locales. No modifica playlists ni activa fondos animados de producción.</p>
+        <label className="mt-4 block text-sm font-medium">Monitor de prueba</label>
+        <select className="input mt-2 max-w-xl" value={prototypeMonitorIndex} onChange={event => setPrototypeMonitorIndex(Number(event.target.value))} disabled={prototypeMonitors.length === 0}>
+          {prototypeMonitors.length === 0 ? <option value={0}>No se detectaron monitores</option> : prototypeMonitors.map((monitor, index) => <option key={monitor.id} value={index}>{monitor.name || `Monitor ${index + 1}`} · {monitor.width} × {monitor.height}{monitor.primary ? " · Principal" : ""}</option>)}
+        </select>
+        <div className="mt-4 flex flex-wrap gap-3">
+          <button className="btn btn-secondary" type="button" onClick={() => void openAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Abrir medio MP4/GIF</button>
+          <button className="btn btn-secondary" type="button" onClick={() => void closeAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Cerrar superficie</button>
         </div>
       </section>
     </div>

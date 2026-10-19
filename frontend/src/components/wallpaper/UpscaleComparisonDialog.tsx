@@ -1,6 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { Check, Images } from "lucide-react";
 import type { Wallpaper } from "../../types/wallpaper";
+import { wallpaperThumbnailSrc } from "../../utils/wallpaperPreview";
 
 interface Props {
   original: Wallpaper;
@@ -10,10 +11,10 @@ interface Props {
 }
 
 function Preview({ wallpaper, label }: { wallpaper: Wallpaper; label: string }) {
-  const previewPath = wallpaper.thumbnail || wallpaper.path;
+  const previewPath = wallpaperThumbnailSrc(wallpaper) || wallpaper.path;
   return <article className="comparison-option">
     <div className="comparison-image">
-      <img src={convertFileSrc(previewPath)} alt={`${label}: ${wallpaper.name}`} />
+      <img src={previewPath.includes("?") ? previewPath : convertFileSrc(previewPath)} alt={`${label}: ${wallpaper.name}`} />
     </div>
     <div className="p-4">
       <div className="font-semibold">{label}</div>
