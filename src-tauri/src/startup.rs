@@ -65,7 +65,87 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
         .map_err(|error| format!("No se pudo actualizar el inicio automático de Lumina: {error}"))
 }
 
+#[cfg(target_os = "windows")]
+pub fn is_enabled() -> Result<bool, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
+    };
+
+    let key_path: Vec<u16> = RUN_KEY.encode_utf16().chain([0]).collect();
+    let value_name: Vec<u16> = VALUE_NAME.encode_utf16().chain([0]).collect();
+    let mut key = HKEY::default();
+    let result = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_path.as_ptr()),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if result.0 == 2 {
+        return Ok(false);
+    }
+    if result.is_err() {
+        return Err(format!(
+            "No se pudo comprobar el inicio automático de Lumina: {result:?}"
+        ));
+    }
+
+    let mut size = 0u32;
+    let query = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            None,
+            None,
+            Some(&mut size),
+        )
+    };
+    if query.0 == 2 {
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+        return Ok(false);
+    }
+    if query.is_err() || size == 0 {
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+        return Err(format!(
+            "No se pudo comprobar el inicio automático de Lumina: {query:?}"
+        ));
+    }
+    let mut data = vec![0u8; size as usize];
+    let query = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            None,
+            Some(data.as_mut_ptr()),
+            Some(&mut size),
+        )
+    };
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+    if query.is_err() {
+        return Err(format!(
+            "No se pudo comprobar el inicio automático de Lumina: {query:?}"
+        ));
+    }
+    Ok(size > 0)
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn set_enabled(_enabled: bool) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_enabled() -> Result<bool, String> {
+    Ok(false)
 }
