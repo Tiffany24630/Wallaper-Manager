@@ -64,6 +64,16 @@ pub fn get_connection() -> Result<Connection> {
             FOREIGN KEY(wallpaper_id) REFERENCES wallpapers(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS monitor_playlists(
+            monitor_id TEXT PRIMARY KEY,
+            playlist_id TEXT NOT NULL,
+            current_wallpaper_id TEXT,
+            last_error TEXT,
+            FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
+            FOREIGN KEY(current_wallpaper_id) REFERENCES wallpapers(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS monitor_playlists_playlist ON monitor_playlists(playlist_id);
+
         CREATE TABLE IF NOT EXISTS settings(
             id INTEGER PRIMARY KEY,
             launch_at_startup INTEGER DEFAULT 0,

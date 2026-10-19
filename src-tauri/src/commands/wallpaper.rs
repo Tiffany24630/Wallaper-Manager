@@ -182,6 +182,8 @@ pub fn set_active_wallpaper(
         [&wallpaper_id],
     )
     .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM monitor_playlists", [])
+        .map_err(|e| e.to_string())?;
     scheduler.stop();
     Ok(())
 }

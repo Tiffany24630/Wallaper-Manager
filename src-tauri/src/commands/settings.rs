@@ -58,27 +58,9 @@ pub fn get_settings() -> Result<Settings, String> {
         },
     );
 
-    match result {
-        Ok(settings) => Ok(settings),
-
-        Err(_) => Ok(Settings {
-            launch_at_startup: false,
-            minimize_to_tray: true,
-            hardware_acceleration: true,
-            pause_on_battery: false,
-            pause_when_maximized: true,
-            scaling_mode: "fill".into(),
-            accent_color: "violet".into(),
-            ui_scale: 100,
-            dynamic_enabled: false,
-            dynamic_playlist_id: None,
-            dynamic_interval_minutes: 5,
-            dynamic_current_wallpaper_id: None,
-            dynamic_last_error: None,
-            cursor_enabled: false,
-            active_cursor_id: None,
-        }),
-    }
+    let mut settings = result.map_err(|error| error.to_string())?;
+    settings.launch_at_startup = startup::is_enabled()?;
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -114,55 +96,41 @@ pub fn save_settings(
         if !exists {
             return Err("La playlist seleccionada ya no existe".into());
         }
+        let monitor_playlists: i64 = conn
+            .query_row("SELECT COUNT(*) FROM monitor_playlists", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        if monitor_playlists > 0 {
+            return Err("Desactiva primero las playlists asignadas por monitor para usar el fondo dinámico global".into());
+        }
     }
     startup::set_enabled(settings.launch_at_startup)?;
+    if startup::is_enabled()? != settings.launch_at_startup {
+        return Err("Windows no pudo confirmar el estado del inicio automático de Lumina".into());
+    }
     let mut conn = get_connection().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
 
     tx.execute(
         "
-        DELETE FROM settings
-        ",
-        [],
-    )
-    .map_err(|e| e.to_string())?;
-
-    tx.execute(
-        "
-        INSERT INTO settings(
-            launch_at_startup,
-            minimize_to_tray,
-            hardware_acceleration,
-            pause_on_battery,
-            pause_when_maximized,
-            scaling_mode,
-            accent_color,
-            ui_scale,
-            dynamic_enabled,
-            dynamic_playlist_id,
-            dynamic_interval_minutes,
-            dynamic_current_wallpaper_id,
-            dynamic_last_error,
-            cursor_enabled,
-            active_cursor_id
-        )
-        VALUES(
-            ?1,
-            ?2,
-            ?3,
-            ?4,
-            ?5,
-            ?6,
-            ?7,
-            ?8,
-            ?9,
-            ?10,
-            ?11,
-            ?12,
-            ?13,
-            ?14,
-            ?15
-        )
+        UPDATE settings SET
+            launch_at_startup = ?1,
+            minimize_to_tray = ?2,
+            hardware_acceleration = ?3,
+            pause_on_battery = ?4,
+            pause_when_maximized = ?5,
+            scaling_mode = ?6,
+            accent_color = ?7,
+            ui_scale = ?8,
+            dynamic_enabled = ?9,
+            dynamic_playlist_id = ?10,
+            dynamic_interval_minutes = ?11,
+            dynamic_current_wallpaper_id = ?12,
+            dynamic_last_error = ?13,
+            cursor_enabled = ?14,
+            active_cursor_id = ?15
+        WHERE id = (SELECT id FROM settings LIMIT 1)
         ",
         params![
             settings.launch_at_startup as i32,

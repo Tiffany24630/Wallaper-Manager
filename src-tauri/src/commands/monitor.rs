@@ -2,6 +2,7 @@ use crate::{
     db::get_connection,
     dynamic::DynamicScheduler,
     models::monitor::MonitorInfo,
+    models::monitor_playlist::MonitorPlaylist,
     utils::windows_wallpaper::{available_monitor_ids, set_monitor_wallpaper},
 };
 use tauri::Manager;
@@ -215,11 +216,99 @@ pub fn assign_wallpaper_to_monitor(
     )
     .map_err(|e| e.to_string())?;
     conn.execute(
+        "DELETE FROM monitor_playlists WHERE monitor_id = ?1",
+        [&monitor_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
         "UPDATE settings SET dynamic_enabled = 0, dynamic_last_error = NULL WHERE id = (SELECT id FROM settings LIMIT 1)",
         [],
     )
     .map_err(|e| e.to_string())?;
     scheduler.stop();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_monitor_playlists() -> Result<Vec<MonitorPlaylist>, String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT monitor_id, playlist_id, current_wallpaper_id, last_error
+             FROM monitor_playlists ORDER BY monitor_id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(MonitorPlaylist {
+                monitor_id: row.get(0)?,
+                playlist_id: row.get(1)?,
+                current_wallpaper_id: row.get(2)?,
+                last_error: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn assign_playlist_to_monitor(
+    app: tauri::AppHandle,
+    monitor_id: String,
+    playlist_id: String,
+    scheduler: State<'_, DynamicScheduler>,
+) -> Result<(), String> {
+    if !current_monitor_ids(&app)?
+        .iter()
+        .any(|id| id == &monitor_id)
+    {
+        return Err("La pantalla seleccionada ya no está disponible".into());
+    }
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM playlists WHERE id = ?1)",
+            [&playlist_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        return Err("La playlist seleccionada ya no existe".into());
+    }
+    conn.execute(
+        "INSERT INTO monitor_playlists(monitor_id, playlist_id, current_wallpaper_id, last_error)
+         VALUES(?1, ?2, NULL, NULL)
+         ON CONFLICT(monitor_id) DO UPDATE SET
+           playlist_id = excluded.playlist_id,
+           current_wallpaper_id = CASE
+             WHEN monitor_playlists.playlist_id = excluded.playlist_id
+             THEN monitor_playlists.current_wallpaper_id ELSE NULL END,
+           last_error = NULL",
+        (&monitor_id, &playlist_id),
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE settings SET dynamic_enabled = 0, dynamic_last_error = NULL WHERE id = (SELECT id FROM settings LIMIT 1)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    scheduler.restart();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn remove_playlist_from_monitor(
+    monitor_id: String,
+    scheduler: State<'_, DynamicScheduler>,
+) -> Result<(), String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM monitor_playlists WHERE monitor_id = ?1",
+        [&monitor_id],
+    )
+    .map_err(|e| e.to_string())?;
+    scheduler.restart();
     Ok(())
 }
 

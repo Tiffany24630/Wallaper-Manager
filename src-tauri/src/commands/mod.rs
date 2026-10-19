@@ -1,5 +1,9 @@
+pub mod cursor;
+pub mod download;
 pub mod monitor;
 pub mod playlist;
+pub mod secure_storage;
 pub mod settings;
+pub mod sync;
 pub mod system;
 pub mod wallpaper;
