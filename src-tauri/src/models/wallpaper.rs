@@ -13,5 +13,6 @@ pub struct Wallpaper {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub file_type: Option<String>,
+    pub hash: Option<String>,
     pub created_at: Option<String>,
 }
