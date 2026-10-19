@@ -30,9 +30,9 @@ export default function Library() {
       setMessage("Imagen añadida a la biblioteca.");
       if (!window.confirm("Imagen importada. ¿Quieres mejorar su calidad con IA? Se conservará el original hasta que compares ambas versiones.")) return;
       setMessage("Mejorando la imagen; este proceso puede tardar varios minutos…");
-      const enhancedId = await store.upscaleWallpaper(originalId, 4);
-      setComparison({ originalId, enhancedId });
-      setMessage(null);
+      const result = await store.upscaleWallpaper(originalId, 4);
+      setComparison({ originalId, enhancedId: result.id });
+      setMessage(result.warning ? `Aviso: ${result.warning}` : null);
     } catch (error) { setMessage(`Error: ${String(error)}`); }
     finally { setBusy(false); }
   }

@@ -10,9 +10,10 @@ interface Props {
 }
 
 function Preview({ wallpaper, label }: { wallpaper: Wallpaper; label: string }) {
+  const previewPath = wallpaper.thumbnail || wallpaper.path;
   return <article className="comparison-option">
     <div className="comparison-image">
-      <img src={convertFileSrc(wallpaper.path)} alt={`${label}: ${wallpaper.name}`} />
+      <img src={convertFileSrc(previewPath)} alt={`${label}: ${wallpaper.name}`} />
     </div>
     <div className="p-4">
       <div className="font-semibold">{label}</div>

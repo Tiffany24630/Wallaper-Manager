@@ -15,7 +15,7 @@ export default function AIUpscaling() {
   useEffect(() => { void loadWallpapers(); }, [loadWallpapers]);
   useEffect(() => { if (!selected && wallpapers[0]) setSelected(wallpapers[0].id); }, [wallpapers, selected]);
   const current = wallpapers.find(w => w.id === selected);
-  async function enhance() { if (!selected) return; setBusy(true); setMessage(null); try { const enhancedId = await upscaleWallpaper(selected, scale); setComparison({ originalId: selected, enhancedId }); } catch (e) { setMessage(`Error: ${String(e)}`); } finally { setBusy(false); } }
+  async function enhance() { if (!selected) return; setBusy(true); setMessage(null); try { const result = await upscaleWallpaper(selected, scale); setComparison({ originalId: selected, enhancedId: result.id }); if (result.warning) setMessage(`Aviso: ${result.warning}`); } catch (e) { setMessage(`Error: ${String(e)}`); } finally { setBusy(false); } }
   async function chooseVersion(choice: "original" | "enhanced") { if (!comparison) return; setBusy(true); try { const original = wallpapers.find(w => w.id === comparison.originalId); if (choice === "enhanced" && original?.active) await store.setActive(comparison.enhancedId); await store.deleteWallpaper(choice === "original" ? comparison.enhancedId : comparison.originalId); setSelected(choice === "original" ? comparison.originalId : comparison.enhancedId); setComparison(null); setMessage(choice === "original" ? "Se conservó la versión original." : "Se conservó la versión mejorada."); } catch (e) { setMessage(`Error: ${String(e)}`); } finally { setBusy(false); } }
   const original = comparison && wallpapers.find(w => w.id === comparison.originalId);
   const enhanced = comparison && wallpapers.find(w => w.id === comparison.enhancedId);

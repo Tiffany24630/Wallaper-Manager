@@ -3,6 +3,12 @@ import type { Wallpaper } from "../types/wallpaper";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 
+export interface UpscaleResult {
+  id: string;
+  method: string;
+  warning?: string;
+}
+
 export const wallpaperService = {
   async getAll(): Promise<Wallpaper[]> {
     return tauriInvoke<Wallpaper[]>("list_wallpapers");
@@ -52,8 +58,8 @@ export const wallpaperService = {
     return file as string | null;
   },
 
-  async upscaleWallpaper(id: string, scale = 4) {
-    return invoke<string>(
+  async upscaleWallpaper(id: string, scale = 4): Promise<UpscaleResult> {
+    return invoke<UpscaleResult>(
       "upscale_wallpaper",
       {
         wallpaperId: id,

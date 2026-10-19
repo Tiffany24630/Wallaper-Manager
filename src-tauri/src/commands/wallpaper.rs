@@ -1,6 +1,7 @@
 use chrono::Utc;
 use image::{imageops::FilterType, GenericImageView};
 use rand::seq::SliceRandom;
+use serde::Serialize;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -247,12 +248,43 @@ fn target_dimensions(width: u32, height: u32, scale: u8) -> Result<(u32, u32), S
     Ok((target_width, target_height))
 }
 
+fn validate_generated_image(path: &Path, expected: (u32, u32)) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("Real-ESRGAN no generó el archivo de salida esperado".into());
+    }
+    let size = fs::metadata(path)
+        .map_err(|e| format!("No se pudo inspeccionar la salida mejorada: {e}"))?
+        .len();
+    if size == 0 {
+        return Err("Real-ESRGAN generó un archivo vacío".into());
+    }
+    let image = image::open(path)
+        .map_err(|e| format!("La salida de Real-ESRGAN no es una imagen válida: {e}"))?;
+    if image.dimensions() != expected {
+        return Err(format!(
+            "La salida mejorada tiene dimensiones {} × {}; se esperaban {} × {}",
+            image.width(),
+            image.height(),
+            expected.0,
+            expected.1
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpscaleResult {
+    pub id: String,
+    pub method: String,
+    pub warning: Option<String>,
+}
+
 #[tauri::command]
 pub fn upscale_wallpaper(
     app: tauri::AppHandle,
     wallpaper_id: String,
     scale: Option<u8>,
-) -> Result<String, String> {
+) -> Result<UpscaleResult, String> {
     let scale = scale.unwrap_or(4);
     let model = match scale {
         3 => "realesr-animevideov3-x3",
@@ -283,11 +315,17 @@ pub fn upscale_wallpaper(
         .join(format!("{}-{scale}x.png", Uuid::new_v4()));
     let output_string = output_path.to_string_lossy().into_owned();
     let scale_string = scale.to_string();
-    let used_ai = hardware_acceleration
-        && realesrgan_dir(&app)
-            .ok()
-            .and_then(|tool_dir| {
-                Command::new(tool_dir.join("realesrgan-ncnn-vulkan.exe"))
+    let source = image::open(&source_path)
+        .map_err(|e| format!("No se pudo abrir la imagen para mejorarla: {e}"))?;
+    let expected_dimensions = target_dimensions(source.width(), source.height(), scale)?;
+    let mut used_ai = false;
+    let mut warning = None;
+
+    if hardware_acceleration {
+        if let Ok(tool_dir) = realesrgan_dir(&app) {
+            let executable = tool_dir.join("realesrgan-ncnn-vulkan.exe");
+            if executable.is_file() {
+                let result = Command::new(&executable)
                     .current_dir(&tool_dir)
                     .args([
                         "-i",
@@ -299,23 +337,34 @@ pub fn upscale_wallpaper(
                         "-s",
                         &scale_string,
                     ])
-                    .status()
-                    .ok()
-                    .filter(|status| status.success())
-            })
-            .is_some()
-        && output_path.is_file();
+                    .output()
+                    .map_err(|e| format!("No se pudo iniciar Real-ESRGAN: {e}"))?;
+                if result.status.success() {
+                    validate_generated_image(&output_path, expected_dimensions)?;
+                    used_ai = true;
+                } else {
+                    let detail = String::from_utf8_lossy(&result.stderr).trim().to_string();
+                    warning = Some(if detail.is_empty() {
+                        "Real-ESRGAN no pudo ejecutarse; se usó el respaldo Lanczos.".into()
+                    } else {
+                        format!("Real-ESRGAN no pudo ejecutarse ({detail}); se usó el respaldo Lanczos.")
+                    });
+                }
+            }
+        }
+    }
 
     if !used_ai {
         let _ = fs::remove_file(&output_path);
-        let source = image::open(&source_path)
-            .map_err(|e| format!("No se pudo abrir la imagen para mejorarla: {e}"))?;
-        let (width, height) = source.dimensions();
-        let (target_width, target_height) = target_dimensions(width, height, scale)?;
         source
-            .resize_exact(target_width, target_height, FilterType::Lanczos3)
+            .resize_exact(
+                expected_dimensions.0,
+                expected_dimensions.1,
+                FilterType::Lanczos3,
+            )
             .save(&output_path)
             .map_err(|e| format!("No se pudo guardar la imagen mejorada: {e}"))?;
+        validate_generated_image(&output_path, expected_dimensions)?;
     }
 
     let stem = Path::new(&original_name)
@@ -334,12 +383,21 @@ pub fn upscale_wallpaper(
         }
     };
     let _ = fs::remove_file(output_path);
-    Ok(new_id)
+    Ok(UpscaleResult {
+        id: new_id,
+        method: method.into(),
+        warning,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::target_dimensions;
+    use super::{target_dimensions, validate_generated_image};
+    use image::RgbImage;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn calculates_upscaled_resolution() {
@@ -351,5 +409,25 @@ mod tests {
     fn rejects_unsafe_output_sizes() {
         assert!(target_dimensions(u32::MAX, 100, 4).is_err());
         assert!(target_dimensions(10_000, 10_000, 4).is_err());
+    }
+
+    #[test]
+    fn validates_generated_image_dimensions_and_readability() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumina-upscale-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("output.png");
+        RgbImage::new(24, 16).save(&path).unwrap();
+
+        assert!(validate_generated_image(&path, (24, 16)).is_ok());
+        assert!(validate_generated_image(&path, (48, 32)).is_err());
+        fs::write(&path, b"not an image").unwrap();
+        assert!(validate_generated_image(&path, (24, 16)).is_err());
+        let _ = fs::remove_dir_all(dir);
     }
 }

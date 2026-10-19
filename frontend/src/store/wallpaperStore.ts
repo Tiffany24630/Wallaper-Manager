@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { Wallpaper } from "../types/wallpaper";
 import { wallpaperService } from "../services/wallpaperService";
+import type { UpscaleResult } from "../services/wallpaperService";
 
 interface WallpaperState {
   wallpapers: Wallpaper[];
@@ -16,7 +17,7 @@ interface WallpaperState {
   deleteWallpaper: (id: string) => Promise<void>;
   scanFolder: () => Promise<void>;
   rotateWallpaper: () => Promise<void>;
-  upscaleWallpaper: (id: string, scale?: number) => Promise<string>;
+  upscaleWallpaper: (id: string, scale?: number) => Promise<UpscaleResult>;
   assignWallpaperToMonitor: (monitorId: string, wallpaperId: string) => Promise<void>;
 }
 
