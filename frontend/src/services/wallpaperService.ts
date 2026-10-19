@@ -38,6 +38,14 @@ export const wallpaperService = {
     });
   },
 
+  async renameWallpaper(id: string, name: string): Promise<void> {
+    return tauriInvoke("rename_wallpaper", { wallpaperId: id, name });
+  },
+
+  async rotateWallpaperVersion(id: string, degrees: 0 | 90 | 180 | 270): Promise<void> {
+    return tauriInvoke("rotate_wallpaper_version", { wallpaperId: id, degrees });
+  },
+
   async selectWallpaperFile(): Promise<string | null> {
     const file = await open({
       multiple: false,
@@ -76,7 +84,7 @@ export const wallpaperService = {
 
   async rotateWallpaper(): Promise<void> {
     return tauriInvoke(
-      "rotate_wallpaper"
+      "rotate_random_wallpaper"
     );
   },
 

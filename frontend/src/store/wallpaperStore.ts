@@ -15,6 +15,8 @@ interface WallpaperState {
   importWallpaper: (path: string) => Promise<string>;
   selectAndImportWallpaper: () => Promise<string | null>;
   deleteWallpaper: (id: string) => Promise<void>;
+  renameWallpaper: (id: string, name: string) => Promise<void>;
+  rotateWallpaperVersion: (id: string, degrees: 0 | 90 | 180 | 270) => Promise<void>;
   scanFolder: () => Promise<void>;
   rotateWallpaper: () => Promise<void>;
   upscaleWallpaper: (id: string, scale?: number) => Promise<UpscaleResult>;
@@ -102,6 +104,18 @@ export const useWallpaperStore =
 
     deleteWallpaper: async (id) => {
       await wallpaperService.deleteWallpaper(id);
+      const wallpapers = await wallpaperService.getAll();
+      set({ wallpapers });
+    },
+
+    renameWallpaper: async (id, name) => {
+      await wallpaperService.renameWallpaper(id, name);
+      const wallpapers = await wallpaperService.getAll();
+      set({ wallpapers });
+    },
+
+    rotateWallpaperVersion: async (id, degrees) => {
+      await wallpaperService.rotateWallpaperVersion(id, degrees);
       const wallpapers = await wallpaperService.getAll();
       set({ wallpapers });
     },
