@@ -9,5 +9,6 @@ export interface Wallpaper {
   width?: number;
   height?: number;
   fileType?: string;
+  hash?: string;
   createdAt?: string;
 }

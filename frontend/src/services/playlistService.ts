@@ -1,28 +1,33 @@
 import { tauriInvoke } from "./tauri";
 import type { Playlist } from "../types/playlist";
+import { notifyLocalChange } from "./syncQueueService";
 
 export const playlistService = {
   async getAll(): Promise<Playlist[]> {
     return tauriInvoke<Playlist[]>("get_playlists");
   },
 
-  async create(name: string): Promise<void> {
-    return tauriInvoke("create_playlist", {
+  async create(name: string): Promise<string> {
+    const id = await tauriInvoke<string>("create_playlist", {
       name,
     });
+    await notifyLocalChange("playlist_update", id);
+    return id;
   },
 
   async delete(id: string): Promise<void> {
-    return tauriInvoke("delete_playlist", {
+    await tauriInvoke("delete_playlist", {
       playlistId: id,
     });
+    await notifyLocalChange("playlist_delete", id);
   },
 
-  addWallpaper(playlistId: string, wallpaperId: string): Promise<void> {
-    return tauriInvoke("add_wallpaper_to_playlist", {
+  async addWallpaper(playlistId: string, wallpaperId: string): Promise<void> {
+    await tauriInvoke("add_wallpaper_to_playlist", {
       playlistId,
       wallpaperId,
     });
+    await notifyLocalChange("playlist_item_update", playlistId);
   },
 
   getPlaylistWallpapers(playlistId: string): Promise<string[]> {
@@ -31,7 +36,8 @@ export const playlistService = {
     });
   },
 
-  removeWallpaper(playlistId: string, wallpaperId: string): Promise<void> {
-    return tauriInvoke("remove_wallpaper_from_playlist", { playlistId, wallpaperId });
+  async removeWallpaper(playlistId: string, wallpaperId: string): Promise<void> {
+    await tauriInvoke("remove_wallpaper_from_playlist", { playlistId, wallpaperId });
+    await notifyLocalChange("playlist_item_update", playlistId);
   },
 };

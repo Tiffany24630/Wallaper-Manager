@@ -2,6 +2,7 @@ import { tauriInvoke } from "./tauri";
 import type { Wallpaper } from "../types/wallpaper";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
+import { notifyLocalChange } from "./syncQueueService";
 
 export interface UpscaleResult {
   id: string;
@@ -21,29 +22,32 @@ export const wallpaperService = {
   },
 
   async toggleFavorite(id: string): Promise<void> {
-    return tauriInvoke("toggle_favorite", {
+    await tauriInvoke("toggle_favorite", {
       wallpaperId: id,
     });
+    await notifyLocalChange("wallpaper_update", id);
   },
 
   async importWallpaper(path: string): Promise<string> {
-    return tauriInvoke<string>("import_wallpaper", {
+    const id = await tauriInvoke<string>("import_wallpaper", {
       sourcePath: path,
     });
+    await notifyLocalChange("wallpaper_create", id); return id;
   },
 
   async deleteWallpaper(id: string): Promise<void> {
-    return tauriInvoke("delete_wallpaper", {
+    await tauriInvoke("delete_wallpaper", {
       wallpaperId: id,
     });
+    await notifyLocalChange("wallpaper_delete", id);
   },
 
   async renameWallpaper(id: string, name: string): Promise<void> {
-    return tauriInvoke("rename_wallpaper", { wallpaperId: id, name });
+    await tauriInvoke("rename_wallpaper", { wallpaperId: id, name }); await notifyLocalChange("wallpaper_update", id);
   },
 
   async rotateWallpaperVersion(id: string, degrees: 0 | 90 | 180 | 270): Promise<void> {
-    return tauriInvoke("rotate_wallpaper_version", { wallpaperId: id, degrees });
+    await tauriInvoke("rotate_wallpaper_version", { wallpaperId: id, degrees }); await notifyLocalChange("wallpaper_update", id);
   },
 
   async selectWallpaperFile(): Promise<string | null> {
@@ -67,13 +71,13 @@ export const wallpaperService = {
   },
 
   async upscaleWallpaper(id: string, scale = 4): Promise<UpscaleResult> {
-    return invoke<UpscaleResult>(
+    const result = await invoke<UpscaleResult>(
       "upscale_wallpaper",
       {
         wallpaperId: id,
         scale,
       }
-    );
+    ); await notifyLocalChange("wallpaper_update", id); return result;
   },
 
   async scanFolder(): Promise<void> {
