@@ -11,6 +11,7 @@ export default function AnimatedPrototype() {
   const imageRef = useRef<HTMLImageElement>(null);
   const mediaPath = params.get("media");
   const surfaceId = params.get("surface") ?? "animated-prototype-unknown";
+  const activationId = params.get("activation") ?? "";
   const mediaErrorTest = params.get("mediaErrorTest") === "1";
   const mediaUrl = useMemo(
     () => (mediaPath ? convertFileSrc(mediaPath, "asset") : null),
@@ -24,7 +25,7 @@ export default function AnimatedPrototype() {
     setStatus(`Error de media: ${reason}`);
     setFailed(true);
     void animatedPrototypeService
-      .reportMediaError(surfaceId, "media", reason)
+      .reportMediaError(surfaceId, activationId, "media", reason)
       .catch((error) => console.error("No se pudo informar el error de media a Rust", error));
   };
 

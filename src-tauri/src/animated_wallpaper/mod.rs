@@ -187,6 +187,11 @@ pub(crate) fn validate_animated_gif(
 #[derive(Debug)]
 struct PrototypeSurfaceRecord {
     lifecycle: AnimatedSurfaceLifecycle,
+    activation_id: String,
+}
+
+fn activation_matches(record: &PrototypeSurfaceRecord, activation_id: &str) -> bool {
+    record.activation_id == activation_id
 }
 
 static PROTOTYPE_SURFACES: OnceLock<Mutex<BTreeMap<String, PrototypeSurfaceRecord>>> =
@@ -196,7 +201,7 @@ fn prototype_surfaces() -> &'static Mutex<BTreeMap<String, PrototypeSurfaceRecor
     PROTOTYPE_SURFACES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn register_prototype_surface(label: &str) -> Result<(), String> {
+fn register_prototype_surface(label: &str, activation_id: &str) -> Result<(), String> {
     let mut lifecycle = AnimatedSurfaceLifecycle::new();
     lifecycle.begin_create().map_err(str::to_string)?;
     lifecycle.webview_ready().map_err(str::to_string)?;
@@ -216,7 +221,13 @@ fn register_prototype_surface(label: &str) -> Result<(), String> {
             return Err("La superficie de diagnóstico ya está registrada".into());
         }
     }
-    surfaces.insert(label.to_string(), PrototypeSurfaceRecord { lifecycle });
+    surfaces.insert(
+        label.to_string(),
+        PrototypeSurfaceRecord {
+            lifecycle,
+            activation_id: activation_id.to_string(),
+        },
+    );
     Ok(())
 }
 
@@ -228,9 +239,13 @@ fn begin_explicit_prototype_close(label: &str) {
     }
 }
 
-fn finish_prototype_close(label: &str) {
+fn finish_prototype_close(label: &str, activation_id: Option<&str>) {
     if let Ok(mut surfaces) = prototype_surfaces().lock() {
         if let Some(record) = surfaces.get_mut(label) {
+            if activation_id.is_some_and(|id| id != record.activation_id) {
+                eprintln!("ANIMATED_SURFACE_CLOSE_IGNORED surface={label} reason=stale_activation");
+                return;
+            }
             record.lifecycle.finish_close();
         }
     }
@@ -455,6 +470,7 @@ pub async fn open_animated_prototype(
         );
     }
     let label = format!("animated-prototype-{monitor_index}");
+    let activation_id = Uuid::new_v4().to_string();
 
     if app.get_webview_window(&label).is_some() {
         return Err(
@@ -472,7 +488,7 @@ pub async fn open_animated_prototype(
     };
     let url = WebviewUrl::App(
         format!(
-            "index.html#/animated-prototype?media={media_query}&surface={label}{error_test_query}"
+            "index.html#/animated-prototype?media={media_query}&surface={label}&activation={activation_id}{error_test_query}"
         )
         .into(),
     );
@@ -517,7 +533,7 @@ pub async fn open_animated_prototype(
         format!("No se pudo crear la superficie WebView2: {e}")
     })?;
 
-    if let Err(error) = register_prototype_surface(&label) {
+    if let Err(error) = register_prototype_surface(&label, &activation_id) {
         let _ = window.close();
         let _ = fs::remove_file(&cleanup_path);
         return Err(error);
@@ -549,11 +565,12 @@ pub async fn open_animated_prototype(
     }
     let event_cleanup_path = cleanup_path.clone();
     let event_label = label.clone();
+    let event_activation_id = activation_id.clone();
     window.on_window_event(move |event| {
         if matches!(event, WindowEvent::Destroyed) {
             let temporary_removed =
                 fs::remove_file(&event_cleanup_path).is_ok() || !event_cleanup_path.exists();
-            finish_prototype_close(&event_label);
+            finish_prototype_close(&event_label, Some(&event_activation_id));
             eprintln!("WEBVIEW2_CLOSED surface={event_label} source=tauri_destroyed");
             eprintln!("HWND_DESTROYED surface={event_label} source=tauri_destroyed");
             eprintln!("TEMPORARY_CLEANED surface={event_label} removed={temporary_removed}");
@@ -1262,6 +1279,7 @@ pub fn close_animated_prototype(app: AppHandle, monitor_index: usize) -> Result<
 pub fn report_animated_media_error(
     app: AppHandle,
     surface_id: String,
+    activation_id: String,
     kind: String,
     reason: Option<String>,
 ) -> Result<(), String> {
@@ -1283,12 +1301,18 @@ pub fn report_animated_media_error(
             eprintln!("ANIMATED_MEDIA_ERROR_IGNORED surface={surface_id} reason=unknown_surface");
             return Ok(());
         };
+        if !activation_matches(record, &activation_id) {
+            eprintln!("ANIMATED_MEDIA_ERROR_IGNORED surface={surface_id} reason=stale_activation");
+            return Ok(());
+        }
         if matches!(
             record.lifecycle.state(),
-            AnimatedSurfaceState::Closing | AnimatedSurfaceState::Closed
+            AnimatedSurfaceState::Closing
+                | AnimatedSurfaceState::Closed
+                | AnimatedSurfaceState::FallbackRequired
         ) {
             eprintln!(
-                "ANIMATED_MEDIA_ERROR_IGNORED surface={surface_id} reason=surface_closing_or_closed"
+                "ANIMATED_MEDIA_ERROR_IGNORED surface={surface_id} reason=surface_closing_closed_or_fallback"
             );
             return Ok(());
         }
@@ -1305,10 +1329,10 @@ pub fn report_animated_media_error(
     if let Some(window) = app.get_webview_window(&surface_id) {
         if let Err(error) = window.close() {
             eprintln!("ANIMATED_MEDIA_ERROR_CLOSE_FAILED surface={surface_id} error={error}");
-            finish_prototype_close(&surface_id);
+            finish_prototype_close(&surface_id, Some(&activation_id));
         }
     } else {
-        finish_prototype_close(&surface_id);
+        finish_prototype_close(&surface_id, Some(&activation_id));
     }
 
     if decision == FailureDecision::FallbackRequired {
@@ -1334,9 +1358,10 @@ pub fn close_all_animated_prototypes(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounds_from_geometry, create_diagnostic_gif, encode_query_component, resource_limit_reason,
-        smoke_variant_options, validate_animated_gif, validate_media_source,
-        MAX_ANIMATED_DIMENSION, MAX_ANIMATED_FILE_BYTES,
+        activation_matches, bounds_from_geometry, create_diagnostic_gif, encode_query_component,
+        resource_limit_reason, smoke_variant_options, validate_animated_gif, validate_media_source,
+        AnimatedSurfaceLifecycle, PrototypeSurfaceRecord, MAX_ANIMATED_DIMENSION,
+        MAX_ANIMATED_FILE_BYTES,
     };
     use image::GenericImageView;
     use uuid::Uuid;
@@ -1375,6 +1400,16 @@ mod tests {
             format!("animated-prototype-{}", 0),
             format!("animated-prototype-{}", 1)
         );
+    }
+
+    #[test]
+    fn stale_activation_cannot_target_a_new_surface_on_the_same_monitor() {
+        let old = PrototypeSurfaceRecord {
+            lifecycle: AnimatedSurfaceLifecycle::new(),
+            activation_id: "activation-old".into(),
+        };
+        assert!(activation_matches(&old, "activation-old"));
+        assert!(!activation_matches(&old, "activation-new"));
     }
 
     #[test]

@@ -32,11 +32,13 @@ export const animatedPrototypeService = {
 
   reportMediaError(
     surfaceId: string,
+    activationId: string,
     kind: "media" | "webview",
     reason?: string,
   ): Promise<void> {
     return tauriInvoke("report_animated_media_error", {
       surfaceId,
+      activationId,
       kind,
       reason,
     });

@@ -61,6 +61,9 @@ impl AnimatedSurfaceLifecycle {
     }
 
     pub(crate) fn begin_create(&mut self) -> Result<(), &'static str> {
+        if self.state == AnimatedSurfaceState::FallbackRequired {
+            return Err("la superficie requiere una nueva activación explícita");
+        }
         if self.cleanup_started
             || matches!(
                 self.state,
@@ -73,6 +76,15 @@ impl AnimatedSurfaceLifecycle {
         }
         self.state = AnimatedSurfaceState::Creating;
         Ok(())
+    }
+
+    pub(crate) fn begin_explicit_create(&mut self) -> Result<(), &'static str> {
+        if self.state == AnimatedSurfaceState::FallbackRequired {
+            self.failures = 0;
+            self.cleanup_started = false;
+            self.state = AnimatedSurfaceState::Closed;
+        }
+        self.begin_create()
     }
 
     pub(crate) fn webview_ready(&mut self) -> Result<(), &'static str> {
@@ -126,7 +138,9 @@ impl AnimatedSurfaceLifecycle {
     }
 
     pub(crate) fn finish_close(&mut self) {
-        self.state = AnimatedSurfaceState::Closed;
+        if self.state != AnimatedSurfaceState::FallbackRequired {
+            self.state = AnimatedSurfaceState::Closed;
+        }
         self.cleanup_started = false;
     }
 
@@ -465,7 +479,14 @@ mod tests {
         assert_eq!(lifecycle.failures(), 3);
         lifecycle.begin_close();
         lifecycle.finish_close();
-        assert!(lifecycle.begin_create().is_ok());
+        assert_eq!(lifecycle.state(), AnimatedSurfaceState::FallbackRequired);
+        assert_eq!(
+            lifecycle.fail(SurfaceFailureKind::WebView),
+            FailureDecision::Ignored
+        );
+        assert!(lifecycle.begin_create().is_err());
+        lifecycle.begin_explicit_create().unwrap();
+        assert_eq!(lifecycle.state(), AnimatedSurfaceState::Creating);
     }
 
     #[test]
