@@ -107,6 +107,17 @@ fn main() {
                     }
                 });
             }
+            if std::env::var_os("LUMINA_ANIMATED_MEDIA_ERROR_TEST").is_some() {
+                let media_error_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) =
+                        animated_wallpaper::open_animated_prototype_test(media_error_handle, 0)
+                            .await
+                    {
+                        eprintln!("Animated media error test failed: {error}");
+                    }
+                });
+            }
             if std::env::var_os("LUMINA_NATIVE_ANIMATED_TEST").is_some() {
                 match animated_wallpaper::open_native_animated_prototype_test(
                     app.handle().clone(),
@@ -229,6 +240,7 @@ fn main() {
             animated_wallpaper::close_native_animated_prototype,
             animated_wallpaper::close_animated_multimonitor_physical_poc,
             animated_wallpaper::close_animated_prototype,
+            animated_wallpaper::report_animated_media_error,
         ])
         .plugin(tauri_plugin_dialog::init())
         .build(tauri::generate_context!());

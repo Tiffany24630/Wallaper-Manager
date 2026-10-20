@@ -20,7 +20,7 @@ use tauri::AppHandle;
 use webview2_com::{
     CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, Microsoft::Web::WebView2::Win32::*,
-    NavigationCompletedEventHandler,
+    NavigationCompletedEventHandler, WebMessageReceivedEventHandler,
 };
 use windows_webview2::{
     core::{w, Interface, HSTRING, PCWSTR},
@@ -39,8 +39,9 @@ use windows_webview2::{
             GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect, PostMessageW, PostQuitMessage,
             RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
             GWL_EXSTYLE, GW_OWNER, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_NCDESTROY,
-            WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY,
+            WM_NCDESTROY, WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
 };
@@ -48,6 +49,7 @@ use windows_webview2::{
 const NATIVE_WINDOW_CLASS: PCWSTR = w!("LuminaNativeAnimatedPrototype");
 const MAX_NATIVE_SURFACES: usize = 1;
 const MAX_NATIVE_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
+const WM_NATIVE_MEDIA_ERROR: u32 = WM_APP + 59;
 
 static NATIVE_SURFACE: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
 static NATIVE_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
@@ -424,6 +426,7 @@ fn native_html(media_path: &Path) -> String {
         </style></head><body>
         <div id="status">Native HWND WebView2 · cargando GIF…</div>
         <img src="{uri}" alt="GIF de diagnóstico" onload="document.getElementById('status').textContent='Native HWND WebView2 · GIF cargado'" onerror="document.getElementById('status').textContent='Native HWND WebView2 · error de carga'">
+        <script>document.querySelector('img').addEventListener('error', function() {{ window.chrome?.webview?.postMessage('lumina-media-error'); }});</script>
         </body></html>"#
     )
 }
@@ -533,6 +536,24 @@ fn create_webview(
             .map_err(|error| {
                 controller.Close().ok();
                 format!("WebViewError: no se pudo registrar NavigationCompleted: {error}")
+            })?;
+        let media_error_hwnd = hwnd.0 as isize;
+        let media_error_handler =
+            WebMessageReceivedEventHandler::create(Box::new(move |_webview, _args| {
+                eprintln!("[NativeAnimated] MEDIA_ERROR_MESSAGE_RECEIVED");
+                let _ = PostMessageW(
+                    Some(HWND(media_error_hwnd as *mut _)),
+                    WM_NATIVE_MEDIA_ERROR,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+                Ok(())
+            }));
+        webview
+            .add_WebMessageReceived(&media_error_handler, &mut token)
+            .map_err(|error| {
+                controller.Close().ok();
+                format!("WebViewError: no se pudo registrar el canal de errores de media: {error}")
             })?;
         let html = HSTRING::from(native_html(media_path));
         webview.NavigateToString(&html).map_err(|error| {
@@ -690,6 +711,16 @@ fn run_native_surface(
                 return Err("GetMessageW falló durante el ciclo de vida nativo".into());
             }
             if status == 0 || message.message == WM_QUIT {
+                break;
+            }
+            if message.message == WM_NATIVE_MEDIA_ERROR {
+                let decision = surface_lifecycle.fail(super::recovery::SurfaceFailureKind::Media);
+                eprintln!(
+                    "[NativeAnimated] MEDIA_FAILURE state={:?} attempts={} decision={decision:?}",
+                    surface_lifecycle.state(),
+                    surface_lifecycle.failures()
+                );
+                surface_lifecycle.begin_close();
                 break;
             }
             unsafe {

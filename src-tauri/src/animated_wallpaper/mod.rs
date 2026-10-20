@@ -1,6 +1,8 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use image::{
@@ -17,7 +19,63 @@ mod multimonitor;
 mod native_window;
 mod recovery;
 
+use recovery::{
+    AnimatedSurfaceLifecycle, AnimatedSurfaceState, FailureDecision, SurfaceFailureKind,
+};
+
 const MAX_PROTOTYPE_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Debug)]
+struct PrototypeSurfaceRecord {
+    lifecycle: AnimatedSurfaceLifecycle,
+}
+
+static PROTOTYPE_SURFACES: OnceLock<Mutex<BTreeMap<String, PrototypeSurfaceRecord>>> =
+    OnceLock::new();
+
+fn prototype_surfaces() -> &'static Mutex<BTreeMap<String, PrototypeSurfaceRecord>> {
+    PROTOTYPE_SURFACES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn register_prototype_surface(label: &str) -> Result<(), String> {
+    let mut lifecycle = AnimatedSurfaceLifecycle::new();
+    lifecycle.begin_create().map_err(str::to_string)?;
+    lifecycle.webview_ready().map_err(str::to_string)?;
+    lifecycle.playing().map_err(str::to_string)?;
+
+    let mut surfaces = prototype_surfaces()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el registro de superficies".to_string())?;
+    if let Some(record) = surfaces.get(label) {
+        if matches!(
+            record.lifecycle.state(),
+            AnimatedSurfaceState::Creating
+                | AnimatedSurfaceState::WebViewReady
+                | AnimatedSurfaceState::Playing
+                | AnimatedSurfaceState::Closing
+        ) {
+            return Err("La superficie de diagnóstico ya está registrada".into());
+        }
+    }
+    surfaces.insert(label.to_string(), PrototypeSurfaceRecord { lifecycle });
+    Ok(())
+}
+
+fn begin_explicit_prototype_close(label: &str) {
+    if let Ok(mut surfaces) = prototype_surfaces().lock() {
+        if let Some(record) = surfaces.get_mut(label) {
+            record.lifecycle.begin_close();
+        }
+    }
+}
+
+fn finish_prototype_close(label: &str) {
+    if let Ok(mut surfaces) = prototype_surfaces().lock() {
+        if let Some(record) = surfaces.get_mut(label) {
+            record.lifecycle.finish_close();
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MonitorBounds {
@@ -231,7 +289,17 @@ pub async fn open_animated_prototype(
 
     let copied_media = copy_to_controlled_storage(&app, &source, extension)?;
     let media_query = encode_query_component(&copied_media.to_string_lossy());
-    let url = WebviewUrl::App(format!("index.html#/animated-prototype?media={media_query}").into());
+    let error_test_query = if std::env::var_os("LUMINA_ANIMATED_MEDIA_ERROR_TEST").is_some() {
+        "&mediaErrorTest=1"
+    } else {
+        ""
+    };
+    let url = WebviewUrl::App(
+        format!(
+            "index.html#/animated-prototype?media={media_query}&surface={label}{error_test_query}"
+        )
+        .into(),
+    );
     let cleanup_path = copied_media.clone();
     let workerw_mode = std::env::var_os("LUMINA_ANIMATED_SMOKE_WORKERW").is_some();
     let options = if workerw_mode {
@@ -273,6 +341,12 @@ pub async fn open_animated_prototype(
         format!("No se pudo crear la superficie WebView2: {e}")
     })?;
 
+    if let Err(error) = register_prototype_surface(&label) {
+        let _ = window.close();
+        let _ = fs::remove_file(&cleanup_path);
+        return Err(error);
+    }
+
     if workerw_mode {
         #[cfg(target_os = "windows")]
         if let Err(error) = desktop_host::attach_to_worker_w(&window, bounds) {
@@ -298,12 +372,20 @@ pub async fn open_animated_prototype(
         ));
     }
     let event_cleanup_path = cleanup_path.clone();
+    let event_label = label.clone();
     window.on_window_event(move |event| {
         if matches!(event, WindowEvent::Destroyed) {
-            let _ = fs::remove_file(&event_cleanup_path);
+            let temporary_removed =
+                fs::remove_file(&event_cleanup_path).is_ok() || !event_cleanup_path.exists();
+            finish_prototype_close(&event_label);
+            eprintln!("WEBVIEW2_CLOSED surface={event_label} source=tauri_destroyed");
+            eprintln!("HWND_DESTROYED surface={event_label} source=tauri_destroyed");
+            eprintln!("TEMPORARY_CLEANED surface={event_label} removed={temporary_removed}");
+            eprintln!("ANIMATED_SURFACE_CLOSED surface={event_label}");
         }
     });
     if let Err(error) = window.show() {
+        begin_explicit_prototype_close(&label);
         let _ = window.close();
         let _ = fs::remove_file(&cleanup_path);
         return Err(format!(
@@ -872,9 +954,69 @@ pub async fn open_animated_prototype_test(
 pub fn close_animated_prototype(app: AppHandle, monitor_index: usize) -> Result<(), String> {
     let label = format!("animated-prototype-{monitor_index}");
     if let Some(window) = app.get_webview_window(&label) {
+        begin_explicit_prototype_close(&label);
         window
             .close()
             .map_err(|e| format!("No se pudo cerrar la superficie WebView2: {e}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn report_animated_media_error(
+    app: AppHandle,
+    surface_id: String,
+    kind: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    if !surface_id.starts_with("animated-prototype-") {
+        return Err("Identificador de superficie no permitido".into());
+    }
+
+    let failure_kind = match kind.as_str() {
+        "media" => SurfaceFailureKind::Media,
+        "webview" => SurfaceFailureKind::WebView,
+        _ => return Err("Tipo de error de superficie no permitido".into()),
+    };
+
+    let decision = {
+        let mut surfaces = prototype_surfaces()
+            .lock()
+            .map_err(|_| "No se pudo bloquear el registro de superficies".to_string())?;
+        let Some(record) = surfaces.get_mut(&surface_id) else {
+            eprintln!("ANIMATED_MEDIA_ERROR_IGNORED surface={surface_id} reason=unknown_surface");
+            return Ok(());
+        };
+        if matches!(
+            record.lifecycle.state(),
+            AnimatedSurfaceState::Closing | AnimatedSurfaceState::Closed
+        ) {
+            eprintln!(
+                "ANIMATED_MEDIA_ERROR_IGNORED surface={surface_id} reason=surface_closing_or_closed"
+            );
+            return Ok(());
+        }
+        let decision = record.lifecycle.fail(failure_kind);
+        record.lifecycle.begin_close();
+        eprintln!(
+            "ANIMATED_MEDIA_ERROR_RECEIVED surface={surface_id} kind={kind} failures={} reason={}",
+            record.lifecycle.failures(),
+            reason.as_deref().unwrap_or("unspecified")
+        );
+        decision
+    };
+
+    if let Some(window) = app.get_webview_window(&surface_id) {
+        if let Err(error) = window.close() {
+            eprintln!("ANIMATED_MEDIA_ERROR_CLOSE_FAILED surface={surface_id} error={error}");
+            finish_prototype_close(&surface_id);
+        }
+    } else {
+        finish_prototype_close(&surface_id);
+    }
+
+    if decision == FailureDecision::FallbackRequired {
+        eprintln!("ANIMATED_SURFACE_FALLBACK_REQUIRED surface={surface_id}");
     }
     Ok(())
 }
@@ -887,6 +1029,7 @@ pub fn close_all_animated_prototypes(app: &AppHandle) {
     }
     for (label, window) in app.webview_windows() {
         if label.starts_with("animated-prototype-") {
+            begin_explicit_prototype_close(&label);
             let _ = window.close();
         }
     }

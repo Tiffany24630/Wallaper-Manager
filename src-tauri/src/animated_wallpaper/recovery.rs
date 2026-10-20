@@ -41,6 +41,7 @@ pub(crate) enum SurfaceFailureKind {
 pub(crate) enum FailureDecision {
     RetryAllowed,
     FallbackRequired,
+    Ignored,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,14 @@ impl AnimatedSurfaceLifecycle {
     }
 
     pub(crate) fn fail(&mut self, kind: SurfaceFailureKind) -> FailureDecision {
+        if matches!(
+            self.state,
+            AnimatedSurfaceState::Closing
+                | AnimatedSurfaceState::Closed
+                | AnimatedSurfaceState::FallbackRequired
+        ) {
+            return FailureDecision::Ignored;
+        }
         self.state = match kind {
             SurfaceFailureKind::Media => AnimatedSurfaceState::MediaError,
             SurfaceFailureKind::WebView => AnimatedSurfaceState::WebViewError,
@@ -307,6 +316,38 @@ mod tests {
         lifecycle.begin_close();
         lifecycle.finish_close();
         assert!(lifecycle.begin_create().is_ok());
+    }
+
+    #[test]
+    fn late_media_error_after_close_is_ignored_and_never_reopens_surface() {
+        let mut lifecycle = AnimatedSurfaceLifecycle::new();
+        lifecycle.begin_create().unwrap();
+        lifecycle.webview_ready().unwrap();
+        lifecycle.playing().unwrap();
+        lifecycle.begin_close();
+        lifecycle.finish_close();
+        assert_eq!(
+            lifecycle.fail(SurfaceFailureKind::Media),
+            FailureDecision::Ignored
+        );
+        assert_eq!(lifecycle.state(), AnimatedSurfaceState::Closed);
+    }
+
+    #[test]
+    fn explicit_close_after_media_error_is_idempotent() {
+        let mut lifecycle = AnimatedSurfaceLifecycle::new();
+        lifecycle.begin_create().unwrap();
+        lifecycle.webview_ready().unwrap();
+        lifecycle.playing().unwrap();
+        assert_eq!(
+            lifecycle.fail(SurfaceFailureKind::Media),
+            FailureDecision::RetryAllowed
+        );
+        lifecycle.begin_close();
+        lifecycle.begin_close();
+        lifecycle.finish_close();
+        lifecycle.finish_close();
+        assert_eq!(lifecycle.state(), AnimatedSurfaceState::Closed);
     }
 
     #[test]
