@@ -1,4 +1,8 @@
-use super::{create_diagnostic_gif, desktop_host, prototype_directory, MonitorBounds};
+use super::{
+    create_diagnostic_gif, desktop_host, prototype_directory,
+    recovery::{RecoveryLifecycle, RecoveryScenario},
+    MonitorBounds,
+};
 use std::{
     path::Path,
     sync::{mpsc, Mutex, OnceLock},
@@ -15,7 +19,9 @@ use webview2_com::{
 use windows_webview2::{
     core::{w, Interface, HSTRING, PCWSTR},
     Win32::{
-        Foundation::{E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{
+            GetLastError, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, WIN32_ERROR, WPARAM,
+        },
         Graphics::Gdi::UpdateWindow,
         System::{
             Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
@@ -115,7 +121,7 @@ unsafe extern "system" fn native_window_proc(
 ) -> LRESULT {
     match message {
         WM_CLOSE => {
-            let _ = DestroyWindow(window);
+            PostQuitMessage(0);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -140,6 +146,9 @@ fn register_native_window_class() -> Result<HINSTANCE, String> {
     };
     let atom = unsafe { RegisterClassW(&class) };
     if atom == 0 {
+        if unsafe { GetLastError() } == WIN32_ERROR(1410) {
+            return Ok(instance.into());
+        }
         return Err("RegisterClassW no pudo registrar la clase nativa".into());
     }
     Ok(instance.into())
@@ -444,6 +453,7 @@ fn run_native_surface(
             controller.Close().ok();
         }
         eprintln!("[NativeAnimated] WebView2 destruido");
+        eprintln!("[RecoveryPOC] WEBVIEW2_CLOSED");
         let detach_error = if attached_to_desktop {
             desktop_host::detach_native_window(hwnd.0 as isize).err()
         } else {
@@ -451,11 +461,14 @@ fn run_native_surface(
         };
         if let Some(error) = &detach_error {
             eprintln!("[NativeAnimated] error al restaurar el parent del HWND: {error}");
+        } else if attached_to_desktop {
+            eprintln!("[RecoveryPOC] DETACHED");
         }
         unsafe {
             DestroyWindow(hwnd).ok();
         }
         eprintln!("[NativeAnimated] HWND destruido");
+        eprintln!("[RecoveryPOC] HWND_DESTROYED");
         *native_surface()
             .lock()
             .expect("native surface mutex poisoned") = None;
@@ -564,6 +577,106 @@ pub fn open_desktop_poc(app: &AppHandle, monitor: MonitorBounds) -> Result<(), S
         ))?
     );
     open_internal(app, monitor, ZOrderVariant::ClickThrough, Some(host))
+}
+
+pub fn open_desktop_recovery_poc(app: &AppHandle, monitor: MonitorBounds) -> Result<(), String> {
+    let (host, experiment) = desktop_host::prepare_modern_host()?;
+    let candidate_count = experiment.candidate_count;
+    eprintln!(
+        "[RecoveryPOC] HOST_DISCOVERED progman={} workerw={} shell_view={} candidate_count={candidate_count}",
+        host.0, host.1, host.2
+    );
+    if !experiment.host_is_unambiguous {
+        eprintln!("[RecoveryPOC] HOST_UNAVAILABLE");
+        return Err("El host inicial del POC de recuperación no es inequívoco".into());
+    }
+    eprintln!("[RecoveryPOC] HOST_VALIDATED");
+    open_internal(app, monitor, ZOrderVariant::ClickThrough, Some(host))?;
+    let mut lifecycle = RecoveryLifecycle::new();
+    lifecycle
+        .create_renderer()
+        .map_err(|error| format!("No se pudo registrar el renderer inicial: {error}"))?;
+    eprintln!(
+        "[RecoveryPOC] RENDERER_CREATED renderer_count={} renderer_phase=initial state={:?}",
+        lifecycle.renderer_count(),
+        lifecycle.state()
+    );
+    eprintln!("[RecoveryPOC] ATTACHED");
+
+    let app = app.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(3));
+        eprintln!("[RecoveryPOC] RECOVERY_TRIGGERED");
+        eprintln!("[RecoveryPOC] RENDERER_STOPPING");
+        lifecycle.begin_cleanup();
+        if let Err(error) = close() {
+            eprintln!("[RecoveryPOC] RECOVERY_ABORTED cleanup_error={error}");
+            return;
+        }
+        lifecycle.finish_cleanup();
+        eprintln!("[RecoveryPOC] HOST_INVALIDATED");
+        if let Err(error) = close() {
+            eprintln!("[RecoveryPOC] RECOVERY_ABORTED idempotent_cleanup_error={error}");
+            return;
+        }
+        eprintln!(
+            "[RecoveryPOC] CLEANUP_IDEMPOTENT renderer_count={} state={:?}",
+            lifecycle.renderer_count(),
+            lifecycle.state()
+        );
+
+        let scenario = RecoveryScenario::from_environment();
+        if let Some(candidate_count) = scenario.simulated_candidate_count() {
+            eprintln!(
+                "[RecoveryPOC] HOST_UNAVAILABLE candidate_count={candidate_count} simulated=true"
+            );
+            eprintln!("[RecoveryPOC] RECOVERY_ABORTED");
+            return;
+        }
+
+        let (new_host, new_experiment) = match desktop_host::prepare_modern_host() {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("[RecoveryPOC] HOST_UNAVAILABLE error={error}");
+                eprintln!("[RecoveryPOC] RECOVERY_ABORTED");
+                return;
+            }
+        };
+        eprintln!(
+            "[RecoveryPOC] HOST_REDISCOVERED progman={} workerw={} shell_view={} candidate_count={}",
+            new_host.0, new_host.1, new_host.2, new_experiment.candidate_count
+        );
+        if !new_experiment.host_is_unambiguous
+            || scenario == RecoveryScenario::SecondValidationFails
+        {
+            eprintln!(
+                "[RecoveryPOC] HOST_UNAVAILABLE candidate_count={} simulated={}",
+                new_experiment.candidate_count,
+                scenario == RecoveryScenario::SecondValidationFails
+            );
+            eprintln!("[RecoveryPOC] RECOVERY_ABORTED");
+            return;
+        }
+        eprintln!("[RecoveryPOC] HOST_REVALIDATED");
+        if let Err(error) = lifecycle.create_renderer() {
+            eprintln!("[RecoveryPOC] RECOVERY_ABORTED renderer_guard={error}");
+            return;
+        }
+        if let Err(error) =
+            open_internal(&app, monitor, ZOrderVariant::ClickThrough, Some(new_host))
+        {
+            lifecycle.finish_cleanup();
+            eprintln!("[RecoveryPOC] RECOVERY_ABORTED renderer_error={error}");
+            return;
+        }
+        eprintln!(
+            "[RecoveryPOC] RENDERER_RECREATED renderer_count={} renderer_phase=recovered state={:?}",
+            lifecycle.renderer_count(),
+            lifecycle.state()
+        );
+        eprintln!("[RecoveryPOC] RECOVERY_COMPLETED");
+    });
+    Ok(())
 }
 
 pub fn close() -> Result<(), String> {

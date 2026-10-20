@@ -14,6 +14,7 @@ use uuid::Uuid;
 mod desktop_host;
 #[cfg(target_os = "windows")]
 mod native_window;
+mod recovery;
 
 const MAX_PROTOTYPE_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -362,6 +363,33 @@ pub fn open_animated_desktop_poc(app: AppHandle, monitor_index: usize) -> Result
     {
         let _ = (app, monitor_index);
         Err("El POC de escritorio solo está disponible en Windows".into())
+    }
+}
+
+#[tauri::command]
+pub fn open_animated_desktop_recovery_poc(
+    app: AppHandle,
+    monitor_index: usize,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let monitors = app
+            .get_webview_window("main")
+            .ok_or("No se encontró la ventana principal de Lumina")?
+            .available_monitors()
+            .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
+        let monitor = monitors
+            .get(monitor_index)
+            .ok_or("El monitor seleccionado ya no está disponible")?;
+        let position = monitor.position();
+        let size = monitor.size();
+        let bounds = bounds_from_geometry(position.x, position.y, size.width, size.height)?;
+        return native_window::open_desktop_recovery_poc(&app, bounds);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, monitor_index);
+        Err("El POC de recuperación solo está disponible en Windows".into())
     }
 }
 
