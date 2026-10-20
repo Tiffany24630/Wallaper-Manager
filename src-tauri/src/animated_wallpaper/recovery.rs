@@ -19,6 +19,117 @@ pub(crate) struct StartupRecoveryPlan {
     pub(crate) start_watcher_only_after_validation: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnimatedSurfaceState {
+    Creating,
+    WebViewReady,
+    Playing,
+    MediaError,
+    WebViewError,
+    Closing,
+    Closed,
+    FallbackRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceFailureKind {
+    Media,
+    WebView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureDecision {
+    RetryAllowed,
+    FallbackRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnimatedSurfaceLifecycle {
+    state: AnimatedSurfaceState,
+    failures: u8,
+    cleanup_started: bool,
+}
+
+impl AnimatedSurfaceLifecycle {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: AnimatedSurfaceState::Closed,
+            failures: 0,
+            cleanup_started: false,
+        }
+    }
+
+    pub(crate) fn begin_create(&mut self) -> Result<(), &'static str> {
+        if self.cleanup_started
+            || matches!(
+                self.state,
+                AnimatedSurfaceState::Creating
+                    | AnimatedSurfaceState::WebViewReady
+                    | AnimatedSurfaceState::Playing
+            )
+        {
+            return Err("la superficie ya está activa o cerrándose");
+        }
+        self.state = AnimatedSurfaceState::Creating;
+        Ok(())
+    }
+
+    pub(crate) fn webview_ready(&mut self) -> Result<(), &'static str> {
+        if self.state != AnimatedSurfaceState::Creating {
+            return Err("WebView2 no puede pasar a listo desde este estado");
+        }
+        self.state = AnimatedSurfaceState::WebViewReady;
+        Ok(())
+    }
+
+    pub(crate) fn playing(&mut self) -> Result<(), &'static str> {
+        if self.state != AnimatedSurfaceState::WebViewReady {
+            return Err("la superficie no está lista para reproducir");
+        }
+        self.state = AnimatedSurfaceState::Playing;
+        Ok(())
+    }
+
+    pub(crate) fn fail(&mut self, kind: SurfaceFailureKind) -> FailureDecision {
+        self.state = match kind {
+            SurfaceFailureKind::Media => AnimatedSurfaceState::MediaError,
+            SurfaceFailureKind::WebView => AnimatedSurfaceState::WebViewError,
+        };
+        if self.failures < MAX_RECOVERY_ATTEMPTS {
+            self.failures += 1;
+        }
+        if self.failures >= MAX_RECOVERY_ATTEMPTS {
+            self.state = AnimatedSurfaceState::FallbackRequired;
+            FailureDecision::FallbackRequired
+        } else {
+            FailureDecision::RetryAllowed
+        }
+    }
+
+    pub(crate) fn begin_close(&mut self) {
+        if !matches!(
+            self.state,
+            AnimatedSurfaceState::Closed | AnimatedSurfaceState::FallbackRequired
+        ) {
+            self.state = AnimatedSurfaceState::Closing;
+        }
+        self.cleanup_started = true;
+    }
+
+    pub(crate) fn finish_close(&mut self) {
+        self.state = AnimatedSurfaceState::Closed;
+        self.cleanup_started = false;
+    }
+
+    pub(crate) fn state(self) -> AnimatedSurfaceState {
+        self.state
+    }
+
+    pub(crate) fn failures(self) -> u8 {
+        self.failures
+    }
+}
+
 impl StartupRecoveryPlan {
     pub(crate) fn for_new_process() -> Self {
         Self {
@@ -152,9 +263,51 @@ impl RecoveryLifecycle {
 #[cfg(test)]
 mod tests {
     use super::{
-        RecoveryLifecycle, RecoveryPolicy, RecoveryProbe, RecoveryScenario, RecoveryState,
-        StartupRecoveryPlan,
+        AnimatedSurfaceLifecycle, AnimatedSurfaceState, FailureDecision, RecoveryLifecycle,
+        RecoveryPolicy, RecoveryProbe, RecoveryScenario, RecoveryState, StartupRecoveryPlan,
+        SurfaceFailureKind,
     };
+
+    #[test]
+    fn animated_surface_failure_enters_safe_state_and_cleanup_is_idempotent() {
+        let mut lifecycle = AnimatedSurfaceLifecycle::new();
+        lifecycle.begin_create().unwrap();
+        lifecycle.webview_ready().unwrap();
+        lifecycle.playing().unwrap();
+        assert_eq!(
+            lifecycle.fail(SurfaceFailureKind::Media),
+            FailureDecision::RetryAllowed
+        );
+        lifecycle.begin_close();
+        lifecycle.finish_close();
+        lifecycle.begin_close();
+        lifecycle.finish_close();
+        assert_eq!(lifecycle.state(), AnimatedSurfaceState::Closed);
+    }
+
+    #[test]
+    fn repeated_webview_failures_reach_fallback_without_infinite_retry() {
+        let mut lifecycle = AnimatedSurfaceLifecycle::new();
+        for _ in 0..2 {
+            lifecycle.begin_create().unwrap();
+            assert_eq!(
+                lifecycle.fail(SurfaceFailureKind::WebView),
+                FailureDecision::RetryAllowed
+            );
+            lifecycle.begin_close();
+            lifecycle.finish_close();
+        }
+        lifecycle.begin_create().unwrap();
+        assert_eq!(
+            lifecycle.fail(SurfaceFailureKind::WebView),
+            FailureDecision::FallbackRequired
+        );
+        assert_eq!(lifecycle.state(), AnimatedSurfaceState::FallbackRequired);
+        assert_eq!(lifecycle.failures(), 3);
+        lifecycle.begin_close();
+        lifecycle.finish_close();
+        assert!(lifecycle.begin_create().is_ok());
+    }
 
     #[test]
     fn startup_plan_discards_stale_native_state_and_requires_new_host_validation() {

@@ -47,6 +47,7 @@ use windows_webview2::{
 
 const NATIVE_WINDOW_CLASS: PCWSTR = w!("LuminaNativeAnimatedPrototype");
 const MAX_NATIVE_SURFACES: usize = 1;
+const MAX_NATIVE_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 
 static NATIVE_SURFACE: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
 static NATIVE_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
@@ -481,13 +482,15 @@ fn create_webview(
         .map_err(|error| format!("WebView2 Controller no pudo inicializarse: {error}"))?
         .map_err(|error| format!("WebView2 devolvió un error al crear el Controller: {error}"))?;
     let webview = unsafe {
-        controller
-            .CoreWebView2()
-            .map_err(|error| format!("No se pudo obtener ICoreWebView2: {error}"))?
+        controller.CoreWebView2().map_err(|error| {
+            controller.Close().ok();
+            format!("WebViewError: no se pudo obtener ICoreWebView2: {error}")
+        })?
     };
-    let webview3 = webview
-        .cast::<ICoreWebView2_3>()
-        .map_err(|error| format!("WebView2 no expone el mapeo de host local: {error}"))?;
+    let webview3 = webview.cast::<ICoreWebView2_3>().map_err(|error| {
+        unsafe { controller.Close().ok() };
+        format!("WebViewError: WebView2 no expone el mapeo de host local: {error}")
+    })?;
     let folder = media_path
         .parent()
         .ok_or_else(|| "El medio nativo no tiene un directorio padre válido".to_string())?;
@@ -500,7 +503,10 @@ fn create_webview(
                 &folder,
                 COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW,
             )
-            .map_err(|error| format!("No se pudo mapear el medio local en WebView2: {error}"))?;
+            .map_err(|error| {
+                controller.Close().ok();
+                format!("WebViewError: no se pudo mapear el medio local: {error}")
+            })?;
     }
     let rect = windows_webview2::Win32::Foundation::RECT {
         left: 0,
@@ -509,12 +515,14 @@ fn create_webview(
         bottom: bounds.height as i32,
     };
     unsafe {
-        controller
-            .SetBounds(rect)
-            .map_err(|error| format!("No se pudo ajustar el tamaño de WebView2: {error}"))?;
-        controller
-            .SetIsVisible(true)
-            .map_err(|error| format!("No se pudo mostrar WebView2: {error}"))?;
+        controller.SetBounds(rect).map_err(|error| {
+            controller.Close().ok();
+            format!("WebViewError: no se pudo ajustar el tamaño: {error}")
+        })?;
+        controller.SetIsVisible(true).map_err(|error| {
+            controller.Close().ok();
+            format!("WebViewError: no se pudo mostrar WebView2: {error}")
+        })?;
         let navigation_handler = NavigationCompletedEventHandler::create(Box::new(|_, _| {
             eprintln!("[NativeAnimated] URL cargada");
             Ok(())
@@ -522,14 +530,53 @@ fn create_webview(
         let mut token = 0i64;
         webview
             .add_NavigationCompleted(&navigation_handler, &mut token)
-            .map_err(|error| format!("No se pudo registrar NavigationCompleted: {error}"))?;
+            .map_err(|error| {
+                controller.Close().ok();
+                format!("WebViewError: no se pudo registrar NavigationCompleted: {error}")
+            })?;
         let html = HSTRING::from(native_html(media_path));
-        webview
-            .NavigateToString(&html)
-            .map_err(|error| format!("No se pudo cargar el HTML del GIF: {error}"))?;
+        webview.NavigateToString(&html).map_err(|error| {
+            controller.Close().ok();
+            format!("MediaError: no se pudo cargar el HTML del GIF: {error}")
+        })?;
     }
     eprintln!("[NativeAnimated] GIF cargado en la ruta local del WebView2");
     Ok(controller)
+}
+
+fn validate_native_media(media_path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(media_path)
+        .map_err(|error| format!("MediaError: no se pudo leer el archivo: {error}"))?;
+    if !metadata.is_file() {
+        return Err("MediaError: la ruta no es un archivo".into());
+    }
+    if metadata.len() == 0 {
+        return Err("MediaError: el archivo está vacío".into());
+    }
+    if metadata.len() > MAX_NATIVE_MEDIA_BYTES {
+        return Err(format!(
+            "MediaError: el archivo supera el límite de {} MiB",
+            MAX_NATIVE_MEDIA_BYTES / (1024 * 1024)
+        ));
+    }
+    let extension = media_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    if extension.as_deref() != Some("gif") {
+        return Err("MediaError: el POC nativo solo admite GIF".into());
+    }
+    let reader = image::ImageReader::open(media_path)
+        .map_err(|error| format!("MediaError: no se pudo abrir el GIF: {error}"))?
+        .with_guessed_format()
+        .map_err(|error| format!("MediaError: formato GIF inválido: {error}"))?;
+    let image = reader
+        .decode()
+        .map_err(|error| format!("MediaError: no se pudo decodificar el GIF: {error}"))?;
+    if image.width() == 0 || image.height() == 0 {
+        return Err("MediaError: el GIF no tiene dimensiones válidas".into());
+    }
+    Ok(())
 }
 
 fn run_native_surface(
@@ -542,20 +589,55 @@ fn run_native_surface(
 ) {
     let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
     let result = (|| {
+        let mut lifecycle = RecoveryLifecycle::new();
+        let mut surface_lifecycle = super::recovery::AnimatedSurfaceLifecycle::new();
+        surface_lifecycle
+            .begin_create()
+            .map_err(|error| error.to_string())?;
         if !com_initialized {
             return Err("CoInitializeEx no pudo inicializar COM".into());
         }
+        if let Err(error) = validate_native_media(&media_path) {
+            let decision = surface_lifecycle.fail(super::recovery::SurfaceFailureKind::Media);
+            eprintln!(
+                "[NativeAnimated] MEDIA_FAILURE state={:?} attempts={} decision={decision:?} error={error}",
+                surface_lifecycle.state(),
+                surface_lifecycle.failures()
+            );
+            return Err(error);
+        }
         let hwnd = create_native_window(bounds, variant)?;
-        apply_z_order(hwnd, variant)?;
+        if let Err(error) = apply_z_order(hwnd, variant) {
+            unsafe {
+                DestroyWindow(hwnd).ok();
+            }
+            return Err(error);
+        }
         let attached_to_desktop = if let Some(host) = desktop_host_target {
-            desktop_host::attach_native_window(hwnd.0 as isize, host, bounds)?;
+            if let Err(error) = desktop_host::attach_native_window(hwnd.0 as isize, host, bounds) {
+                unsafe {
+                    DestroyWindow(hwnd).ok();
+                }
+                return Err(error);
+            }
             true
         } else {
             false
         };
         let controller = match create_webview(hwnd, bounds, &media_path) {
-            Ok(controller) => controller,
+            Ok(controller) => {
+                surface_lifecycle
+                    .webview_ready()
+                    .map_err(|error| error.to_string())?;
+                controller
+            }
             Err(error) => {
+                let decision = surface_lifecycle.fail(super::recovery::SurfaceFailureKind::WebView);
+                eprintln!(
+                    "[NativeAnimated] WEBVIEW_FAILURE state={:?} attempts={} decision={decision:?} error={error}",
+                    surface_lifecycle.state(),
+                    surface_lifecycle.failures()
+                );
                 unsafe {
                     if attached_to_desktop {
                         if let Err(detach_error) =
@@ -575,6 +657,12 @@ fn run_native_surface(
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = UpdateWindow(hwnd);
         }
+        surface_lifecycle
+            .playing()
+            .map_err(|error| error.to_string())?;
+        lifecycle
+            .create_renderer()
+            .map_err(|error| error.to_string())?;
         if let Some(key) = surface_key.as_ref() {
             multi_surfaces()
                 .lock()
@@ -610,8 +698,12 @@ fn run_native_surface(
             }
         }
         eprintln!("[NativeAnimated] cierre solicitado");
+        surface_lifecycle.begin_close();
+        lifecycle.begin_cleanup();
         unsafe {
-            controller.Close().ok();
+            if let Err(error) = controller.Close() {
+                eprintln!("[NativeAnimated] WEBVIEW2_CLOSE_FAILED error={error}");
+            }
         }
         eprintln!("[NativeAnimated] WebView2 destruido");
         eprintln!("[RecoveryPOC] WEBVIEW2_CLOSED");
@@ -641,6 +733,8 @@ fn run_native_surface(
                 .lock()
                 .expect("native surface mutex poisoned") = None;
         }
+        lifecycle.finish_cleanup();
+        surface_lifecycle.finish_close();
         let _ = std::fs::remove_file(&media_path);
         active_multi_temporaries()
             .lock()
@@ -1263,7 +1357,7 @@ pub fn close() -> Result<(), String> {
 mod tests {
     use super::{
         active_multi_temporaries, classify_multi_temporary, cleanup_orphaned_multi_temporaries,
-        TemporaryClassification,
+        create_diagnostic_gif, validate_native_media, TemporaryClassification,
     };
     use std::{
         collections::BTreeSet,
@@ -1327,6 +1421,39 @@ mod tests {
             .lock()
             .unwrap()
             .remove(&active_path);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_media_validation_rejects_missing_empty_wrong_format_and_large_files() {
+        let directory = test_directory();
+        let missing = directory.join("missing.gif");
+        assert!(validate_native_media(&missing)
+            .unwrap_err()
+            .contains("MediaError"));
+
+        let empty = directory.join("empty.gif");
+        fs::write(&empty, []).unwrap();
+        assert!(validate_native_media(&empty)
+            .unwrap_err()
+            .contains("MediaError"));
+
+        let wrong_format = directory.join("wrong.txt");
+        fs::write(&wrong_format, b"not media").unwrap();
+        assert!(validate_native_media(&wrong_format)
+            .unwrap_err()
+            .contains("MediaError"));
+
+        let large = directory.join("large.gif");
+        let file = fs::File::create(&large).unwrap();
+        file.set_len(super::MAX_NATIVE_MEDIA_BYTES + 1).unwrap();
+        assert!(validate_native_media(&large)
+            .unwrap_err()
+            .contains("límite"));
+
+        let valid = directory.join("valid.gif");
+        create_diagnostic_gif(&valid).unwrap();
+        assert!(validate_native_media(&valid).is_ok());
         fs::remove_dir_all(directory).unwrap();
     }
 }
