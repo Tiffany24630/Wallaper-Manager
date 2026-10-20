@@ -1,12 +1,17 @@
 use super::{
     create_diagnostic_gif, desktop_host, prototype_directory,
-    recovery::{RecoveryLifecycle, RecoveryScenario},
+    recovery::{
+        RecoveryLifecycle, RecoveryPolicy, RecoveryProbe, RecoveryScenario, StartupRecoveryPlan,
+    },
     MonitorBounds,
 };
 use std::{
-    collections::BTreeMap,
-    path::Path,
-    sync::{mpsc, Mutex, OnceLock},
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex, OnceLock,
+    },
     thread,
     time::Duration,
 };
@@ -49,6 +54,23 @@ static MULTI_SURFACES: OnceLock<Mutex<BTreeMap<String, isize>>> = OnceLock::new(
 static MULTI_THREADS: OnceLock<Mutex<BTreeMap<String, thread::JoinHandle<()>>>> = OnceLock::new();
 static REGISTERED_DESKTOP_HOST: OnceLock<Mutex<Option<desktop_host::RawDesktopHost>>> =
     OnceLock::new();
+static DESIRED_SURFACES: OnceLock<Mutex<BTreeMap<String, DesiredSurface>>> = OnceLock::new();
+static HOST_WATCHER: OnceLock<Mutex<Option<HostWatcher>>> = OnceLock::new();
+static ACTIVE_MULTI_TEMPORARIES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct DesiredSurface {
+    app: AppHandle,
+    monitor_id: String,
+    bounds: MonitorBounds,
+    dpi: u32,
+}
+
+struct HostWatcher {
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    thread: thread::JoinHandle<()>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZOrderVariant {
@@ -134,6 +156,110 @@ fn register_desktop_host(host: desktop_host::RawDesktopHost) {
     *registered_desktop_host()
         .lock()
         .expect("registered host mutex poisoned") = Some(host);
+}
+
+fn desired_surfaces() -> &'static Mutex<BTreeMap<String, DesiredSurface>> {
+    DESIRED_SURFACES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn host_watcher() -> &'static Mutex<Option<HostWatcher>> {
+    HOST_WATCHER.get_or_init(|| Mutex::new(None))
+}
+
+fn active_multi_temporaries() -> &'static Mutex<BTreeSet<PathBuf>> {
+    ACTIVE_MULTI_TEMPORARIES.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn is_owned_multi_temporary(path: &Path, directory: &Path) -> bool {
+    path.parent() == Some(directory)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("native-multimonitor-") && name.ends_with(".gif"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemporaryClassification {
+    OwnedOrphan,
+    Active,
+    Foreign,
+}
+
+fn classify_multi_temporary(
+    path: &Path,
+    directory: &Path,
+    active: &BTreeSet<PathBuf>,
+) -> TemporaryClassification {
+    if !is_owned_multi_temporary(path, directory) {
+        TemporaryClassification::Foreign
+    } else if active.contains(path) {
+        TemporaryClassification::Active
+    } else {
+        TemporaryClassification::OwnedOrphan
+    }
+}
+
+pub fn cleanup_orphaned_multi_temporaries(directory: &Path) -> Result<(), String> {
+    let active = active_multi_temporaries()
+        .lock()
+        .expect("active temporary mutex poisoned")
+        .clone();
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "[TempCleanup] STARTUP_CONTINUES reason=directory_unreadable path={} error={error}",
+                directory.display()
+            );
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!("[TempCleanup] TEMP_PRESERVED reason=read_entry error={error}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        match classify_multi_temporary(&path, directory, &active) {
+            TemporaryClassification::Foreign => {}
+            TemporaryClassification::Active => eprintln!(
+                "[TempCleanup] TEMP_PRESERVED reason=active path={}",
+                path.display()
+            ),
+            TemporaryClassification::OwnedOrphan => match std::fs::remove_file(&path) {
+                Ok(()) => eprintln!("[TempCleanup] TEMP_REMOVED path={}", path.display()),
+                Err(error) => eprintln!(
+                    "[TempCleanup] TEMP_PRESERVED reason=remove_failed path={} error={error}",
+                    path.display()
+                ),
+            },
+        }
+    }
+    Ok(())
+}
+
+pub fn prepare_startup(directory: &Path) -> Result<(), String> {
+    let plan = StartupRecoveryPlan::for_new_process();
+    if plan.discard_native_references {
+        *registered_desktop_host()
+            .lock()
+            .expect("registered host mutex poisoned") = None;
+        desired_surfaces()
+            .lock()
+            .expect("desired surfaces mutex poisoned")
+            .clear();
+    }
+    if plan.clean_owned_temporaries {
+        cleanup_orphaned_multi_temporaries(directory)?;
+    }
+    eprintln!(
+        "[HostMonitor] STARTUP_CLEAN references_discarded={} watcher_requires_new_validation={}",
+        plan.discard_native_references, plan.start_watcher_only_after_validation
+    );
+    Ok(())
 }
 
 unsafe extern "system" fn native_window_proc(
@@ -516,6 +642,10 @@ fn run_native_surface(
                 .expect("native surface mutex poisoned") = None;
         }
         let _ = std::fs::remove_file(&media_path);
+        active_multi_temporaries()
+            .lock()
+            .expect("active temporary mutex poisoned")
+            .remove(&media_path);
         eprintln!("[NativeAnimated] temporal eliminado");
         if std::env::var_os("LUMINA_ANIMATED_DESKTOP_POC_FINAL_SNAPSHOT").is_some() {
             match desktop_host::snapshot_current_desktop() {
@@ -586,7 +716,7 @@ fn open_internal(
     match ready_rx.recv_timeout(Duration::from_secs(15)) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => {
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&path);
             if let Some(handle) = native_thread()
                 .lock()
                 .expect("native thread mutex poisoned")
@@ -597,7 +727,7 @@ fn open_internal(
             Err(error)
         }
         Err(_) => {
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&path);
             Err(
                 "El renderer nativo no confirmó su inicialización dentro del tiempo esperado"
                     .into(),
@@ -627,7 +757,19 @@ pub fn open_physical_surface(
     app: &AppHandle,
     monitor_id: String,
     monitor: MonitorBounds,
+    dpi: u32,
     desktop_host: desktop_host::RawDesktopHost,
+) -> Result<(), String> {
+    open_physical_surface_internal(app, monitor_id, monitor, dpi, desktop_host, true)
+}
+
+fn open_physical_surface_internal(
+    app: &AppHandle,
+    monitor_id: String,
+    monitor: MonitorBounds,
+    dpi: u32,
+    desktop_host: desktop_host::RawDesktopHost,
+    remember_desired: bool,
 ) -> Result<(), String> {
     register_desktop_host(desktop_host);
     if multi_surfaces()
@@ -655,6 +797,24 @@ pub fn open_physical_surface(
         uuid::Uuid::new_v4()
     ));
     create_diagnostic_gif(&path)?;
+    active_multi_temporaries()
+        .lock()
+        .expect("active temporary mutex poisoned")
+        .insert(path.clone());
+    if remember_desired {
+        desired_surfaces()
+            .lock()
+            .expect("desired surfaces mutex poisoned")
+            .insert(
+                monitor_id.clone(),
+                DesiredSurface {
+                    app: app.clone(),
+                    monitor_id: monitor_id.clone(),
+                    bounds: monitor,
+                    dpi,
+                },
+            );
+    }
     let (ready_tx, ready_rx) = mpsc::channel();
     let thread_path = path.clone();
     let key = monitor_id.clone();
@@ -678,10 +838,21 @@ pub fn open_physical_surface(
                 "[MultiMonitorPOC] RENDERER_CREATED monitor_id={} hwnd=0x{:x} host=0x{:x}",
                 monitor_id, hwnd, desktop_host.1
             );
+            start_host_watcher();
             Ok(())
         }
         Ok(Err(error)) => {
-            let _ = std::fs::remove_file(path);
+            if remember_desired {
+                desired_surfaces()
+                    .lock()
+                    .expect("desired surfaces mutex poisoned")
+                    .remove(&monitor_id);
+            }
+            let _ = std::fs::remove_file(&path);
+            active_multi_temporaries()
+                .lock()
+                .expect("active temporary mutex poisoned")
+                .remove(&path);
             if let Some(handle) = multi_threads()
                 .lock()
                 .expect("multi thread mutex poisoned")
@@ -691,9 +862,22 @@ pub fn open_physical_surface(
             }
             Err(error)
         }
-        Err(_) => Err(format!(
-            "La superficie del monitor {monitor_id} no confirmó su inicialización"
-        )),
+        Err(_) => {
+            if remember_desired {
+                desired_surfaces()
+                    .lock()
+                    .expect("desired surfaces mutex poisoned")
+                    .remove(&monitor_id);
+            }
+            let _ = std::fs::remove_file(&path);
+            active_multi_temporaries()
+                .lock()
+                .expect("active temporary mutex poisoned")
+                .remove(&path);
+            Err(format!(
+                "La superficie del monitor {monitor_id} no confirmó su inicialización"
+            ))
+        }
     }
 }
 
@@ -703,6 +887,181 @@ pub fn validate_registered_desktop_host() -> Result<desktop_host::HostValidation
         .expect("registered host mutex poisoned")
         .ok_or("No hay un host Explorer registrado")?;
     Ok(desktop_host::validate_registered_host(host))
+}
+
+fn start_host_watcher() {
+    let mut slot = host_watcher().lock().expect("host watcher mutex poisoned");
+    if slot.is_some() {
+        return;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    let thread_wake = Arc::clone(&wake);
+    let handle = thread::spawn(move || {
+        let mut recovery_policy = RecoveryPolicy::new();
+        loop {
+            let interval = match recovery_policy.probe() {
+                RecoveryProbe::Immediate => Duration::from_secs(2),
+                RecoveryProbe::LowFrequency => Duration::from_secs(30),
+            };
+            let (wake_lock, wake_condition) = &*thread_wake;
+            let guard = wake_lock.lock().expect("host watcher wake mutex poisoned");
+            let (_guard, timeout) = wake_condition
+                .wait_timeout_while(guard, interval, |requested| {
+                    !*requested && !thread_stop.load(Ordering::Acquire)
+                })
+                .expect("host watcher wait failed");
+            if thread_stop.load(Ordering::Acquire) {
+                break;
+            }
+            if desired_surfaces()
+                .lock()
+                .expect("desired surfaces mutex poisoned")
+                .is_empty()
+            {
+                break;
+            }
+            if recovery_policy.exhausted() && timeout.timed_out() {
+                eprintln!("[HostMonitor] RECOVERY_PROBE low_frequency=true");
+                if recover_desired_surfaces() {
+                    recovery_policy.on_success();
+                }
+                continue;
+            }
+            match validate_registered_desktop_host() {
+                Ok(desktop_host::HostValidation::Stable) => {
+                    recovery_policy.on_success();
+                }
+                Ok(desktop_host::HostValidation::Transient(reason)) => {
+                    eprintln!("[HostMonitor] HOST_TRANSIENT_ERROR reason={reason}");
+                }
+                Ok(desktop_host::HostValidation::Changed(reason)) => {
+                    eprintln!("[HostMonitor] HOST_CHANGED reason={reason}");
+                    if recover_desired_surfaces() {
+                        recovery_policy.on_success();
+                    } else {
+                        recovery_policy.on_failure();
+                        if recovery_policy.exhausted() {
+                            eprintln!(
+                                "[HostMonitor] RECOVERY_DEGRADED retry_limit={} desired_surfaces_preserved=true next_probe_seconds=30",
+                                recovery_policy.attempts()
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[HostMonitor] watcher validation failed: {error}");
+                }
+            }
+        }
+        eprintln!("[HostMonitor] WATCHER_STOPPED");
+        eprintln!("[HostMonitor] WATCHER_TERMINATED");
+    });
+    eprintln!("[HostMonitor] WATCHER_STARTED");
+    *slot = Some(HostWatcher {
+        stop,
+        wake,
+        thread: handle,
+    });
+}
+
+fn stop_host_watcher() {
+    let watcher = host_watcher()
+        .lock()
+        .expect("host watcher mutex poisoned")
+        .take();
+    if let Some(watcher) = watcher {
+        watcher.stop.store(true, Ordering::Release);
+        let (wake_lock, wake_condition) = &*watcher.wake;
+        if let Ok(mut requested) = wake_lock.lock() {
+            *requested = true;
+            wake_condition.notify_one();
+        }
+        let _ = watcher.thread.join();
+    }
+}
+
+fn recover_desired_surfaces() -> bool {
+    eprintln!("[HostMonitor] RECOVERY_STARTED");
+    let desired = desired_surfaces()
+        .lock()
+        .expect("desired surfaces mutex poisoned")
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let ids = multi_surfaces()
+        .lock()
+        .expect("multi surface mutex poisoned")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for id in ids {
+        if let Err(error) = stop_physical_surface(&id) {
+            eprintln!("[HostMonitor] RECOVERY_CLEANUP_FAILED monitor_id={id} error={error}");
+            return false;
+        }
+    }
+
+    let (host, experiment) = match desktop_host::prepare_modern_host() {
+        Ok(value) if value.1.host_is_unambiguous => value,
+        Ok((_, experiment)) => {
+            eprintln!(
+                "[HostMonitor] HOST_UNAVAILABLE candidate_count={}",
+                experiment.candidate_count
+            );
+            return false;
+        }
+        Err(error) => {
+            eprintln!("[HostMonitor] HOST_UNAVAILABLE error={error}");
+            return false;
+        }
+    };
+    register_desktop_host(host);
+    eprintln!(
+        "[HostMonitor] HOST_REDISCOVERED workerw=0x{:x} candidate_count={}",
+        host.1, experiment.candidate_count
+    );
+    let mut recovered = 0usize;
+    let desired_count = desired.len();
+    for surface in desired {
+        let still_desired = desired_surfaces()
+            .lock()
+            .expect("desired surfaces mutex poisoned")
+            .contains_key(&surface.monitor_id);
+        if !still_desired {
+            eprintln!(
+                "[HostMonitor] SURFACE_RECOVERY_SKIPPED monitor_id={} reason=explicit_close",
+                surface.monitor_id
+            );
+            continue;
+        }
+        match open_physical_surface_internal(
+            &surface.app,
+            surface.monitor_id.clone(),
+            surface.bounds,
+            surface.dpi,
+            host,
+            false,
+        ) {
+            Ok(()) => {
+                recovered += 1;
+                eprintln!(
+                    "[HostMonitor] SURFACE_RECOVERED monitor_id={}",
+                    surface.monitor_id
+                );
+            }
+            Err(error) => eprintln!(
+                "[HostMonitor] SURFACE_RECOVERY_FAILED monitor_id={} error={error}",
+                surface.monitor_id
+            ),
+        }
+    }
+    eprintln!(
+        "[HostMonitor] RECOVERY_COMPLETED recovered={} desired={}",
+        recovered, desired_count
+    );
+    recovered == desired_count
 }
 
 fn sanitize_monitor_id(value: &str) -> String {
@@ -719,6 +1078,22 @@ fn sanitize_monitor_id(value: &str) -> String {
 }
 
 pub fn close_physical_surface(monitor_id: &str) -> Result<(), String> {
+    desired_surfaces()
+        .lock()
+        .expect("desired surfaces mutex poisoned")
+        .remove(monitor_id);
+    let result = stop_physical_surface(monitor_id);
+    if desired_surfaces()
+        .lock()
+        .expect("desired surfaces mutex poisoned")
+        .is_empty()
+    {
+        stop_host_watcher();
+    }
+    result
+}
+
+fn stop_physical_surface(monitor_id: &str) -> Result<(), String> {
     let hwnd = multi_surfaces()
         .lock()
         .expect("multi surface mutex poisoned")
@@ -743,6 +1118,11 @@ pub fn close_physical_surface(monitor_id: &str) -> Result<(), String> {
 }
 
 pub fn close_all_physical_surfaces() {
+    desired_surfaces()
+        .lock()
+        .expect("desired surfaces mutex poisoned")
+        .clear();
+    stop_host_watcher();
     let ids: Vec<String> = multi_surfaces()
         .lock()
         .expect("multi surface mutex poisoned")
@@ -877,4 +1257,76 @@ pub fn close() -> Result<(), String> {
             .map_err(|_| "El hilo del renderer nativo terminó de forma inesperada".to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        active_multi_temporaries, classify_multi_temporary, cleanup_orphaned_multi_temporaries,
+        TemporaryClassification,
+    };
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    fn test_directory() -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "lumina-animated-temp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn temporary_classification_is_conservative() {
+        let directory = test_directory();
+        let owned = directory.join("native-multimonitor-display-1.gif");
+        let active_path = directory.join("native-multimonitor-display-2.gif");
+        let foreign = directory.join("native-diagnostic-old.gif");
+        let active = BTreeSet::from([active_path.clone()]);
+
+        assert_eq!(
+            classify_multi_temporary(&owned, &directory, &active),
+            TemporaryClassification::OwnedOrphan
+        );
+        assert_eq!(
+            classify_multi_temporary(&active_path, &directory, &active),
+            TemporaryClassification::Active
+        );
+        assert_eq!(
+            classify_multi_temporary(&foreign, &directory, &active),
+            TemporaryClassification::Foreign
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cleanup_removes_only_orphaned_owned_temporaries_and_is_idempotent() {
+        let directory = test_directory();
+        let orphan = directory.join("native-multimonitor-orphan.gif");
+        let active_path = directory.join("native-multimonitor-active.gif");
+        let foreign = directory.join("native-diagnostic-legacy.gif");
+        fs::write(&orphan, b"gif").unwrap();
+        fs::write(&active_path, b"gif").unwrap();
+        fs::write(&foreign, b"gif").unwrap();
+        active_multi_temporaries()
+            .lock()
+            .unwrap()
+            .insert(active_path.clone());
+
+        cleanup_orphaned_multi_temporaries(Path::new(&directory)).unwrap();
+        cleanup_orphaned_multi_temporaries(Path::new(&directory)).unwrap();
+
+        assert!(!orphan.exists());
+        assert!(active_path.exists());
+        assert!(foreign.exists());
+        active_multi_temporaries()
+            .lock()
+            .unwrap()
+            .remove(&active_path);
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

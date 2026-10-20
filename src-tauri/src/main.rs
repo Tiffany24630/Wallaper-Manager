@@ -36,6 +36,9 @@ fn main() {
         .manage(scheduler)
         .setup(move |app| {
             db::initialize(app.handle()).map_err(std::io::Error::other)?;
+            if let Err(error) = animated_wallpaper::prepare_animated_startup(app.handle()) {
+                eprintln!("No se pudo preparar el arranque limpio del POC animado: {error}");
+            }
             if let Err(error) = restore_active_cursor() {
                 eprintln!("No se pudo restaurar el cursor activo: {error}");
             }
@@ -131,6 +134,11 @@ fn main() {
                     Ok(()) => eprintln!("Animated multi-monitor POC started"),
                     Err(error) => eprintln!("Animated multi-monitor POC failed: {error}"),
                 }
+            } else if std::env::var_os("LUMINA_ANIMATED_HOST_WATCHER_TEST").is_some() {
+                match animated_wallpaper::open_animated_host_watcher_poc(app.handle().clone()) {
+                    Ok(()) => eprintln!("Animated host watcher POC started"),
+                    Err(error) => eprintln!("Animated host watcher POC failed: {error}"),
+                }
             } else if std::env::var_os("LUMINA_ANIMATED_MULTIMONITOR_PHYSICAL_TEST").is_some() {
                 match animated_wallpaper::open_animated_multimonitor_physical_poc(
                     app.handle().clone(),
@@ -216,6 +224,7 @@ fn main() {
             animated_wallpaper::open_animated_desktop_poc,
             animated_wallpaper::open_animated_desktop_recovery_poc,
             animated_wallpaper::open_animated_multimonitor_poc,
+            animated_wallpaper::open_animated_host_watcher_poc,
             animated_wallpaper::open_animated_multimonitor_physical_poc,
             animated_wallpaper::close_native_animated_prototype,
             animated_wallpaper::close_animated_multimonitor_physical_poc,

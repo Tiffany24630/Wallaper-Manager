@@ -144,6 +144,19 @@ fn prototype_directory(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(directory)
 }
 
+pub fn prepare_animated_startup(app: &AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let directory = prototype_directory(app)?;
+        return native_window::prepare_startup(&directory);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Ok(())
+    }
+}
+
 fn copy_to_controlled_storage(
     app: &AppHandle,
     source: &Path,
@@ -594,9 +607,64 @@ pub fn open_animated_multimonitor_poc(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn open_animated_host_watcher_poc(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let window = app
+            .get_webview_window("main")
+            .ok_or("No se encontró la ventana principal de Lumina")?;
+        let monitor = window
+            .primary_monitor()
+            .map_err(|error| format!("No se pudo obtener el monitor principal: {error}"))?
+            .ok_or("Windows no expuso un monitor principal")?;
+        let position = monitor.position();
+        let size = monitor.size();
+        let bounds = bounds_from_geometry(position.x, position.y, size.width, size.height)?;
+        let dpi = (monitor.scale_factor() * 96.0).round() as u32;
+        let temporary_directory = prototype_directory(&app)?;
+        native_window::cleanup_orphaned_multi_temporaries(&temporary_directory)?;
+        let (host, experiment) = desktop_host::prepare_modern_host()?;
+        if !experiment.host_is_unambiguous {
+            return Err(format!(
+                "Host de escritorio no inequívoco: candidate_count={}",
+                experiment.candidate_count
+            ));
+        }
+        eprintln!(
+            "[HostMonitorPOC] MONITOR_READY id=watcher-primary bounds=({},{} {}x{}) dpi={} candidate_count={}",
+            bounds.x, bounds.y, bounds.width, bounds.height, dpi, experiment.candidate_count
+        );
+        native_window::open_physical_surface(
+            &app,
+            "watcher-primary".to_string(),
+            bounds,
+            dpi,
+            host,
+        )?;
+        if std::env::var_os("LUMINA_ANIMATED_HOST_WATCHER_AUTOCLOSE").is_some() {
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                eprintln!("[HostMonitorPOC] EXPLICIT_CLOSE_COMMAND");
+                if let Err(error) = native_window::close_physical_surface("watcher-primary") {
+                    eprintln!("[HostMonitorPOC] EXPLICIT_CLOSE_FAILED error={error}");
+                }
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("El POC del watcher solo está disponible en Windows".into())
+    }
+}
+
+#[tauri::command]
 pub fn open_animated_multimonitor_physical_poc(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        let temporary_directory = prototype_directory(&app)?;
+        native_window::cleanup_orphaned_multi_temporaries(&temporary_directory)?;
         let window = app
             .get_webview_window("main")
             .ok_or("No se encontró la ventana principal de Lumina")?;
@@ -660,7 +728,8 @@ pub fn open_animated_multimonitor_physical_poc(app: AppHandle) -> Result<(), Str
                 }
                 return Err(format!("Host de escritorio no inequívoco para {id}"));
             }
-            if let Err(error) = native_window::open_physical_surface(&app, id.clone(), bounds, host)
+            if let Err(error) =
+                native_window::open_physical_surface(&app, id.clone(), bounds, dpi, host)
             {
                 for previous in &created {
                     let _ = native_window::close_physical_surface(previous);
