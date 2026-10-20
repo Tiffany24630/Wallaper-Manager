@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 #[cfg(target_os = "windows")]
 mod desktop_host;
+mod multimonitor;
 #[cfg(target_os = "windows")]
 mod native_window;
 mod recovery;
@@ -394,6 +395,324 @@ pub fn open_animated_desktop_recovery_poc(
 }
 
 #[tauri::command]
+pub fn open_animated_multimonitor_poc(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let window = app
+            .get_webview_window("main")
+            .ok_or("No se encontró la ventana principal de Lumina")?;
+        let monitors = window
+            .available_monitors()
+            .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
+        let native_ids = crate::utils::windows_wallpaper::available_monitor_ids()
+            .ok()
+            .filter(|ids| ids.len() == monitors.len());
+        let dpi = window
+            .hwnd()
+            .ok()
+            .map(|hwnd| unsafe {
+                windows_webview2::Win32::UI::HiDpi::GetDpiForWindow(
+                    windows_webview2::Win32::Foundation::HWND(hwnd.0),
+                )
+            })
+            .filter(|value| *value != 0)
+            .unwrap_or(96);
+        let primary_name = window
+            .primary_monitor()
+            .ok()
+            .flatten()
+            .and_then(|monitor| monitor.name().cloned());
+        let mut actual = Vec::new();
+        for (index, monitor) in monitors.iter().enumerate() {
+            let position = monitor.position();
+            let size = monitor.size();
+            let id = native_ids
+                .as_ref()
+                .and_then(|ids| ids.get(index).cloned())
+                .or_else(|| monitor.name().cloned().filter(|name| !name.is_empty()))
+                .unwrap_or_else(|| {
+                    format!(
+                        "display-{}-{}-{}-{}",
+                        position.x, position.y, size.width, size.height
+                    )
+                });
+            let spec = multimonitor::MonitorSpec {
+                id,
+                bounds: multimonitor::LogicalBounds {
+                    x: position.x,
+                    y: position.y,
+                    width: size.width,
+                    height: size.height,
+                },
+                dpi,
+                primary: primary_name
+                    .as_ref()
+                    .zip(monitor.name())
+                    .is_some_and(|(primary, name)| primary == name),
+                simulated: false,
+            };
+            eprintln!(
+                "[MultiMonitorPOC] REAL_MONITOR id={} bounds=({},{} {}x{}) dpi={} primary={}",
+                spec.id,
+                spec.bounds.x,
+                spec.bounds.y,
+                spec.bounds.width,
+                spec.bounds.height,
+                spec.dpi,
+                spec.primary
+            );
+            actual.push(spec);
+        }
+        eprintln!(
+            "[MultiMonitorPOC] REAL_MONITOR_COUNT={} physical_visual_validation={}",
+            actual.len(),
+            actual.len() > 1
+        );
+
+        for (variant_index, topology) in multimonitor::simulated_topologies().iter().enumerate() {
+            let mut coordinator = multimonitor::MonitorCoordinator::default();
+            eprintln!("[MultiMonitorPOC] SIMULATED_TOPOLOGY index={variant_index}");
+            for monitor in topology {
+                eprintln!(
+                    "[MultiMonitorPOC] TOPOLOGY_MONITOR id={} bounds=({},{} -> {},{}) dpi={} simulated={}",
+                    monitor.id,
+                    monitor.bounds.x,
+                    monitor.bounds.y,
+                    monitor.bounds.right(),
+                    monitor.bounds.bottom(),
+                    monitor.dpi,
+                    monitor.simulated
+                );
+                coordinator
+                    .create(monitor)
+                    .map_err(|error| format!("No se pudo crear la instancia simulada: {error}"))?;
+                let surface = coordinator
+                    .surface(&monitor.id)
+                    .ok_or("La superficie simulada no quedó registrada")?;
+                eprintln!(
+                    "[MultiMonitorPOC] SURFACE monitor={} renderer={} host={} temp={} dpi={}",
+                    surface.monitor_id,
+                    surface.renderer_id,
+                    surface.host_id,
+                    surface.temp_id,
+                    surface.dpi
+                );
+                coordinator
+                    .update_geometry(&monitor.id, monitor.bounds, monitor.dpi)
+                    .map_err(|error| format!("No se pudo actualizar la geometría: {error}"))?;
+            }
+            eprintln!(
+                "[MultiMonitorPOC] SURFACES_CREATED count={} renderer_count={}",
+                topology.len(),
+                coordinator.active_count()
+            );
+            let first = &topology[0];
+            coordinator.mark_unavailable(&first.id);
+            eprintln!(
+                "[MultiMonitorPOC] SURFACE_CLOSED monitor={} renderer_count={}",
+                first.id,
+                coordinator.active_count()
+            );
+            coordinator
+                .create(first)
+                .map_err(|error| format!("No se pudo recrear la instancia simulada: {error}"))?;
+            eprintln!(
+                "[MultiMonitorPOC] SURFACE_RECOVERED monitor={} renderer_count={}",
+                first.id,
+                coordinator.active_count()
+            );
+            let second = &topology[1];
+            coordinator.mark_unavailable(&second.id);
+            eprintln!(
+                "[MultiMonitorPOC] MONITOR_UNAVAILABLE monitor={} renderer_count={}",
+                second.id,
+                coordinator.active_count()
+            );
+            coordinator
+                .create(second)
+                .map_err(|error| format!("No se pudo restaurar la instancia simulada: {error}"))?;
+            eprintln!(
+                "[MultiMonitorPOC] MONITOR_RESTORED monitor={} renderer_count={}",
+                second.id,
+                coordinator.active_count()
+            );
+            coordinator.mark_unavailable(&first.id);
+            coordinator.mark_unavailable(&second.id);
+            eprintln!(
+                "[MultiMonitorPOC] SIMULATED_CLEANUP renderer_count={}",
+                coordinator.active_count()
+            );
+        }
+
+        if let Some(monitor) = actual.first() {
+            return native_window::open_desktop_poc(
+                &app,
+                MonitorBounds {
+                    x: monitor.bounds.x,
+                    y: monitor.bounds.y,
+                    width: monitor.bounds.width,
+                    height: monitor.bounds.height,
+                },
+            );
+        }
+        return Err("Windows no expuso ningún monitor disponible".into());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("El POC multi-monitor solo está disponible en Windows".into())
+    }
+}
+
+#[tauri::command]
+pub fn open_animated_multimonitor_physical_poc(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let window = app
+            .get_webview_window("main")
+            .ok_or("No se encontró la ventana principal de Lumina")?;
+        let monitors = window
+            .available_monitors()
+            .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
+        eprintln!(
+            "[MultiMonitorPOC] PHYSICAL_MONITOR_COUNT={} physical_visual_validation={}",
+            monitors.len(),
+            monitors.len() >= 2
+        );
+        if monitors.len() < 2 {
+            eprintln!(
+                "[MultiMonitorPOC] MULTIMONITOR_FISICO=NO_PROBADO; se ejecutan únicamente las pruebas lógicas"
+            );
+            run_simulated_multimonitor_validation()?;
+            return Ok(());
+        }
+
+        let native_ids = crate::utils::windows_wallpaper::available_monitor_ids()
+            .ok()
+            .filter(|ids| ids.len() == monitors.len());
+        let mut created: Vec<String> = Vec::new();
+        for (index, monitor) in monitors.iter().take(2).enumerate() {
+            let position = monitor.position();
+            let size = monitor.size();
+            let id = native_ids
+                .as_ref()
+                .and_then(|ids| ids.get(index).cloned())
+                .or_else(|| monitor.name().cloned().filter(|name| !name.is_empty()))
+                .unwrap_or_else(|| format!("display-{}-{}-{}", position.x, position.y, size.width));
+            let bounds = bounds_from_geometry(position.x, position.y, size.width, size.height)?;
+            let dpi = (monitor.scale_factor() * 96.0).round() as u32;
+            eprintln!(
+                "[MultiMonitorPOC] PHYSICAL_MONITOR index={} id={} bounds=({},{} {}x{}) dpi={} primary={}",
+                index,
+                id,
+                position.x,
+                position.y,
+                size.width,
+                size.height,
+                dpi,
+                monitor.name().is_some_and(|name| window.primary_monitor().ok().flatten().and_then(|primary| primary.name().cloned()).as_ref() == Some(name))
+            );
+            let (host, experiment) = match desktop_host::prepare_modern_host() {
+                Ok(value) => value,
+                Err(error) => {
+                    for previous in &created {
+                        let _ = native_window::close_physical_surface(previous);
+                    }
+                    return Err(format!("No se pudo validar el host para {id}: {error}"));
+                }
+            };
+            if !experiment.host_is_unambiguous {
+                eprintln!(
+                    "[MultiMonitorPOC] HOST_UNAVAILABLE monitor_id={} candidate_count={}",
+                    id, experiment.candidate_count
+                );
+                for previous in created {
+                    let _ = native_window::close_physical_surface(&previous);
+                }
+                return Err(format!("Host de escritorio no inequívoco para {id}"));
+            }
+            if let Err(error) = native_window::open_physical_surface(&app, id.clone(), bounds, host)
+            {
+                for previous in &created {
+                    let _ = native_window::close_physical_surface(previous);
+                }
+                return Err(format!("No se pudo crear la superficie para {id}: {error}"));
+            }
+            eprintln!(
+                "[MultiMonitorPOC] SURFACE_READY monitor_id={} host={} candidate_count={}",
+                id, host.1, experiment.candidate_count
+            );
+            created.push(id);
+        }
+        eprintln!(
+            "[MultiMonitorPOC] PHYSICAL_SURFACES_CREATED count={} independent=true",
+            created.len()
+        );
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("El POC físico multi-monitor solo está disponible en Windows".into())
+    }
+}
+
+fn run_simulated_multimonitor_validation() -> Result<(), String> {
+    for (variant_index, topology) in multimonitor::simulated_topologies().iter().enumerate() {
+        let mut coordinator = multimonitor::MonitorCoordinator::default();
+        eprintln!("[MultiMonitorPOC] PHYSICAL_SIMULATED_TOPOLOGY index={variant_index}");
+        for monitor in topology {
+            coordinator
+                .create(monitor)
+                .map_err(|error| format!("No se pudo crear la instancia simulada: {error}"))?;
+            let surface = coordinator
+                .surface(&monitor.id)
+                .ok_or("La superficie simulada no quedó registrada")?;
+            eprintln!(
+                "[MultiMonitorPOC] PHYSICAL_SIMULATED_SURFACE monitor={} renderer={} host={} temp={} bounds=({},{} {}x{}) dpi={}",
+                surface.monitor_id,
+                surface.renderer_id,
+                surface.host_id,
+                surface.temp_id,
+                surface.bounds.x,
+                surface.bounds.y,
+                surface.bounds.width,
+                surface.bounds.height,
+                surface.dpi
+            );
+            coordinator
+                .update_geometry(&monitor.id, monitor.bounds, monitor.dpi)
+                .map_err(|error| format!("No se pudo actualizar la geometría: {error}"))?;
+        }
+        let first = &topology[0];
+        let second = &topology[1];
+        eprintln!(
+            "[MultiMonitorPOC] PHYSICAL_SIMULATED_ACTIVE count={}",
+            coordinator.active_count()
+        );
+        coordinator.mark_unavailable(&first.id);
+        eprintln!(
+            "[MultiMonitorPOC] PHYSICAL_SIMULATED_CLOSE_A count={}",
+            coordinator.active_count()
+        );
+        coordinator
+            .create(first)
+            .map_err(|error| format!("No se pudo recuperar A: {error}"))?;
+        coordinator.mark_unavailable(&second.id);
+        coordinator
+            .create(second)
+            .map_err(|error| format!("No se pudo restaurar B: {error}"))?;
+        coordinator.mark_unavailable(&first.id);
+        coordinator.mark_unavailable(&second.id);
+        eprintln!(
+            "[MultiMonitorPOC] PHYSICAL_SIMULATED_CLEANUP count={}",
+            coordinator.active_count()
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn close_native_animated_prototype() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -402,6 +721,19 @@ pub fn close_native_animated_prototype() -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
         Err("El renderer HWND nativo solo está disponible en Windows".into())
+    }
+}
+
+#[tauri::command]
+pub fn close_animated_multimonitor_physical_poc(monitor_id: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        return native_window::close_physical_surface(&monitor_id);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = monitor_id;
+        Err("El POC físico multi-monitor solo está disponible en Windows".into())
     }
 }
 
@@ -437,7 +769,10 @@ pub fn close_animated_prototype(app: AppHandle, monitor_index: usize) -> Result<
 
 pub fn close_all_animated_prototypes(app: &AppHandle) {
     #[cfg(target_os = "windows")]
-    let _ = native_window::close();
+    {
+        let _ = native_window::close();
+        native_window::close_all_physical_surfaces();
+    }
     for (label, window) in app.webview_windows() {
         if label.starts_with("animated-prototype-") {
             let _ = window.close();

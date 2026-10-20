@@ -4,6 +4,7 @@ use super::{
     MonitorBounds,
 };
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::{mpsc, Mutex, OnceLock},
     thread,
@@ -44,6 +45,8 @@ const MAX_NATIVE_SURFACES: usize = 1;
 
 static NATIVE_SURFACE: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
 static NATIVE_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
+static MULTI_SURFACES: OnceLock<Mutex<BTreeMap<String, isize>>> = OnceLock::new();
+static MULTI_THREADS: OnceLock<Mutex<BTreeMap<String, thread::JoinHandle<()>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZOrderVariant {
@@ -111,6 +114,14 @@ fn native_surface() -> &'static Mutex<Option<isize>> {
 
 fn native_thread() -> &'static Mutex<Option<thread::JoinHandle<()>>> {
     NATIVE_THREAD.get_or_init(|| Mutex::new(None))
+}
+
+fn multi_surfaces() -> &'static Mutex<BTreeMap<String, isize>> {
+    MULTI_SURFACES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn multi_threads() -> &'static Mutex<BTreeMap<String, thread::JoinHandle<()>>> {
+    MULTI_THREADS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 unsafe extern "system" fn native_window_proc(
@@ -388,6 +399,7 @@ fn run_native_surface(
     media_path: std::path::PathBuf,
     variant: ZOrderVariant,
     desktop_host_target: Option<desktop_host::RawDesktopHost>,
+    surface_key: Option<String>,
     ready: mpsc::Sender<Result<isize, String>>,
 ) {
     let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
@@ -425,9 +437,20 @@ fn run_native_surface(
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = UpdateWindow(hwnd);
         }
-        *native_surface()
-            .lock()
-            .expect("native surface mutex poisoned") = Some(hwnd.0 as isize);
+        if let Some(key) = surface_key.as_ref() {
+            multi_surfaces()
+                .lock()
+                .expect("multi surface mutex poisoned")
+                .insert(key.clone(), hwnd.0 as isize);
+            eprintln!(
+                "[MultiMonitorPOC] SURFACE_ACTIVE monitor_id={} hwnd={:?} bounds=({},{} {}x{})",
+                key, hwnd, bounds.x, bounds.y, bounds.width, bounds.height
+            );
+        } else {
+            *native_surface()
+                .lock()
+                .expect("native surface mutex poisoned") = Some(hwnd.0 as isize);
+        }
         eprintln!("[NativeAnimated] ventana mostrada");
         log_window_diagnostics(hwnd, bounds, variant);
         ready
@@ -469,9 +492,17 @@ fn run_native_surface(
         }
         eprintln!("[NativeAnimated] HWND destruido");
         eprintln!("[RecoveryPOC] HWND_DESTROYED");
-        *native_surface()
-            .lock()
-            .expect("native surface mutex poisoned") = None;
+        if let Some(key) = surface_key.as_ref() {
+            multi_surfaces()
+                .lock()
+                .expect("multi surface mutex poisoned")
+                .remove(key);
+            eprintln!("[MultiMonitorPOC] SURFACE_DESTROYED monitor_id={key}");
+        } else {
+            *native_surface()
+                .lock()
+                .expect("native surface mutex poisoned") = None;
+        }
         let _ = std::fs::remove_file(&media_path);
         eprintln!("[NativeAnimated] temporal eliminado");
         if std::env::var_os("LUMINA_ANIMATED_DESKTOP_POC_FINAL_SNAPSHOT").is_some() {
@@ -535,7 +566,7 @@ fn open_internal(
         variant.label()
     );
     let handle = thread::spawn(move || {
-        run_native_surface(monitor, thread_path, variant, desktop_host, ready_tx)
+        run_native_surface(monitor, thread_path, variant, desktop_host, None, ready_tx)
     });
     *native_thread()
         .lock()
@@ -577,6 +608,130 @@ pub fn open_desktop_poc(app: &AppHandle, monitor: MonitorBounds) -> Result<(), S
         ))?
     );
     open_internal(app, monitor, ZOrderVariant::ClickThrough, Some(host))
+}
+
+pub fn open_physical_surface(
+    app: &AppHandle,
+    monitor_id: String,
+    monitor: MonitorBounds,
+    desktop_host: desktop_host::RawDesktopHost,
+) -> Result<(), String> {
+    if multi_surfaces()
+        .lock()
+        .expect("multi surface mutex poisoned")
+        .contains_key(&monitor_id)
+    {
+        return Err(format!(
+            "Ya existe una superficie nativa para el monitor {monitor_id}"
+        ));
+    }
+    if multi_threads()
+        .lock()
+        .expect("multi thread mutex poisoned")
+        .contains_key(&monitor_id)
+    {
+        return Err(format!(
+            "El monitor {monitor_id} todavía está cerrando su superficie anterior"
+        ));
+    }
+
+    let path = prototype_directory(app)?.join(format!(
+        "native-multimonitor-{}-{}.gif",
+        sanitize_monitor_id(&monitor_id),
+        uuid::Uuid::new_v4()
+    ));
+    create_diagnostic_gif(&path)?;
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let thread_path = path.clone();
+    let key = monitor_id.clone();
+    let handle = thread::spawn(move || {
+        run_native_surface(
+            monitor,
+            thread_path,
+            ZOrderVariant::ClickThrough,
+            Some(desktop_host),
+            Some(key),
+            ready_tx,
+        )
+    });
+    multi_threads()
+        .lock()
+        .expect("multi thread mutex poisoned")
+        .insert(monitor_id.clone(), handle);
+    match ready_rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(Ok(hwnd)) => {
+            eprintln!(
+                "[MultiMonitorPOC] RENDERER_CREATED monitor_id={} hwnd=0x{:x} host=0x{:x}",
+                monitor_id, hwnd, desktop_host.1
+            );
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            let _ = std::fs::remove_file(path);
+            if let Some(handle) = multi_threads()
+                .lock()
+                .expect("multi thread mutex poisoned")
+                .remove(&monitor_id)
+            {
+                let _ = handle.join();
+            }
+            Err(error)
+        }
+        Err(_) => Err(format!(
+            "La superficie del monitor {monitor_id} no confirmó su inicialización"
+        )),
+    }
+}
+
+fn sanitize_monitor_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub fn close_physical_surface(monitor_id: &str) -> Result<(), String> {
+    let hwnd = multi_surfaces()
+        .lock()
+        .expect("multi surface mutex poisoned")
+        .get(monitor_id)
+        .copied();
+    if let Some(hwnd) = hwnd {
+        unsafe {
+            PostMessageW(Some(HWND(hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0))
+                .map_err(|error| format!("No se pudo cerrar {monitor_id}: {error}"))?;
+        }
+    }
+    if let Some(thread) = multi_threads()
+        .lock()
+        .expect("multi thread mutex poisoned")
+        .remove(monitor_id)
+    {
+        thread
+            .join()
+            .map_err(|_| format!("El hilo de {monitor_id} terminó inesperadamente"))?;
+    }
+    Ok(())
+}
+
+pub fn close_all_physical_surfaces() {
+    let ids: Vec<String> = multi_surfaces()
+        .lock()
+        .expect("multi surface mutex poisoned")
+        .keys()
+        .cloned()
+        .collect();
+    for id in ids {
+        if let Err(error) = close_physical_surface(&id) {
+            eprintln!("[MultiMonitorPOC] cleanup monitor_id={id} error={error}");
+        }
+    }
 }
 
 pub fn open_desktop_recovery_poc(app: &AppHandle, monitor: MonitorBounds) -> Result<(), String> {

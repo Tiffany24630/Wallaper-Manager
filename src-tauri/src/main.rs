@@ -126,6 +126,18 @@ fn main() {
                     Ok(()) => eprintln!("Animated desktop recovery POC started"),
                     Err(error) => eprintln!("Animated desktop recovery POC failed: {error}"),
                 }
+            } else if std::env::var_os("LUMINA_ANIMATED_MULTIMONITOR_TEST").is_some() {
+                match animated_wallpaper::open_animated_multimonitor_poc(app.handle().clone()) {
+                    Ok(()) => eprintln!("Animated multi-monitor POC started"),
+                    Err(error) => eprintln!("Animated multi-monitor POC failed: {error}"),
+                }
+            } else if std::env::var_os("LUMINA_ANIMATED_MULTIMONITOR_PHYSICAL_TEST").is_some() {
+                match animated_wallpaper::open_animated_multimonitor_physical_poc(
+                    app.handle().clone(),
+                ) {
+                    Ok(()) => eprintln!("Animated physical multi-monitor POC started"),
+                    Err(error) => eprintln!("Animated physical multi-monitor POC failed: {error}"),
+                }
             }
             if std::env::var_os("LUMINA_ANIMATED_DESKTOP_INSPECT").is_some() {
                 match animated_wallpaper::inspect_animated_desktop_host() {
@@ -196,7 +208,10 @@ fn main() {
             animated_wallpaper::open_native_animated_prototype_test,
             animated_wallpaper::open_animated_desktop_poc,
             animated_wallpaper::open_animated_desktop_recovery_poc,
+            animated_wallpaper::open_animated_multimonitor_poc,
+            animated_wallpaper::open_animated_multimonitor_physical_poc,
             animated_wallpaper::close_native_animated_prototype,
+            animated_wallpaper::close_animated_multimonitor_physical_poc,
             animated_wallpaper::close_animated_prototype,
         ])
         .plugin(tauri_plugin_dialog::init())
