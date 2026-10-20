@@ -21,11 +21,14 @@ use windows_webview2::{
             Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
             LibraryLoader::GetModuleHandleW,
         },
+        UI::HiDpi::GetDpiForWindow,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-            PostMessageW, PostQuitMessage, RegisterClassW, ShowWindow, TranslateMessage,
-            CS_HREDRAW, CS_VREDRAW, MSG, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_NCDESTROY, WM_QUIT,
-            WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+            GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect, PostMessageW, PostQuitMessage,
+            RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+            GWL_EXSTYLE, GW_OWNER, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_NCDESTROY,
+            WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
 };
@@ -34,6 +37,66 @@ const NATIVE_WINDOW_CLASS: PCWSTR = w!("LuminaNativeAnimatedPrototype");
 const MAX_NATIVE_SURFACES: usize = 1;
 
 static NATIVE_SURFACE: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZOrderVariant {
+    Normal,
+    Bottom,
+    Top,
+    Topmost,
+    ToolWindow,
+    ClickThrough,
+}
+
+impl ZOrderVariant {
+    fn from_environment() -> Result<Self, String> {
+        match std::env::var("LUMINA_NATIVE_Z_VARIANT")
+            .unwrap_or_else(|_| "toolwindow".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "normal" => Ok(Self::Normal),
+            "bottom" => Ok(Self::Bottom),
+            "top" => Ok(Self::Top),
+            "topmost" => Ok(Self::Topmost),
+            "toolwindow" => Ok(Self::ToolWindow),
+            "clickthrough" => Ok(Self::ClickThrough),
+            value => Err(format!(
+                "LUMINA_NATIVE_Z_VARIANT inválida: {value}; usa normal, bottom, top, topmost, toolwindow o clickthrough"
+            )),
+        }
+    }
+
+    fn ex_style(self) -> windows_webview2::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE {
+        match self {
+            Self::Normal => Default::default(),
+            Self::Bottom | Self::Top | Self::Topmost | Self::ToolWindow => {
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            }
+            Self::ClickThrough => WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+        }
+    }
+
+    fn requested_z_order(self) -> Option<HWND> {
+        match self {
+            Self::Bottom => Some(HWND_BOTTOM),
+            Self::Top => Some(HWND_TOP),
+            Self::Topmost => Some(HWND_TOPMOST),
+            Self::Normal | Self::ToolWindow | Self::ClickThrough => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Bottom => "bottom",
+            Self::Top => "top",
+            Self::Topmost => "topmost",
+            Self::ToolWindow => "toolwindow",
+            Self::ClickThrough => "clickthrough",
+        }
+    }
+}
 
 fn native_surface() -> &'static Mutex<Option<isize>> {
     NATIVE_SURFACE.get_or_init(|| Mutex::new(None))
@@ -77,11 +140,11 @@ fn register_native_window_class() -> Result<HINSTANCE, String> {
     Ok(instance.into())
 }
 
-fn create_native_window(bounds: MonitorBounds) -> Result<HWND, String> {
+fn create_native_window(bounds: MonitorBounds, variant: ZOrderVariant) -> Result<HWND, String> {
     let instance = register_native_window_class()?;
     let window = unsafe {
         CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            variant.ex_style(),
             NATIVE_WINDOW_CLASS,
             w!("Lumina Native Animated Prototype"),
             WS_POPUP,
@@ -101,6 +164,60 @@ fn create_native_window(bounds: MonitorBounds) -> Result<HWND, String> {
         window, bounds.x, bounds.y, bounds.width, bounds.height
     );
     Ok(window)
+}
+
+fn apply_z_order(hwnd: HWND, variant: ZOrderVariant) -> Result<(), String> {
+    if let Some(z_order) = variant.requested_z_order() {
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(z_order),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+            .map_err(|error| format!("SetWindowPos({}) falló: {error}", variant.label()))?;
+        }
+    }
+    Ok(())
+}
+
+fn log_window_diagnostics(hwnd: HWND, bounds: MonitorBounds, variant: ZOrderVariant) {
+    let mut rect = windows_webview2::Win32::Foundation::RECT::default();
+    let rect_ok = unsafe { GetWindowRect(hwnd, &mut rect).is_ok() };
+    let parent = unsafe { GetParent(hwnd) }.ok();
+    let owner = unsafe { GetWindow(hwnd, GW_OWNER) }.ok();
+    let previous = unsafe {
+        GetWindow(
+            hwnd,
+            windows_webview2::Win32::UI::WindowsAndMessaging::GW_HWNDPREV,
+        )
+    }
+    .ok();
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    eprintln!(
+        "[NativeAnimated] z-diagnostics variant={} hwnd={:?} requested_z={:?} rect=({}, {}, {}, {}) rect_ok={} monitor_rect=({}, {}, {}, {}) exstyle=0x{:X} parent={:?} owner={:?} z_previous={:?} dpi={}",
+        variant.label(),
+        hwnd,
+        variant.requested_z_order(),
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        rect_ok,
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+        ex_style,
+        parent,
+        owner,
+        previous,
+        dpi,
+    );
 }
 
 fn encode_uri_component(value: &str) -> String {
@@ -255,6 +372,7 @@ fn create_webview(
 fn run_native_surface(
     bounds: MonitorBounds,
     media_path: std::path::PathBuf,
+    variant: ZOrderVariant,
     ready: mpsc::Sender<Result<isize, String>>,
 ) {
     let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
@@ -262,7 +380,8 @@ fn run_native_surface(
         if !com_initialized {
             return Err("CoInitializeEx no pudo inicializar COM".into());
         }
-        let hwnd = create_native_window(bounds)?;
+        let hwnd = create_native_window(bounds, variant)?;
+        apply_z_order(hwnd, variant)?;
         let controller = match create_webview(hwnd, bounds, &media_path) {
             Ok(controller) => controller,
             Err(error) => {
@@ -280,6 +399,7 @@ fn run_native_surface(
             .lock()
             .expect("native surface mutex poisoned") = Some(hwnd.0 as isize);
         eprintln!("[NativeAnimated] ventana mostrada");
+        log_window_diagnostics(hwnd, bounds, variant);
         ready
             .send(Ok(hwnd.0 as isize))
             .map_err(|_| "El llamador cerró el POC".to_string())?;
@@ -327,6 +447,7 @@ fn run_native_surface(
 }
 
 pub fn open(app: &AppHandle, monitor: MonitorBounds) -> Result<(), String> {
+    let variant = ZOrderVariant::from_environment()?;
     let active = native_surface()
         .lock()
         .expect("native surface mutex poisoned");
@@ -341,7 +462,11 @@ pub fn open(app: &AppHandle, monitor: MonitorBounds) -> Result<(), String> {
     }
     let (ready_tx, ready_rx) = mpsc::channel();
     let thread_path = path.clone();
-    thread::spawn(move || run_native_surface(monitor, thread_path, ready_tx));
+    eprintln!(
+        "[NativeAnimated] iniciando variante Z-order={}",
+        variant.label()
+    );
+    thread::spawn(move || run_native_surface(monitor, thread_path, variant, ready_tx));
     drop(active);
     match ready_rx.recv_timeout(Duration::from_secs(15)) {
         Ok(Ok(_)) => Ok(()),

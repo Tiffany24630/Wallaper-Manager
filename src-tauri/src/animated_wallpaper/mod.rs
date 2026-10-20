@@ -384,6 +384,8 @@ pub fn close_animated_prototype(app: AppHandle, monitor_index: usize) -> Result<
 }
 
 pub fn close_all_animated_prototypes(app: &AppHandle) {
+    #[cfg(target_os = "windows")]
+    let _ = native_window::close();
     for (label, window) in app.webview_windows() {
         if label.starts_with("animated-prototype-") {
             let _ = window.close();
