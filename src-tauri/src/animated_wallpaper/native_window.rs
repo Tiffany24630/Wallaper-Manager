@@ -29,7 +29,9 @@ use windows_webview2::{
         Foundation::{
             GetLastError, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, WIN32_ERROR, WPARAM,
         },
-        Graphics::Gdi::UpdateWindow,
+        Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromWindow, UpdateWindow, MONITORINFO, MONITOR_DEFAULTTONULL,
+        },
         System::{
             Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
             LibraryLoader::GetModuleHandleW,
@@ -37,12 +39,12 @@ use windows_webview2::{
         UI::HiDpi::GetDpiForWindow,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-            GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect, PostMessageW, PostQuitMessage,
-            RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-            GWL_EXSTYLE, GW_OWNER, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY,
-            WM_NCDESTROY, WM_POWERBROADCAST, WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE,
-            WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+            GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect, IsWindow, PostMessageW,
+            PostQuitMessage, RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage,
+            CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GW_OWNER, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST,
+            MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW,
+            WM_APP, WM_CLOSE, WM_DESTROY, WM_NCDESTROY, WM_POWERBROADCAST, WM_QUIT, WNDCLASSW,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
 };
@@ -51,6 +53,8 @@ const NATIVE_WINDOW_CLASS: PCWSTR = w!("LuminaNativeAnimatedPrototype");
 const MAX_NATIVE_SURFACES: usize = 1;
 const MAX_NATIVE_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 const WM_NATIVE_MEDIA_ERROR: u32 = WM_APP + 59;
+const WM_DISPLAYCHANGE: u32 = 0x007E;
+const WM_DPICHANGED: u32 = 0x02E0;
 const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
 const PBT_APMSUSPEND: usize = 4;
 const PBT_APMRESUMEAUTOMATIC: usize = 18;
@@ -82,6 +86,8 @@ static DESIRED_SURFACES: OnceLock<Mutex<BTreeMap<String, DesiredSurface>>> = Onc
 static HOST_WATCHER: OnceLock<Mutex<Option<HostWatcher>>> = OnceLock::new();
 static ACTIVE_MULTI_TEMPORARIES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 static DESKTOP_LIFECYCLE: OnceLock<Mutex<LifecycleRuntime>> = OnceLock::new();
+static CLOSING_SURFACES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+static NATIVE_SURFACE_CLOSING: OnceLock<AtomicBool> = OnceLock::new();
 
 #[derive(Clone)]
 struct DesiredSurface {
@@ -221,6 +227,167 @@ fn active_multi_temporaries() -> &'static Mutex<BTreeSet<PathBuf>> {
     ACTIVE_MULTI_TEMPORARIES.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
+fn closing_surfaces() -> &'static Mutex<BTreeSet<String>> {
+    CLOSING_SURFACES.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn mark_surface_closing(monitor_id: &str) {
+    closing_surfaces()
+        .lock()
+        .expect("closing surfaces mutex poisoned")
+        .insert(monitor_id.to_string());
+}
+
+fn clear_surface_closing(monitor_id: &str) {
+    closing_surfaces()
+        .lock()
+        .expect("closing surfaces mutex poisoned")
+        .remove(monitor_id);
+}
+
+fn is_surface_closing(monitor_id: &str) -> bool {
+    closing_surfaces()
+        .lock()
+        .expect("closing surfaces mutex poisoned")
+        .contains(monitor_id)
+}
+
+fn is_current_surface_window(monitor_id: Option<&str>, hwnd: HWND) -> bool {
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return false;
+    }
+    monitor_id.is_none_or(|monitor_id| {
+        multi_surfaces()
+            .lock()
+            .expect("multi surface mutex poisoned")
+            .get(monitor_id)
+            .is_some_and(|current| *current == hwnd.0 as isize)
+    })
+}
+
+fn native_surface_closing() -> &'static AtomicBool {
+    NATIVE_SURFACE_CLOSING.get_or_init(|| AtomicBool::new(false))
+}
+
+fn update_desired_surface_geometry(monitor_id: &str, bounds: MonitorBounds, dpi: u32) {
+    if let Some(surface) = desired_surfaces()
+        .lock()
+        .expect("desired surfaces mutex poisoned")
+        .get_mut(monitor_id)
+    {
+        surface.bounds = bounds;
+        surface.dpi = dpi;
+    }
+}
+
+fn current_monitor_geometry(hwnd: HWND) -> Result<(MonitorBounds, u32), String> {
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) };
+    if monitor.0.is_null() {
+        return Err("MonitorFromWindow no devolvió un monitor válido".into());
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return Err(format!(
+            "GetMonitorInfoW falló: {:?}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let rect = info.rcMonitor;
+    let width = rect
+        .right
+        .checked_sub(rect.left)
+        .ok_or("el ancho del monitor desborda i32")?;
+    let height = rect
+        .bottom
+        .checked_sub(rect.top)
+        .ok_or("el alto del monitor desborda i32")?;
+    if width <= 0 || height <= 0 {
+        return Err("el monitor actual no tiene dimensiones válidas".into());
+    }
+    let bounds = MonitorBounds {
+        x: rect.left,
+        y: rect.top,
+        width: width as u32,
+        height: height as u32,
+    };
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi == 0 {
+        return Err("GetDpiForWindow no devolvió un DPI válido".into());
+    }
+    Ok((bounds, dpi))
+}
+
+fn geometry_changed(
+    previous: MonitorBounds,
+    previous_dpi: u32,
+    next: MonitorBounds,
+    next_dpi: u32,
+) -> bool {
+    previous != next || previous_dpi != next_dpi
+}
+
+fn apply_native_geometry_change(
+    hwnd: HWND,
+    current_bounds: &mut MonitorBounds,
+    current_dpi: &mut u32,
+    surface_key: Option<&str>,
+    attached_to_desktop: bool,
+    controller: &ICoreWebView2Controller,
+) -> Result<(), String> {
+    let (next_bounds, next_dpi) = current_monitor_geometry(hwnd)?;
+    if !geometry_changed(*current_bounds, *current_dpi, next_bounds, next_dpi) {
+        eprintln!(
+            "[GeometryNative] GEOMETRY_UNCHANGED hwnd={:?} bounds=({},{} {}x{}) dpi={}",
+            hwnd, next_bounds.x, next_bounds.y, next_bounds.width, next_bounds.height, next_dpi
+        );
+        return Ok(());
+    }
+    if attached_to_desktop
+        && !matches!(
+            validate_registered_desktop_host()?,
+            desktop_host::HostValidation::Stable
+        )
+    {
+        return Err("el host Explorer dejó de ser estable durante el cambio de geometría".into());
+    }
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            next_bounds.x,
+            next_bounds.y,
+            next_bounds.width as i32,
+            next_bounds.height as i32,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+        )
+        .map_err(|error| format!("SetWindowPos para geometría falló: {error}"))?;
+    }
+    let rect = windows_webview2::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: next_bounds.width as i32,
+        bottom: next_bounds.height as i32,
+    };
+    unsafe {
+        controller
+            .SetBounds(rect)
+            .map_err(|error| format!("WebView2 SetBounds para geometría falló: {error}"))?;
+    }
+    *current_bounds = next_bounds;
+    *current_dpi = next_dpi;
+    if let Some(key) = surface_key {
+        update_desired_surface_geometry(key, next_bounds, next_dpi);
+    }
+    eprintln!(
+        "[GeometryNative] GEOMETRY_APPLIED hwnd={:?} bounds=({},{} {}x{}) dpi={}",
+        hwnd, next_bounds.x, next_bounds.y, next_bounds.width, next_bounds.height, next_dpi
+    );
+    Ok(())
+}
+
 fn desktop_lifecycle() -> &'static Mutex<LifecycleRuntime> {
     DESKTOP_LIFECYCLE.get_or_init(|| {
         Mutex::new(LifecycleRuntime {
@@ -244,7 +411,7 @@ fn register_lifecycle_notifications(hwnd: HWND) -> Result<NotificationRegistrati
         hwnd
     );
     eprintln!(
-        "[LifecycleNative] POWER_NOTIFICATIONS_REGISTERED hwnd={:?}",
+        "[LifecycleNative] POWER_NOTIFICATIONS_READY hwnd={:?}",
         hwnd
     );
     let mut registration = NotificationRegistration::default();
@@ -473,6 +640,23 @@ unsafe extern "system" fn native_window_proc(
                 _ => {}
             }
             LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            eprintln!(
+                "[GeometryNative] DISPLAY_CHANGE_RECEIVED source=windows hwnd={:?} width={} height={}",
+                window,
+                (lparam.0 as u32 & 0xffff),
+                ((lparam.0 as u64 >> 16) & 0xffff)
+            );
+            DefWindowProcW(window, message, wparam, lparam)
+        }
+        WM_DPICHANGED => {
+            eprintln!(
+                "[GeometryNative] DPI_CHANGE_RECEIVED source=windows hwnd={:?} dpi={}",
+                window,
+                (wparam.0 & 0xffff) as u32
+            );
+            DefWindowProcW(window, message, wparam, lparam)
         }
         WM_CLOSE => {
             PostQuitMessage(0);
@@ -867,6 +1051,8 @@ fn run_native_surface(
             return Err(error);
         }
         let hwnd = create_native_window(bounds, variant)?;
+        let mut applied_bounds = bounds;
+        let mut applied_dpi = unsafe { GetDpiForWindow(hwnd) };
         let mut lifecycle_notifications = match register_lifecycle_notifications(hwnd) {
             Ok(registration) => registration,
             Err(error) => {
@@ -968,6 +1154,35 @@ fn run_native_surface(
             if status == 0 || message.message == WM_QUIT {
                 break;
             }
+            if message.message == WM_DISPLAYCHANGE || message.message == WM_DPICHANGED {
+                if surface_key.as_deref().is_some_and(is_surface_closing)
+                    || (surface_key.is_none() && native_surface_closing().load(Ordering::Acquire))
+                    || !is_current_surface_window(surface_key.as_deref(), hwnd)
+                {
+                    eprintln!(
+                        "[GeometryNative] GEOMETRY_IGNORED reason=closing_or_stale_surface hwnd={:?} surface_id={:?}",
+                        hwnd, surface_key
+                    );
+                    continue;
+                }
+                if let Err(error) = apply_native_geometry_change(
+                    hwnd,
+                    &mut applied_bounds,
+                    &mut applied_dpi,
+                    surface_key.as_deref(),
+                    attached_to_desktop,
+                    &controller,
+                ) {
+                    eprintln!(
+                        "[GeometryNative] GEOMETRY_REJECTED hwnd={:?} error={error}; closing_surface=true",
+                        hwnd
+                    );
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+                continue;
+            }
             if message.message == WM_NATIVE_MEDIA_ERROR {
                 let decision = surface_lifecycle.fail(super::recovery::SurfaceFailureKind::Media);
                 eprintln!(
@@ -1060,6 +1275,7 @@ fn open_internal(
     variant: ZOrderVariant,
     desktop_host: Option<desktop_host::RawDesktopHost>,
 ) -> Result<(), String> {
+    native_surface_closing().store(false, Ordering::Release);
     let active = native_surface()
         .lock()
         .expect("native surface mutex poisoned");
@@ -1458,17 +1674,18 @@ fn recover_desired_surfaces() -> bool {
     let mut recovered = 0usize;
     let desired_count = desired.len();
     for surface in desired {
-        let still_desired = desired_surfaces()
+        let current_surface = desired_surfaces()
             .lock()
             .expect("desired surfaces mutex poisoned")
-            .contains_key(&surface.monitor_id);
-        if !still_desired {
+            .get(&surface.monitor_id)
+            .cloned();
+        let Some(surface) = current_surface else {
             eprintln!(
                 "[HostMonitor] SURFACE_RECOVERY_SKIPPED monitor_id={} reason=explicit_close",
                 surface.monitor_id
             );
             continue;
-        }
+        };
         match open_physical_surface_internal(
             &surface.app,
             surface.monitor_id.clone(),
@@ -1558,6 +1775,7 @@ pub fn close_physical_surface(monitor_id: &str) -> Result<(), String> {
 }
 
 fn stop_physical_surface(monitor_id: &str) -> Result<(), String> {
+    mark_surface_closing(monitor_id);
     let hwnd = multi_surfaces()
         .lock()
         .expect("multi surface mutex poisoned")
@@ -1565,8 +1783,12 @@ fn stop_physical_surface(monitor_id: &str) -> Result<(), String> {
         .copied();
     if let Some(hwnd) = hwnd {
         unsafe {
-            PostMessageW(Some(HWND(hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0))
-                .map_err(|error| format!("No se pudo cerrar {monitor_id}: {error}"))?;
+            if let Err(error) =
+                PostMessageW(Some(HWND(hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0))
+            {
+                clear_surface_closing(monitor_id);
+                return Err(format!("No se pudo cerrar {monitor_id}: {error}"));
+            }
         }
     }
     if let Some(thread) = multi_threads()
@@ -1574,10 +1796,13 @@ fn stop_physical_surface(monitor_id: &str) -> Result<(), String> {
         .expect("multi thread mutex poisoned")
         .remove(monitor_id)
     {
-        thread
+        let result = thread
             .join()
-            .map_err(|_| format!("El hilo de {monitor_id} terminó inesperadamente"))?;
+            .map_err(|_| format!("El hilo de {monitor_id} terminó inesperadamente"));
+        clear_surface_closing(monitor_id);
+        result?;
     }
+    clear_surface_closing(monitor_id);
     Ok(())
 }
 
@@ -1701,6 +1926,7 @@ pub fn open_desktop_recovery_poc(app: &AppHandle, monitor: MonitorBounds) -> Res
 }
 
 pub fn close() -> Result<(), String> {
+    native_surface_closing().store(true, Ordering::Release);
     let handle = *native_surface()
         .lock()
         .expect("native surface mutex poisoned");
@@ -1728,7 +1954,7 @@ mod tests {
     use super::{
         active_multi_temporaries, classify_multi_temporary, cleanup_orphaned_multi_temporaries,
         create_diagnostic_gif, is_native_media_error_payload, validate_native_media,
-        TemporaryClassification,
+        NotificationRegistration, TemporaryClassification,
     };
     use std::{
         collections::BTreeSet,
@@ -1766,6 +1992,27 @@ mod tests {
             TemporaryClassification::Foreign
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn notification_registration_is_single_use_and_unregistration_is_idempotent() {
+        let mut registration = NotificationRegistration::default();
+        assert!(registration.mark_registered().is_ok());
+        assert!(registration.mark_registered().is_err());
+        assert!(registration.take_registered());
+        assert!(!registration.take_registered());
+    }
+
+    #[test]
+    fn recreated_surface_gets_a_new_logical_notification_registration() {
+        let mut first = NotificationRegistration::default();
+        first.mark_registered().unwrap();
+        assert!(first.take_registered());
+
+        let mut second = NotificationRegistration::default();
+        assert!(second.mark_registered().is_ok());
+        assert_ne!(first, second);
+        assert!(second.take_registered());
     }
 
     #[test]

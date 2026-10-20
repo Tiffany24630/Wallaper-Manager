@@ -303,15 +303,21 @@ fn smoke_variant_options(variant: u8) -> Result<PrototypeWindowOptions, String> 
 }
 
 fn bounds_from_geometry(x: i32, y: i32, width: u32, height: u32) -> Result<MonitorBounds, String> {
-    if width == 0 || height == 0 {
-        return Err("El monitor no tiene un área visible válida".into());
-    }
-    Ok(MonitorBounds {
+    let bounds = MonitorBounds {
         x,
         y,
         width,
         height,
-    })
+    };
+    multimonitor::LogicalBounds {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+    }
+    .validate()
+    .map_err(|error| format!("Geometría de monitor inválida: {error}"))?;
+    Ok(bounds)
 }
 
 fn validate_media_source(path: &Path) -> Result<&'static str, String> {

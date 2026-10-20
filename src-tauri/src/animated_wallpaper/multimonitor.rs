@@ -13,12 +13,79 @@ pub(crate) struct LogicalBounds {
 }
 
 impl LogicalBounds {
+    pub(crate) fn validate(self) -> Result<(), &'static str> {
+        if self.width == 0 || self.height == 0 {
+            return Err("las dimensiones del monitor deben ser mayores que cero");
+        }
+        if self.width > i32::MAX as u32 || self.height > i32::MAX as u32 {
+            return Err("las dimensiones del monitor exceden el rango Win32");
+        }
+        self.x
+            .checked_add(self.width as i32)
+            .ok_or("el borde derecho del monitor desborda i32")?;
+        self.y
+            .checked_add(self.height as i32)
+            .ok_or("el borde inferior del monitor desborda i32")?;
+        Ok(())
+    }
+
+    pub(crate) fn checked_right(self) -> Result<i32, &'static str> {
+        self.x
+            .checked_add(self.width as i32)
+            .ok_or("el borde derecho del monitor desborda i32")
+    }
+
+    pub(crate) fn checked_bottom(self) -> Result<i32, &'static str> {
+        self.y
+            .checked_add(self.height as i32)
+            .ok_or("el borde inferior del monitor desborda i32")
+    }
+
     pub(crate) fn right(self) -> i32 {
-        self.x + self.width as i32
+        self.checked_right()
+            .expect("LogicalBounds debe validarse antes de calcular right")
     }
 
     pub(crate) fn bottom(self) -> i32 {
-        self.y + self.height as i32
+        self.checked_bottom()
+            .expect("LogicalBounds debe validarse antes de calcular bottom")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GeometrySnapshot {
+    pub(crate) bounds: LogicalBounds,
+    pub(crate) dpi: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GeometryChange {
+    Unchanged,
+    BoundsChanged,
+    DpiChanged,
+    BoundsAndDpiChanged,
+}
+
+impl GeometrySnapshot {
+    pub(crate) fn validate(self) -> Result<(), &'static str> {
+        self.bounds.validate()?;
+        if self.dpi == 0 {
+            return Err("el DPI del monitor debe ser mayor que cero");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compare(self, previous: Self) -> Result<GeometryChange, &'static str> {
+        self.validate()?;
+        previous.validate()?;
+        Ok(
+            match (self.bounds != previous.bounds, self.dpi != previous.dpi) {
+                (false, false) => GeometryChange::Unchanged,
+                (true, false) => GeometryChange::BoundsChanged,
+                (false, true) => GeometryChange::DpiChanged,
+                (true, true) => GeometryChange::BoundsAndDpiChanged,
+            },
+        )
     }
 }
 
@@ -83,6 +150,11 @@ impl Default for MonitorCoordinator {
 
 impl MonitorCoordinator {
     pub(crate) fn create(&mut self, monitor: &MonitorSpec) -> Result<(), &'static str> {
+        GeometrySnapshot {
+            bounds: monitor.bounds,
+            dpi: monitor.dpi,
+        }
+        .validate()?;
         if self
             .surfaces
             .get(&monitor.id)
@@ -166,14 +238,26 @@ impl MonitorCoordinator {
         monitor_id: &str,
         bounds: LogicalBounds,
         dpi: u32,
-    ) -> Result<(), &'static str> {
+    ) -> Result<GeometryChange, &'static str> {
         let surface = self
             .surfaces
             .get_mut(monitor_id)
             .ok_or("monitor sin renderer")?;
+        if surface.state != SurfaceState::Active {
+            return Err("la superficie no está activa");
+        }
+        let current = GeometrySnapshot {
+            bounds: surface.bounds,
+            dpi: surface.dpi,
+        };
+        let next = GeometrySnapshot { bounds, dpi };
+        let change = next.compare(current)?;
+        if change == GeometryChange::Unchanged {
+            return Ok(change);
+        }
         surface.bounds = bounds;
         surface.dpi = dpi;
-        Ok(())
+        Ok(change)
     }
 
     pub(crate) fn active_count(&self) -> usize {
@@ -248,8 +332,8 @@ pub(crate) fn simulated_topologies() -> [Vec<MonitorSpec>; 2] {
 #[cfg(test)]
 mod tests {
     use super::{
-        simulated_topologies, HostObservation, HostReaction, LogicalBounds, MonitorCoordinator,
-        MonitorSpec, SurfaceState,
+        simulated_topologies, GeometryChange, GeometrySnapshot, HostObservation, HostReaction,
+        LogicalBounds, MonitorCoordinator, MonitorSpec, SurfaceState,
     };
 
     fn monitor(id: &str, x: i32, dpi: u32) -> MonitorSpec {
@@ -426,7 +510,125 @@ mod tests {
         let mut coordinator = MonitorCoordinator::default();
         coordinator.create(&a).unwrap();
         coordinator.create(&b).unwrap();
-        coordinator
+        assert_eq!(
+            coordinator
+                .update_geometry(
+                    &a.id,
+                    LogicalBounds {
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                    },
+                    96,
+                )
+                .unwrap(),
+            GeometryChange::DpiChanged
+        );
+        assert_eq!(coordinator.surface(&a.id).unwrap().dpi, 96);
+        assert_eq!(coordinator.surface(&b.id).unwrap().dpi, 96);
+        assert_eq!(coordinator.surface(&b.id).unwrap().bounds.x, 1920);
+    }
+
+    #[test]
+    fn accepts_negative_coordinates_but_rejects_invalid_or_overflowing_bounds() {
+        assert!(LogicalBounds {
+            x: -1920,
+            y: -200,
+            width: 1920,
+            height: 1080,
+        }
+        .validate()
+        .is_ok());
+        assert!(LogicalBounds {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 1080,
+        }
+        .validate()
+        .is_err());
+        assert!(LogicalBounds {
+            x: i32::MAX,
+            y: 0,
+            width: 2,
+            height: 1,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn detects_unchanged_bounds_and_dpi_without_reapplying_geometry() {
+        let snapshot = GeometrySnapshot {
+            bounds: LogicalBounds {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            },
+            dpi: 144,
+        };
+        assert_eq!(
+            snapshot.compare(snapshot).unwrap(),
+            GeometryChange::Unchanged
+        );
+        assert_eq!(
+            snapshot
+                .compare(GeometrySnapshot {
+                    dpi: 96,
+                    ..snapshot
+                })
+                .unwrap(),
+            GeometryChange::DpiChanged
+        );
+        assert_eq!(
+            snapshot
+                .compare(GeometrySnapshot {
+                    bounds: LogicalBounds {
+                        width: 1920,
+                        height: 1080,
+                        ..snapshot.bounds
+                    },
+                    ..snapshot
+                })
+                .unwrap(),
+            GeometryChange::BoundsChanged
+        );
+    }
+
+    #[test]
+    fn rejects_zero_dpi_and_keeps_monitor_states_isolated() {
+        assert!(GeometrySnapshot {
+            bounds: LogicalBounds {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            dpi: 0,
+        }
+        .validate()
+        .is_err());
+        let a = monitor("display-a", 0, 144);
+        let b = monitor("display-b", 1920, 96);
+        let mut coordinator = MonitorCoordinator::default();
+        coordinator.create(&a).unwrap();
+        coordinator.create(&b).unwrap();
+        assert_eq!(
+            coordinator.update_geometry(&a.id, a.bounds, 96).unwrap(),
+            GeometryChange::DpiChanged
+        );
+        assert_eq!(coordinator.surface(&b.id).unwrap().dpi, 96);
+    }
+
+    #[test]
+    fn unavailable_surface_rejects_late_geometry_events() {
+        let a = monitor("display-a", 0, 144);
+        let mut coordinator = MonitorCoordinator::default();
+        coordinator.create(&a).unwrap();
+        coordinator.mark_unavailable(&a.id);
+        assert!(coordinator
             .update_geometry(
                 &a.id,
                 LogicalBounds {
@@ -437,9 +639,6 @@ mod tests {
                 },
                 96,
             )
-            .unwrap();
-        assert_eq!(coordinator.surface(&a.id).unwrap().dpi, 96);
-        assert_eq!(coordinator.surface(&b.id).unwrap().dpi, 96);
-        assert_eq!(coordinator.surface(&b.id).unwrap().bounds.x, 1920);
+            .is_err());
     }
 }
