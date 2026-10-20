@@ -1,4 +1,4 @@
-use super::{create_diagnostic_gif, prototype_directory, MonitorBounds};
+use super::{create_diagnostic_gif, desktop_host, prototype_directory, MonitorBounds};
 use std::{
     path::Path,
     sync::{mpsc, Mutex, OnceLock},
@@ -37,6 +37,7 @@ const NATIVE_WINDOW_CLASS: PCWSTR = w!("LuminaNativeAnimatedPrototype");
 const MAX_NATIVE_SURFACES: usize = 1;
 
 static NATIVE_SURFACE: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
+static NATIVE_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZOrderVariant {
@@ -100,6 +101,10 @@ impl ZOrderVariant {
 
 fn native_surface() -> &'static Mutex<Option<isize>> {
     NATIVE_SURFACE.get_or_init(|| Mutex::new(None))
+}
+
+fn native_thread() -> &'static Mutex<Option<thread::JoinHandle<()>>> {
+    NATIVE_THREAD.get_or_init(|| Mutex::new(None))
 }
 
 unsafe extern "system" fn native_window_proc(
@@ -373,6 +378,7 @@ fn run_native_surface(
     bounds: MonitorBounds,
     media_path: std::path::PathBuf,
     variant: ZOrderVariant,
+    desktop_host_target: Option<desktop_host::RawDesktopHost>,
     ready: mpsc::Sender<Result<isize, String>>,
 ) {
     let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
@@ -382,10 +388,25 @@ fn run_native_surface(
         }
         let hwnd = create_native_window(bounds, variant)?;
         apply_z_order(hwnd, variant)?;
+        let attached_to_desktop = if let Some(host) = desktop_host_target {
+            desktop_host::attach_native_window(hwnd.0 as isize, host, bounds)?;
+            true
+        } else {
+            false
+        };
         let controller = match create_webview(hwnd, bounds, &media_path) {
             Ok(controller) => controller,
             Err(error) => {
                 unsafe {
+                    if attached_to_desktop {
+                        if let Err(detach_error) =
+                            desktop_host::detach_native_window(hwnd.0 as isize)
+                        {
+                            eprintln!(
+                                "[NativeAnimated] error al separar tras fallo de WebView2: {detach_error}"
+                            );
+                        }
+                    }
                     DestroyWindow(hwnd).ok();
                 }
                 return Err(error);
@@ -423,6 +444,14 @@ fn run_native_surface(
             controller.Close().ok();
         }
         eprintln!("[NativeAnimated] WebView2 destruido");
+        let detach_error = if attached_to_desktop {
+            desktop_host::detach_native_window(hwnd.0 as isize).err()
+        } else {
+            None
+        };
+        if let Some(error) = &detach_error {
+            eprintln!("[NativeAnimated] error al restaurar el parent del HWND: {error}");
+        }
         unsafe {
             DestroyWindow(hwnd).ok();
         }
@@ -432,7 +461,19 @@ fn run_native_surface(
             .expect("native surface mutex poisoned") = None;
         let _ = std::fs::remove_file(&media_path);
         eprintln!("[NativeAnimated] temporal eliminado");
-        Ok(())
+        if std::env::var_os("LUMINA_ANIMATED_DESKTOP_POC_FINAL_SNAPSHOT").is_some() {
+            match desktop_host::snapshot_current_desktop() {
+                Ok(snapshot) => eprintln!(
+                    "[NativeAnimated] snapshot final del escritorio: {}",
+                    serde_json::to_string(&snapshot)
+                        .unwrap_or_else(|error| format!("<snapshot no serializable: {error}>"))
+                ),
+                Err(error) => {
+                    eprintln!("[NativeAnimated] no se pudo obtener el snapshot final: {error}")
+                }
+            }
+        }
+        detach_error.map_or(Ok(()), Err)
     })();
 
     if let Err(error) = result {
@@ -446,13 +487,27 @@ fn run_native_surface(
     }
 }
 
-pub fn open(app: &AppHandle, monitor: MonitorBounds) -> Result<(), String> {
-    let variant = ZOrderVariant::from_environment()?;
+fn open_internal(
+    app: &AppHandle,
+    monitor: MonitorBounds,
+    variant: ZOrderVariant,
+    desktop_host: Option<desktop_host::RawDesktopHost>,
+) -> Result<(), String> {
     let active = native_surface()
         .lock()
         .expect("native surface mutex poisoned");
     if active.is_some() {
         return Err("Ya existe una superficie HWND nativa; ciérrala antes de abrir otra".into());
+    }
+    drop(active);
+    if let Some(previous_thread) = native_thread()
+        .lock()
+        .expect("native thread mutex poisoned")
+        .take()
+    {
+        previous_thread.join().map_err(|_| {
+            "El hilo anterior del renderer nativo terminó de forma inesperada".to_string()
+        })?;
     }
     let path =
         prototype_directory(app)?.join(format!("native-diagnostic-{}.gif", uuid::Uuid::new_v4()));
@@ -466,12 +521,23 @@ pub fn open(app: &AppHandle, monitor: MonitorBounds) -> Result<(), String> {
         "[NativeAnimated] iniciando variante Z-order={}",
         variant.label()
     );
-    thread::spawn(move || run_native_surface(monitor, thread_path, variant, ready_tx));
-    drop(active);
+    let handle = thread::spawn(move || {
+        run_native_surface(monitor, thread_path, variant, desktop_host, ready_tx)
+    });
+    *native_thread()
+        .lock()
+        .expect("native thread mutex poisoned") = Some(handle);
     match ready_rx.recv_timeout(Duration::from_secs(15)) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => {
             let _ = std::fs::remove_file(path);
+            if let Some(handle) = native_thread()
+                .lock()
+                .expect("native thread mutex poisoned")
+                .take()
+            {
+                let _ = handle.join();
+            }
             Err(error)
         }
         Err(_) => {
@@ -484,6 +550,22 @@ pub fn open(app: &AppHandle, monitor: MonitorBounds) -> Result<(), String> {
     }
 }
 
+pub fn open(app: &AppHandle, monitor: MonitorBounds) -> Result<(), String> {
+    let variant = ZOrderVariant::from_environment()?;
+    open_internal(app, monitor, variant, None)
+}
+
+pub fn open_desktop_poc(app: &AppHandle, monitor: MonitorBounds) -> Result<(), String> {
+    let (host, experiment) = desktop_host::prepare_modern_host()?;
+    eprintln!(
+        "[NativeAnimated] desktop POC experiment: {}",
+        serde_json::to_string(&experiment).map_err(|error| format!(
+            "No se pudo registrar el experimento de escritorio: {error}"
+        ))?
+    );
+    open_internal(app, monitor, ZOrderVariant::ClickThrough, Some(host))
+}
+
 pub fn close() -> Result<(), String> {
     let handle = *native_surface()
         .lock()
@@ -494,6 +576,15 @@ pub fn close() -> Result<(), String> {
                 |error| format!("No se pudo solicitar el cierre del HWND nativo: {error}"),
             )?;
         }
+    }
+    if let Some(thread) = native_thread()
+        .lock()
+        .expect("native thread mutex poisoned")
+        .take()
+    {
+        thread
+            .join()
+            .map_err(|_| "El hilo del renderer nativo terminó de forma inesperada".to_string())?;
     }
     Ok(())
 }

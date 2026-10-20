@@ -113,6 +113,12 @@ fn main() {
                     Err(error) => eprintln!("Native animated WebView2 smoke test failed: {error}"),
                 }
             }
+            if std::env::var_os("LUMINA_ANIMATED_DESKTOP_POC").is_some() {
+                match animated_wallpaper::open_animated_desktop_poc(app.handle().clone(), 0) {
+                    Ok(()) => eprintln!("Animated desktop POC started"),
+                    Err(error) => eprintln!("Animated desktop POC refused or failed: {error}"),
+                }
+            }
             if std::env::var_os("LUMINA_ANIMATED_DESKTOP_INSPECT").is_some() {
                 match animated_wallpaper::inspect_animated_desktop_host() {
                     Ok(value) => eprintln!(
@@ -180,6 +186,7 @@ fn main() {
             animated_wallpaper::open_animated_prototype_test,
             animated_wallpaper::inspect_animated_desktop_host,
             animated_wallpaper::open_native_animated_prototype_test,
+            animated_wallpaper::open_animated_desktop_poc,
             animated_wallpaper::close_native_animated_prototype,
             animated_wallpaper::close_animated_prototype,
         ])

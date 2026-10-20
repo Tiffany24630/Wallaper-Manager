@@ -2,7 +2,7 @@ use super::MonitorBounds;
 use serde::Serialize;
 use tauri::WebviewWindow;
 use windows::{
-    core::w,
+    core::{w, PCWSTR},
     Win32::{
         Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM},
         Graphics::Gdi::{
@@ -12,7 +12,7 @@ use windows::{
             EnumChildWindows, EnumWindows, FindWindowExW, FindWindowW, GetClassNameW, GetParent,
             GetWindow, GetWindowLongPtrW, GetWindowRect, IsWindowVisible, SendMessageTimeoutW,
             SetParent, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, GW_OWNER, HWND_TOP,
-            SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_CHILD,
+            SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_CHILD, WS_POPUP,
         },
     },
 };
@@ -20,11 +20,13 @@ use windows::{
 const DESKTOP_CREATE_WORKER_W_MESSAGE: u32 = 0x052C;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DesktopHost {
-    progman: HWND,
-    worker_w: HWND,
-    shell_view: HWND,
+pub(crate) struct DesktopHost {
+    pub(crate) progman: HWND,
+    pub(crate) worker_w: HWND,
+    pub(crate) shell_view: HWND,
 }
+
+pub(crate) type RawDesktopHost = (isize, isize, isize);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DesktopRect {
@@ -60,6 +62,20 @@ pub struct DesktopStructureInspection {
     pub message_result: u64,
     pub before: Vec<DesktopWindowSnapshot>,
     pub after: Vec<DesktopWindowSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DesktopHostExperiment {
+    pub message: u32,
+    pub wparam: u64,
+    pub lparam: i64,
+    pub message_result: u64,
+    pub before: Vec<DesktopWindowSnapshot>,
+    pub after: Vec<DesktopWindowSnapshot>,
+    pub candidate_worker_w: Option<u64>,
+    pub candidate_shell_view: Option<u64>,
+    pub candidate_count: usize,
+    pub host_is_unambiguous: bool,
 }
 
 unsafe extern "system" fn find_desktop_worker_w(window: HWND, state: LPARAM) -> BOOL {
@@ -170,6 +186,99 @@ fn inspect_windows() -> Result<Vec<DesktopWindowSnapshot>, String> {
     Ok(windows)
 }
 
+fn direct_child(parent: HWND, class: PCWSTR) -> Option<HWND> {
+    unsafe { FindWindowExW(parent, None, class, None).ok() }
+}
+
+fn direct_worker_candidates(progman: HWND) -> Vec<HWND> {
+    let Some(first) = (unsafe { FindWindowExW(progman, None, w!("WorkerW"), None) }).ok() else {
+        return Vec::new();
+    };
+    let mut result = vec![first];
+    if let Some(second) =
+        (unsafe { FindWindowExW(progman, Some(&first), w!("WorkerW"), None) }).ok()
+    {
+        result.push(second);
+    }
+    result
+}
+
+fn find_progman() -> Result<HWND, String> {
+    let window = unsafe { FindWindowW(w!("Progman"), None) }
+        .map_err(|error| format!("No se pudo localizar Progman: {error}"))?;
+    if window == HWND::default() {
+        return Err("Progman no está disponible".into());
+    }
+    Ok(window)
+}
+
+fn modern_host_from_current_tree(progman: HWND) -> Option<DesktopHost> {
+    let shell_view = direct_child(progman, w!("SHELLDLL_DefView"))?;
+    let workers = direct_worker_candidates(progman)
+        .into_iter()
+        .filter(|worker| direct_child(*worker, w!("SHELLDLL_DefView")).is_none())
+        .collect::<Vec<_>>();
+    (workers.len() == 1).then(|| DesktopHost {
+        progman,
+        worker_w: workers[0],
+        shell_view,
+    })
+}
+
+pub fn prepare_modern_host() -> Result<(RawDesktopHost, DesktopHostExperiment), String> {
+    let progman = find_progman()?;
+    let before = inspect_windows()?;
+    let mut message_result = 0usize;
+    unsafe {
+        SendMessageTimeoutW(
+            progman,
+            DESKTOP_CREATE_WORKER_W_MESSAGE,
+            WPARAM(0xD),
+            LPARAM(1),
+            SMTO_ABORTIFHUNG,
+            1000,
+            Some(&mut message_result),
+        );
+    }
+    let after = inspect_windows()?;
+    let host = modern_host_from_current_tree(progman);
+    let candidate_count = direct_worker_candidates(progman)
+        .into_iter()
+        .filter(|worker| direct_child(*worker, w!("SHELLDLL_DefView")).is_none())
+        .count();
+    let experiment = DesktopHostExperiment {
+        message: DESKTOP_CREATE_WORKER_W_MESSAGE,
+        wparam: 0xD,
+        lparam: 1,
+        message_result: message_result as u64,
+        before,
+        after,
+        candidate_worker_w: host.map(|value| hwnd_value(value.worker_w)),
+        candidate_shell_view: host.map(|value| hwnd_value(value.shell_view)),
+        candidate_count,
+        host_is_unambiguous: host.is_some(),
+    };
+    let host = host.ok_or_else(|| {
+        "La variante moderna no produjo exactamente un WorkerW hijo directo de Progman sin SHELLDLL_DefView; no se hará SetParent".to_string()
+    })?;
+    eprintln!(
+        "Animated desktop POC host validated: Progman={:?}, WorkerW={:?}, SHELLDLL_DefView={:?}",
+        host.progman, host.worker_w, host.shell_view
+    );
+    Ok((
+        (
+            host.progman.0 as isize,
+            host.worker_w.0 as isize,
+            host.shell_view.0 as isize,
+        ),
+        experiment,
+    ))
+}
+
+pub(crate) fn snapshot_current_desktop() -> Result<Vec<DesktopWindowSnapshot>, String> {
+    inspect_windows()
+}
+
 pub fn inspect_desktop_structure() -> Result<DesktopStructureInspection, String> {
     let progman = unsafe { FindWindowW(w!("Progman"), None) }
         .map_err(|error| format!("No se pudo localizar Progman: {error}"))?;
@@ -197,6 +306,79 @@ pub fn inspect_desktop_structure() -> Result<DesktopStructureInspection, String>
         before,
         after,
     })
+}
+
+pub fn attach_native_window(
+    window: isize,
+    host: RawDesktopHost,
+    bounds: MonitorBounds,
+) -> Result<(), String> {
+    let window = HWND(window as *mut _);
+    let host = DesktopHost {
+        progman: HWND(host.0 as *mut _),
+        worker_w: HWND(host.1 as *mut _),
+        shell_view: HWND(host.2 as *mut _),
+    };
+    let mut host_rect = RECT::default();
+    unsafe {
+        GetWindowRect(host.progman, &mut host_rect)
+            .map_err(|error| format!("No se pudo obtener la geometría de Progman: {error}"))?;
+        SetParent(window, host.progman)
+            .map_err(|error| format!("No se pudo asociar el renderer al host validado: {error}"))?;
+        let style = GetWindowLongPtrW(window, GWL_STYLE) as u32;
+        SetWindowLongPtrW(
+            window,
+            GWL_STYLE,
+            ((style & !WS_POPUP.0) | WS_CHILD.0) as isize,
+        );
+        if let Err(error) = SetWindowPos(
+            window,
+            host.shell_view,
+            bounds.x - host_rect.left,
+            bounds.y - host_rect.top,
+            bounds.width as i32,
+            bounds.height as i32,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        ) {
+            let _ = SetParent(window, None);
+            let _ = SetWindowLongPtrW(
+                window,
+                GWL_STYLE,
+                ((style & !WS_CHILD.0) | WS_POPUP.0) as isize,
+            );
+            return Err(format!(
+                "No se pudo colocar el renderer bajo SHELLDLL_DefView: {error}"
+            ));
+        }
+    }
+    eprintln!(
+        "Animated desktop POC attached: renderer={:?}, parent=Progman {:?}, below=SHELLDLL_DefView {:?}, WorkerW {:?}, bounds=({}, {}, {}, {})",
+        window,
+        host.progman,
+        host.shell_view,
+        host.worker_w,
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height
+    );
+    Ok(())
+}
+
+pub fn detach_native_window(window: isize) -> Result<(), String> {
+    let window = HWND(window as *mut _);
+    unsafe {
+        SetParent(window, None).map_err(|error| {
+            format!("No se pudo separar el renderer del host del escritorio: {error}")
+        })?;
+        let style = GetWindowLongPtrW(window, GWL_STYLE) as u32;
+        SetWindowLongPtrW(
+            window,
+            GWL_STYLE,
+            ((style & !WS_CHILD.0) | WS_POPUP.0) as isize,
+        );
+    }
+    Ok(())
 }
 
 fn locate_desktop_host() -> Result<DesktopHost, String> {
