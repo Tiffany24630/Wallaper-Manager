@@ -688,6 +688,126 @@ pub fn open_animated_desktop_recovery_poc(
     }
 }
 
+#[cfg(target_os = "windows")]
+pub fn open_animated_lifecycle_poc(app: AppHandle, monitor_index: usize) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("No se encontró la ventana principal de Lumina")?;
+    let monitor = window
+        .available_monitors()
+        .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?
+        .into_iter()
+        .nth(monitor_index)
+        .ok_or("No existe el monitor solicitado")?;
+    let position = monitor.position();
+    let size = monitor.size();
+    let bounds = bounds_from_geometry(position.x, position.y, size.width, size.height)?;
+    let dpi = (monitor.scale_factor() * 96.0).round() as u32;
+    let (host, experiment) = desktop_host::prepare_modern_host()?;
+    if !experiment.host_is_unambiguous {
+        return Err(format!(
+            "Host de escritorio no inequívoco: candidate_count={}",
+            experiment.candidate_count
+        ));
+    }
+    let monitor_id = "lifecycle-primary".to_string();
+    native_window::open_physical_surface(&app, monitor_id.clone(), bounds, dpi, host)?;
+    eprintln!(
+        "[LifecyclePOC] HOST_VALIDATED monitor_id={} bounds=({},{} {}x{}) dpi={} candidate_count={}",
+        monitor_id, bounds.x, bounds.y, bounds.width, bounds.height, dpi, experiment.candidate_count
+    );
+    eprintln!("[LifecyclePOC] SURFACE_ACTIVE");
+
+    std::thread::spawn(move || {
+        use recovery::{DesktopLifecycle, DesktopLifecycleAction, DesktopLifecycleEvent};
+        use std::time::Duration;
+
+        let mut lifecycle = DesktopLifecycle::new();
+        std::thread::sleep(Duration::from_secs(2));
+        if lifecycle.event(DesktopLifecycleEvent::Suspend)
+            == DesktopLifecycleAction::SuspendSurfaces
+        {
+            eprintln!("[LifecyclePOC] POWER_SUSPEND_RECEIVED simulated=true");
+            if let Err(error) = native_window::suspend_desired_surfaces_for_lifecycle() {
+                eprintln!("[LifecyclePOC] SUSPEND_FAILED error={error}");
+                let _ = native_window::close_physical_surface(&monitor_id);
+                lifecycle.finish_close();
+                return;
+            }
+            eprintln!("[LifecyclePOC] STATE=Suspended");
+        }
+
+        std::thread::sleep(Duration::from_secs(1));
+        if lifecycle.event(DesktopLifecycleEvent::Resume) == DesktopLifecycleAction::RevalidateHost
+        {
+            eprintln!("[LifecyclePOC] POWER_RESUME_RECEIVED simulated=true");
+            let host_valid = matches!(
+                native_window::validate_registered_desktop_host(),
+                Ok(desktop_host::HostValidation::Stable)
+            );
+            eprintln!("[LifecyclePOC] HOST_REVALIDATION_RESULT valid={host_valid}");
+            if !host_valid {
+                let _ = lifecycle.event(DesktopLifecycleEvent::HostInvalid);
+            }
+            if lifecycle.host_revalidated(host_valid) == DesktopLifecycleAction::RevalidateHost
+                && host_valid
+            {
+                eprintln!("[LifecyclePOC] RECOVERY_STARTED reason=resume");
+                let recovered = native_window::recover_desired_surfaces_for_lifecycle();
+                lifecycle.recovery_finished(recovered);
+                if recovered {
+                    eprintln!("[LifecyclePOC] SURFACE_RECREATED reason=resume");
+                } else {
+                    eprintln!("[LifecyclePOC] RECOVERY_SKIPPED reason=host_unavailable");
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_secs(1));
+        if lifecycle.event(DesktopLifecycleEvent::SessionLock)
+            == DesktopLifecycleAction::SuspendSurfaces
+        {
+            eprintln!("[LifecyclePOC] SESSION_LOCK_RECEIVED simulated=true");
+            let _ = native_window::suspend_desired_surfaces_for_lifecycle();
+            eprintln!("[LifecyclePOC] STATE=SessionLocked");
+        }
+        if lifecycle.event(DesktopLifecycleEvent::SessionUnlock)
+            == DesktopLifecycleAction::RevalidateHost
+        {
+            eprintln!("[LifecyclePOC] SESSION_UNLOCK_RECEIVED simulated=true");
+            let host_valid = matches!(
+                native_window::validate_registered_desktop_host(),
+                Ok(desktop_host::HostValidation::Stable)
+            );
+            eprintln!("[LifecyclePOC] HOST_REVALIDATION_RESULT valid={host_valid}");
+            if !host_valid {
+                let _ = lifecycle.event(DesktopLifecycleEvent::HostInvalid);
+            }
+            if lifecycle.host_revalidated(host_valid) == DesktopLifecycleAction::RevalidateHost
+                && host_valid
+            {
+                eprintln!("[LifecyclePOC] RECOVERY_STARTED reason=unlock");
+                let recovered = native_window::recover_desired_surfaces_for_lifecycle();
+                lifecycle.recovery_finished(recovered);
+                if recovered {
+                    eprintln!("[LifecyclePOC] SURFACE_RECREATED reason=unlock");
+                } else {
+                    eprintln!("[LifecyclePOC] RECOVERY_SKIPPED reason=host_unavailable");
+                }
+            }
+        }
+
+        let _ = native_window::close_physical_surface(&monitor_id);
+        lifecycle.event(DesktopLifecycleEvent::Close);
+        lifecycle.finish_close();
+        eprintln!(
+            "[LifecyclePOC] LIFECYCLE_CLEANUP_COMPLETE state={:?}",
+            lifecycle.state()
+        );
+    });
+    Ok(())
+}
+
 #[tauri::command]
 pub fn open_animated_multimonitor_poc(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "windows")]

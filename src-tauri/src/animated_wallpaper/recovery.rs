@@ -227,6 +227,155 @@ pub(crate) enum RecoveryState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesktopLifecycleState {
+    Active,
+    Suspending,
+    Suspended,
+    Resuming,
+    SessionLocked,
+    SessionUnlocked,
+    HostInvalid,
+    Recovering,
+    Closing,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesktopLifecycleEvent {
+    Suspend,
+    Resume,
+    SessionLock,
+    SessionUnlock,
+    HostInvalid,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesktopLifecycleAction {
+    SuspendSurfaces,
+    RevalidateHost,
+    NoAction,
+    CloseSurfaces,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DesktopLifecycle {
+    state: DesktopLifecycleState,
+}
+
+impl DesktopLifecycle {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: DesktopLifecycleState::Active,
+        }
+    }
+
+    pub(crate) fn state(self) -> DesktopLifecycleState {
+        self.state
+    }
+
+    pub(crate) fn event(&mut self, event: DesktopLifecycleEvent) -> DesktopLifecycleAction {
+        use DesktopLifecycleAction::{CloseSurfaces, NoAction, RevalidateHost, SuspendSurfaces};
+        use DesktopLifecycleEvent::{
+            Close, HostInvalid, Resume, SessionLock, SessionUnlock, Suspend,
+        };
+        use DesktopLifecycleState::{
+            Active, Closed, Closing, HostInvalid as Invalid, Recovering, Resuming, SessionLocked,
+            SessionUnlocked, Suspended, Suspending,
+        };
+
+        match (self.state, event) {
+            (Active, Suspend) | (Active, SessionLock) => {
+                self.state = Suspending;
+                self.state = if event == SessionLock {
+                    SessionLocked
+                } else {
+                    Suspended
+                };
+                SuspendSurfaces
+            }
+            (Suspending, Suspend) | (Suspended, Suspend) | (SessionLocked, SessionLock) => NoAction,
+            (Suspended, Resume) | (SessionLocked, SessionUnlock) => {
+                self.state = if event == SessionUnlock {
+                    SessionUnlocked
+                } else {
+                    Resuming
+                };
+                RevalidateHost
+            }
+            (SessionUnlocked, Resume) | (Resuming, Resume) => RevalidateHost,
+            (Active, HostInvalid) | (Resuming, HostInvalid) => {
+                self.state = Invalid;
+                SuspendSurfaces
+            }
+            (Suspended, HostInvalid) | (SessionLocked, HostInvalid) | (Invalid, HostInvalid) => {
+                self.state = Invalid;
+                NoAction
+            }
+            (Invalid, Resume) => {
+                self.state = Resuming;
+                RevalidateHost
+            }
+            (Active, Close)
+            | (Suspending, Close)
+            | (Suspended, Close)
+            | (SessionLocked, Close)
+            | (SessionUnlocked, Close)
+            | (Resuming, Close)
+            | (Invalid, Close)
+            | (Closing, Close) => {
+                self.state = Closing;
+                CloseSurfaces
+            }
+            (Closed, Close) | (Closed, _) | (Closing, _) => NoAction,
+            (Recovering, Close) => {
+                self.state = Closing;
+                CloseSurfaces
+            }
+            (Recovering, _) => NoAction,
+            (Active, Resume) | (Active, SessionUnlock) | (SessionUnlocked, SessionUnlock) => {
+                NoAction
+            }
+            _ => NoAction,
+        }
+    }
+
+    pub(crate) fn host_revalidated(&mut self, valid: bool) -> DesktopLifecycleAction {
+        if !matches!(
+            self.state,
+            DesktopLifecycleState::Resuming | DesktopLifecycleState::SessionUnlocked
+        ) {
+            return DesktopLifecycleAction::NoAction;
+        }
+        if valid {
+            self.state = DesktopLifecycleState::Recovering;
+            DesktopLifecycleAction::RevalidateHost
+        } else {
+            self.state = DesktopLifecycleState::HostInvalid;
+            DesktopLifecycleAction::NoAction
+        }
+    }
+
+    pub(crate) fn recovery_finished(&mut self, success: bool) {
+        if self.state == DesktopLifecycleState::Recovering {
+            self.state = if success {
+                DesktopLifecycleState::Active
+            } else {
+                DesktopLifecycleState::HostInvalid
+            };
+        }
+    }
+
+    pub(crate) fn finish_close(&mut self) {
+        self.state = DesktopLifecycleState::Closed;
+    }
+
+    pub(crate) fn mark_closed(&mut self) {
+        self.state = DesktopLifecycleState::Closed;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecoveryLifecycle {
     state: RecoveryState,
     renderer_count: usize,
@@ -272,7 +421,8 @@ impl RecoveryLifecycle {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnimatedSurfaceLifecycle, AnimatedSurfaceState, FailureDecision, RecoveryLifecycle,
+        AnimatedSurfaceLifecycle, AnimatedSurfaceState, DesktopLifecycle, DesktopLifecycleAction,
+        DesktopLifecycleEvent, DesktopLifecycleState, FailureDecision, RecoveryLifecycle,
         RecoveryPolicy, RecoveryProbe, RecoveryScenario, RecoveryState, StartupRecoveryPlan,
         SurfaceFailureKind,
     };
@@ -413,5 +563,89 @@ mod tests {
         lifecycle.finish_cleanup();
         assert_eq!(lifecycle.state(), RecoveryState::Unavailable);
         assert_eq!(lifecycle.renderer_count(), 0);
+    }
+
+    #[test]
+    fn desktop_lifecycle_suspends_and_revalidates_without_recreating_concurrently() {
+        let mut lifecycle = DesktopLifecycle::new();
+        assert_eq!(lifecycle.state(), DesktopLifecycleState::Active);
+        assert_eq!(
+            lifecycle.event(DesktopLifecycleEvent::Suspend),
+            DesktopLifecycleAction::SuspendSurfaces
+        );
+        assert_eq!(lifecycle.state(), DesktopLifecycleState::Suspended);
+        assert_eq!(
+            lifecycle.event(DesktopLifecycleEvent::Suspend),
+            DesktopLifecycleAction::NoAction
+        );
+        assert_eq!(
+            lifecycle.event(DesktopLifecycleEvent::Resume),
+            DesktopLifecycleAction::RevalidateHost
+        );
+        assert_eq!(
+            lifecycle.host_revalidated(true),
+            DesktopLifecycleAction::RevalidateHost
+        );
+        lifecycle.recovery_finished(true);
+        assert_eq!(lifecycle.state(), DesktopLifecycleState::Active);
+    }
+
+    #[test]
+    fn desktop_lifecycle_lock_unlock_and_invalid_host_are_safe() {
+        let mut lifecycle = DesktopLifecycle::new();
+        assert_eq!(
+            lifecycle.event(DesktopLifecycleEvent::HostInvalid),
+            DesktopLifecycleAction::SuspendSurfaces
+        );
+        assert_eq!(lifecycle.state(), DesktopLifecycleState::HostInvalid);
+        lifecycle.event(DesktopLifecycleEvent::Resume);
+        lifecycle.host_revalidated(true);
+        lifecycle.recovery_finished(true);
+        assert_eq!(
+            lifecycle.event(DesktopLifecycleEvent::SessionLock),
+            DesktopLifecycleAction::SuspendSurfaces
+        );
+        assert_eq!(lifecycle.state(), DesktopLifecycleState::SessionLocked);
+        assert_eq!(
+            lifecycle.event(DesktopLifecycleEvent::SessionLock),
+            DesktopLifecycleAction::NoAction
+        );
+        assert_eq!(
+            lifecycle.event(DesktopLifecycleEvent::SessionUnlock),
+            DesktopLifecycleAction::RevalidateHost
+        );
+        assert_eq!(lifecycle.state(), DesktopLifecycleState::SessionUnlocked);
+        assert_eq!(
+            lifecycle.host_revalidated(false),
+            DesktopLifecycleAction::NoAction
+        );
+        assert_eq!(lifecycle.state(), DesktopLifecycleState::HostInvalid);
+        assert_eq!(
+            lifecycle.event(DesktopLifecycleEvent::Resume),
+            DesktopLifecycleAction::RevalidateHost
+        );
+        assert_eq!(
+            lifecycle.host_revalidated(true),
+            DesktopLifecycleAction::RevalidateHost
+        );
+        lifecycle.recovery_finished(true);
+        assert_eq!(lifecycle.state(), DesktopLifecycleState::Active);
+    }
+
+    #[test]
+    fn desktop_lifecycle_close_is_idempotent_after_suspend_or_close() {
+        let mut lifecycle = DesktopLifecycle::new();
+        lifecycle.event(DesktopLifecycleEvent::Suspend);
+        assert_eq!(
+            lifecycle.event(DesktopLifecycleEvent::Close),
+            DesktopLifecycleAction::CloseSurfaces
+        );
+        assert_eq!(lifecycle.state(), DesktopLifecycleState::Closing);
+        lifecycle.finish_close();
+        assert_eq!(
+            lifecycle.event(DesktopLifecycleEvent::Close),
+            DesktopLifecycleAction::NoAction
+        );
+        assert_eq!(lifecycle.state(), DesktopLifecycleState::Closed);
     }
 }

@@ -1,7 +1,8 @@
 use super::{
     create_diagnostic_gif, desktop_host, prototype_directory,
     recovery::{
-        RecoveryLifecycle, RecoveryPolicy, RecoveryProbe, RecoveryScenario, StartupRecoveryPlan,
+        DesktopLifecycle, DesktopLifecycleAction, DesktopLifecycleEvent, RecoveryLifecycle,
+        RecoveryPolicy, RecoveryProbe, RecoveryScenario, StartupRecoveryPlan,
     },
     validate_animated_gif, MonitorBounds,
 };
@@ -40,8 +41,8 @@ use windows_webview2::{
             RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
             GWL_EXSTYLE, GW_OWNER, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
             SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY,
-            WM_NCDESTROY, WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-            WS_EX_TRANSPARENT, WS_POPUP,
+            WM_NCDESTROY, WM_POWERBROADCAST, WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
 };
@@ -50,6 +51,20 @@ const NATIVE_WINDOW_CLASS: PCWSTR = w!("LuminaNativeAnimatedPrototype");
 const MAX_NATIVE_SURFACES: usize = 1;
 const MAX_NATIVE_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 const WM_NATIVE_MEDIA_ERROR: u32 = WM_APP + 59;
+const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const PBT_APMSUSPEND: usize = 4;
+const PBT_APMRESUMEAUTOMATIC: usize = 18;
+const PBT_APMRESUMESUSPEND: usize = 7;
+const PBT_APMRESUMECRITICAL: usize = 6;
+const WTS_SESSION_LOCK: usize = 0x7;
+const WTS_SESSION_UNLOCK: usize = 0x8;
+const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+
+#[link(name = "Wtsapi32")]
+unsafe extern "system" {
+    fn WTSRegisterSessionNotification(hwnd: HWND, flags: u32) -> i32;
+    fn WTSUnRegisterSessionNotification(hwnd: HWND) -> i32;
+}
 
 fn is_native_media_error_payload(json: &str) -> bool {
     serde_json::from_str::<String>(json)
@@ -66,6 +81,7 @@ static REGISTERED_DESKTOP_HOST: OnceLock<Mutex<Option<desktop_host::RawDesktopHo
 static DESIRED_SURFACES: OnceLock<Mutex<BTreeMap<String, DesiredSurface>>> = OnceLock::new();
 static HOST_WATCHER: OnceLock<Mutex<Option<HostWatcher>>> = OnceLock::new();
 static ACTIVE_MULTI_TEMPORARIES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+static DESKTOP_LIFECYCLE: OnceLock<Mutex<LifecycleRuntime>> = OnceLock::new();
 
 #[derive(Clone)]
 struct DesiredSurface {
@@ -79,6 +95,32 @@ struct HostWatcher {
     stop: Arc<AtomicBool>,
     wake: Arc<(Mutex<bool>, Condvar)>,
     thread: thread::JoinHandle<()>,
+}
+
+struct LifecycleRuntime {
+    controller: DesktopLifecycle,
+    operation_active: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct NotificationRegistration {
+    session_registered: bool,
+}
+
+impl NotificationRegistration {
+    fn mark_registered(&mut self) -> Result<(), &'static str> {
+        if self.session_registered {
+            return Err("las notificaciones de sesión ya están registradas");
+        }
+        self.session_registered = true;
+        Ok(())
+    }
+
+    fn take_registered(&mut self) -> bool {
+        let was_registered = self.session_registered;
+        self.session_registered = false;
+        was_registered
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +219,128 @@ fn host_watcher() -> &'static Mutex<Option<HostWatcher>> {
 
 fn active_multi_temporaries() -> &'static Mutex<BTreeSet<PathBuf>> {
     ACTIVE_MULTI_TEMPORARIES.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn desktop_lifecycle() -> &'static Mutex<LifecycleRuntime> {
+    DESKTOP_LIFECYCLE.get_or_init(|| {
+        Mutex::new(LifecycleRuntime {
+            controller: DesktopLifecycle::new(),
+            operation_active: false,
+        })
+    })
+}
+
+fn register_lifecycle_notifications(hwnd: HWND) -> Result<NotificationRegistration, String> {
+    let registered = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
+    if registered == 0 {
+        return Err(format!(
+            "WTSRegisterSessionNotification falló para {:?}: {:?}",
+            hwnd,
+            std::io::Error::last_os_error()
+        ));
+    }
+    eprintln!(
+        "[LifecycleNative] SESSION_NOTIFICATIONS_REGISTERED hwnd={:?}",
+        hwnd
+    );
+    eprintln!(
+        "[LifecycleNative] POWER_NOTIFICATIONS_REGISTERED hwnd={:?}",
+        hwnd
+    );
+    let mut registration = NotificationRegistration::default();
+    registration
+        .mark_registered()
+        .map_err(|error| error.to_string())?;
+    Ok(registration)
+}
+
+fn unregister_lifecycle_notifications(hwnd: HWND, registration: &mut NotificationRegistration) {
+    if !registration.take_registered() {
+        return;
+    }
+    let unregistered = unsafe { WTSUnRegisterSessionNotification(hwnd) };
+    if unregistered == 0 {
+        eprintln!(
+            "[LifecycleNative] SESSION_NOTIFICATIONS_UNREGISTER_FAILED hwnd={:?} error={:?}",
+            hwnd,
+            std::io::Error::last_os_error()
+        );
+    } else {
+        eprintln!(
+            "[LifecycleNative] LIFECYCLE_NOTIFICATIONS_UNREGISTERED hwnd={:?}",
+            hwnd
+        );
+    }
+}
+
+fn queue_lifecycle_event(event: DesktopLifecycleEvent, source: &'static str) {
+    let action = {
+        let mut runtime = desktop_lifecycle()
+            .lock()
+            .expect("desktop lifecycle mutex poisoned");
+        let action = runtime.controller.event(event);
+        eprintln!(
+            "[LifecycleNative] LIFECYCLE_TRANSITION source={} event={:?} state={:?} action={:?}",
+            source,
+            event,
+            runtime.controller.state(),
+            action
+        );
+        if matches!(
+            action,
+            DesktopLifecycleAction::SuspendSurfaces | DesktopLifecycleAction::RevalidateHost
+        ) {
+            if runtime.operation_active {
+                eprintln!("[LifecycleNative] LIFECYCLE_EVENT_IGNORED reason=operation_in_progress");
+                return;
+            }
+            runtime.operation_active = true;
+        }
+        action
+    };
+
+    match action {
+        DesktopLifecycleAction::SuspendSurfaces => {
+            eprintln!("[LifecycleNative] LIFECYCLE_SUSPEND_REQUESTED");
+            thread::spawn(|| {
+                if let Err(error) = suspend_desired_surfaces_for_lifecycle() {
+                    eprintln!("[LifecycleNative] LIFECYCLE_SUSPEND_FAILED error={error}");
+                }
+                desktop_lifecycle()
+                    .lock()
+                    .expect("desktop lifecycle mutex poisoned")
+                    .operation_active = false;
+            });
+        }
+        DesktopLifecycleAction::RevalidateHost => {
+            eprintln!("[LifecycleNative] LIFECYCLE_RECOVERY_REQUESTED");
+            thread::spawn(|| {
+                let host_valid = matches!(
+                    validate_registered_desktop_host(),
+                    Ok(desktop_host::HostValidation::Stable)
+                );
+                let mut runtime = desktop_lifecycle()
+                    .lock()
+                    .expect("desktop lifecycle mutex poisoned");
+                if host_valid {
+                    drop(runtime);
+                    let recovered = recover_desired_surfaces_for_lifecycle();
+                    runtime = desktop_lifecycle()
+                        .lock()
+                        .expect("desktop lifecycle mutex poisoned");
+                    runtime.controller.recovery_finished(recovered);
+                    eprintln!(
+                        "[LifecycleNative] HOST_REVALIDATION_RESULT valid=true recovered={recovered}"
+                    );
+                } else {
+                    runtime.controller.host_revalidated(false);
+                    eprintln!("[LifecycleNative] HOST_REVALIDATION_RESULT valid=false");
+                }
+                runtime.operation_active = false;
+            });
+        }
+        DesktopLifecycleAction::CloseSurfaces | DesktopLifecycleAction::NoAction => {}
+    }
 }
 
 fn is_owned_multi_temporary(path: &Path, directory: &Path) -> bool {
@@ -278,6 +442,38 @@ unsafe extern "system" fn native_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_POWERBROADCAST => {
+            match wparam.0 {
+                PBT_APMSUSPEND => {
+                    eprintln!(
+                        "[LifecycleNative] POWER_EVENT_RECEIVED source=windows event=suspend"
+                    );
+                    queue_lifecycle_event(DesktopLifecycleEvent::Suspend, "windows");
+                }
+                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL => {
+                    eprintln!("[LifecycleNative] POWER_EVENT_RECEIVED source=windows event=resume");
+                    queue_lifecycle_event(DesktopLifecycleEvent::Resume, "windows");
+                }
+                _ => {}
+            }
+            LRESULT(1)
+        }
+        WM_WTSSESSION_CHANGE => {
+            match wparam.0 {
+                WTS_SESSION_LOCK => {
+                    eprintln!("[LifecycleNative] SESSION_EVENT_RECEIVED source=windows event=lock");
+                    queue_lifecycle_event(DesktopLifecycleEvent::SessionLock, "windows");
+                }
+                WTS_SESSION_UNLOCK => {
+                    eprintln!(
+                        "[LifecycleNative] SESSION_EVENT_RECEIVED source=windows event=unlock"
+                    );
+                    queue_lifecycle_event(DesktopLifecycleEvent::SessionUnlock, "windows");
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             PostQuitMessage(0);
             LRESULT(0)
@@ -671,7 +867,17 @@ fn run_native_surface(
             return Err(error);
         }
         let hwnd = create_native_window(bounds, variant)?;
+        let mut lifecycle_notifications = match register_lifecycle_notifications(hwnd) {
+            Ok(registration) => registration,
+            Err(error) => {
+                unsafe {
+                    DestroyWindow(hwnd).ok();
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = apply_z_order(hwnd, variant) {
+            unregister_lifecycle_notifications(hwnd, &mut lifecycle_notifications);
             unsafe {
                 DestroyWindow(hwnd).ok();
             }
@@ -679,6 +885,7 @@ fn run_native_surface(
         }
         let attached_to_desktop = if let Some(host) = desktop_host_target {
             if let Err(error) = desktop_host::attach_native_window(hwnd.0 as isize, host, bounds) {
+                unregister_lifecycle_notifications(hwnd, &mut lifecycle_notifications);
                 unsafe {
                     DestroyWindow(hwnd).ok();
                 }
@@ -706,6 +913,7 @@ fn run_native_surface(
                     surface_lifecycle.state(),
                     surface_lifecycle.failures()
                 );
+                unregister_lifecycle_notifications(hwnd, &mut lifecycle_notifications);
                 unsafe {
                     if attached_to_desktop {
                         if let Err(detach_error) =
@@ -778,6 +986,7 @@ fn run_native_surface(
         eprintln!("[NativeAnimated] cierre solicitado");
         surface_lifecycle.begin_close();
         lifecycle.begin_cleanup();
+        unregister_lifecycle_notifications(hwnd, &mut lifecycle_notifications);
         unsafe {
             if let Err(error) = controller.Close() {
                 eprintln!("[NativeAnimated] WEBVIEW2_CLOSE_FAILED error={error}");
@@ -953,6 +1162,19 @@ fn open_physical_surface_internal(
     desktop_host: desktop_host::RawDesktopHost,
     remember_desired: bool,
 ) -> Result<(), String> {
+    if multi_surfaces()
+        .lock()
+        .expect("multi surface mutex poisoned")
+        .is_empty()
+    {
+        let mut runtime = desktop_lifecycle()
+            .lock()
+            .expect("desktop lifecycle mutex poisoned");
+        if runtime.controller.state() == super::recovery::DesktopLifecycleState::Closed {
+            runtime.controller = DesktopLifecycle::new();
+            runtime.operation_active = false;
+        }
+    }
     register_desktop_host(desktop_host);
     if multi_surfaces()
         .lock()
@@ -1174,6 +1396,25 @@ fn stop_host_watcher() {
     }
 }
 
+pub fn suspend_desired_surfaces_for_lifecycle() -> Result<(), String> {
+    let ids = multi_surfaces()
+        .lock()
+        .expect("multi surface mutex poisoned")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let count = ids.len();
+    for id in ids {
+        stop_physical_surface(&id)?;
+    }
+    eprintln!("[LifecyclePOC] SURFACES_SUSPENDED count={count}");
+    Ok(())
+}
+
+pub fn recover_desired_surfaces_for_lifecycle() -> bool {
+    recover_desired_surfaces()
+}
+
 fn recover_desired_surfaces() -> bool {
     eprintln!("[HostMonitor] RECOVERY_STARTED");
     let desired = desired_surfaces()
@@ -1274,6 +1515,22 @@ pub fn close_physical_surface(monitor_id: &str) -> Result<(), String> {
         .lock()
         .expect("desired surfaces mutex poisoned")
         .remove(monitor_id);
+    let last_surface = multi_surfaces()
+        .lock()
+        .expect("multi surface mutex poisoned")
+        .len()
+        <= 1;
+    let no_desired = desired_surfaces()
+        .lock()
+        .expect("desired surfaces mutex poisoned")
+        .is_empty();
+    if last_surface && no_desired {
+        let _ = desktop_lifecycle()
+            .lock()
+            .expect("desktop lifecycle mutex poisoned")
+            .controller
+            .event(DesktopLifecycleEvent::Close);
+    }
     let result = stop_physical_surface(monitor_id);
     if desired_surfaces()
         .lock()
@@ -1281,6 +1538,21 @@ pub fn close_physical_surface(monitor_id: &str) -> Result<(), String> {
         .is_empty()
     {
         stop_host_watcher();
+    }
+    let no_surfaces = multi_surfaces()
+        .lock()
+        .expect("multi surface mutex poisoned")
+        .is_empty();
+    let no_desired = desired_surfaces()
+        .lock()
+        .expect("desired surfaces mutex poisoned")
+        .is_empty();
+    if no_surfaces && no_desired {
+        desktop_lifecycle()
+            .lock()
+            .expect("desktop lifecycle mutex poisoned")
+            .controller
+            .mark_closed();
     }
     result
 }

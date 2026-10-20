@@ -145,6 +145,11 @@ fn main() {
                     Ok(()) => eprintln!("Animated desktop recovery POC started"),
                     Err(error) => eprintln!("Animated desktop recovery POC failed: {error}"),
                 }
+            } else if std::env::var_os("LUMINA_ANIMATED_LIFECYCLE_TEST").is_some() {
+                match animated_wallpaper::open_animated_lifecycle_poc(app.handle().clone(), 0) {
+                    Ok(()) => eprintln!("Animated lifecycle POC started"),
+                    Err(error) => eprintln!("Animated lifecycle POC failed: {error}"),
+                }
             } else if std::env::var_os("LUMINA_ANIMATED_MULTIMONITOR_TEST").is_some() {
                 match animated_wallpaper::open_animated_multimonitor_poc(app.handle().clone()) {
                     Ok(()) => eprintln!("Animated multi-monitor POC started"),
