@@ -317,6 +317,35 @@ pub fn inspect_animated_desktop_host() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+pub fn validate_animated_desktop_host() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let result = native_window::validate_registered_desktop_host()?;
+        let message = match result {
+            desktop_host::HostValidation::Stable => {
+                "HOST_STABLE generación física sin cambios".to_string()
+            }
+            desktop_host::HostValidation::Changed(reason) => {
+                eprintln!("[HostMonitor] HOST_INVALIDATED reason={reason}");
+                let _ = native_window::close();
+                native_window::close_all_physical_surfaces();
+                eprintln!("[HostMonitor] SURFACES_CLOSED host_obsolete=true");
+                format!("HOST_CHANGED generación invalidada: {reason}")
+            }
+            desktop_host::HostValidation::Transient(reason) => {
+                format!("HOST_TRANSIENT_ERROR se reintentará: {reason}")
+            }
+        };
+        eprintln!("[HostMonitor] {message}");
+        Ok(message)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("La validación del host Explorer solo está disponible en Windows".into())
+    }
+}
+
+#[tauri::command]
 pub fn open_native_animated_prototype_test(
     app: AppHandle,
     monitor_index: usize,
@@ -707,6 +736,20 @@ fn run_simulated_multimonitor_validation() -> Result<(), String> {
         eprintln!(
             "[MultiMonitorPOC] PHYSICAL_SIMULATED_CLEANUP count={}",
             coordinator.active_count()
+        );
+        let stable = coordinator.observe_host(multimonitor::HostObservation::Stable);
+        eprintln!(
+            "[HostMonitor] SIMULATED_STABLE reaction={stable:?} generation={} valid={}",
+            coordinator.host_generation(),
+            coordinator.host_is_valid()
+        );
+        coordinator.invalidate_host();
+        eprintln!("[HostMonitor] SIMULATED_CHANGED reaction=Invalidated");
+        coordinator.rediscover_host();
+        eprintln!(
+            "[HostMonitor] SIMULATED_REDISCOVERED generation={} valid={}",
+            coordinator.host_generation(),
+            coordinator.host_is_valid()
         );
     }
     Ok(())

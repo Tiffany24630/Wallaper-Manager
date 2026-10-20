@@ -28,6 +28,13 @@ pub(crate) struct DesktopHost {
 
 pub(crate) type RawDesktopHost = (isize, isize, isize);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostValidation {
+    Stable,
+    Changed(String),
+    Transient(String),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DesktopRect {
     pub left: i32,
@@ -195,14 +202,11 @@ fn direct_child(parent: HWND, class: PCWSTR) -> Option<HWND> {
 }
 
 fn direct_worker_candidates(progman: HWND) -> Vec<HWND> {
-    let Some(first) = (unsafe { FindWindowExW(progman, None, w!("WorkerW"), None) }).ok() else {
-        return Vec::new();
-    };
-    let mut result = vec![first];
-    if let Some(second) =
-        (unsafe { FindWindowExW(progman, Some(&first), w!("WorkerW"), None) }).ok()
-    {
-        result.push(second);
+    let mut result = Vec::new();
+    let mut after = None;
+    while let Ok(worker) = unsafe { FindWindowExW(progman, after.as_ref(), w!("WorkerW"), None) } {
+        result.push(worker);
+        after = Some(worker);
     }
     result
 }
@@ -277,6 +281,41 @@ pub fn prepare_modern_host() -> Result<(RawDesktopHost, DesktopHostExperiment), 
         ),
         experiment,
     ))
+}
+
+pub(crate) fn validate_registered_host(registered: RawDesktopHost) -> HostValidation {
+    let progman = match find_progman() {
+        Ok(value) => value,
+        Err(error) => return HostValidation::Transient(error),
+    };
+    if progman.0 as isize != registered.0 {
+        return HostValidation::Changed(format!(
+            "Progman cambió: registrado=0x{:x}, actual=0x{:x}",
+            registered.0, progman.0 as usize
+        ));
+    }
+
+    let Some(shell_view) = direct_child(progman, w!("SHELLDLL_DefView")) else {
+        return HostValidation::Changed("SHELLDLL_DefView ya no es hijo directo de Progman".into());
+    };
+    let candidates = direct_worker_candidates(progman)
+        .into_iter()
+        .filter(|worker| direct_child(*worker, w!("SHELLDLL_DefView")).is_none())
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return HostValidation::Changed(format!(
+            "la jerarquía tiene {} WorkerW candidatos válidos",
+            candidates.len()
+        ));
+    }
+    let worker = candidates[0];
+    if shell_view.0 as isize != registered.2 || worker.0 as isize != registered.1 {
+        return HostValidation::Changed(format!(
+            "cambió la jerarquía: worker=0x{:x}, shell_view=0x{:x}",
+            worker.0 as usize, shell_view.0 as usize
+        ));
+    }
+    HostValidation::Stable
 }
 
 pub(crate) fn snapshot_current_desktop() -> Result<Vec<DesktopWindowSnapshot>, String> {

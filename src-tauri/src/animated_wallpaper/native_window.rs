@@ -47,6 +47,8 @@ static NATIVE_SURFACE: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
 static NATIVE_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
 static MULTI_SURFACES: OnceLock<Mutex<BTreeMap<String, isize>>> = OnceLock::new();
 static MULTI_THREADS: OnceLock<Mutex<BTreeMap<String, thread::JoinHandle<()>>>> = OnceLock::new();
+static REGISTERED_DESKTOP_HOST: OnceLock<Mutex<Option<desktop_host::RawDesktopHost>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZOrderVariant {
@@ -122,6 +124,16 @@ fn multi_surfaces() -> &'static Mutex<BTreeMap<String, isize>> {
 
 fn multi_threads() -> &'static Mutex<BTreeMap<String, thread::JoinHandle<()>>> {
     MULTI_THREADS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn registered_desktop_host() -> &'static Mutex<Option<desktop_host::RawDesktopHost>> {
+    REGISTERED_DESKTOP_HOST.get_or_init(|| Mutex::new(None))
+}
+
+fn register_desktop_host(host: desktop_host::RawDesktopHost) {
+    *registered_desktop_host()
+        .lock()
+        .expect("registered host mutex poisoned") = Some(host);
 }
 
 unsafe extern "system" fn native_window_proc(
@@ -607,6 +619,7 @@ pub fn open_desktop_poc(app: &AppHandle, monitor: MonitorBounds) -> Result<(), S
             "No se pudo registrar el experimento de escritorio: {error}"
         ))?
     );
+    register_desktop_host(host);
     open_internal(app, monitor, ZOrderVariant::ClickThrough, Some(host))
 }
 
@@ -616,6 +629,7 @@ pub fn open_physical_surface(
     monitor: MonitorBounds,
     desktop_host: desktop_host::RawDesktopHost,
 ) -> Result<(), String> {
+    register_desktop_host(desktop_host);
     if multi_surfaces()
         .lock()
         .expect("multi surface mutex poisoned")
@@ -681,6 +695,14 @@ pub fn open_physical_surface(
             "La superficie del monitor {monitor_id} no confirmó su inicialización"
         )),
     }
+}
+
+pub fn validate_registered_desktop_host() -> Result<desktop_host::HostValidation, String> {
+    let host = registered_desktop_host()
+        .lock()
+        .expect("registered host mutex poisoned")
+        .ok_or("No hay un host Explorer registrado")?;
+    Ok(desktop_host::validate_registered_host(host))
 }
 
 fn sanitize_monitor_id(value: &str) -> String {

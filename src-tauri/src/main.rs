@@ -148,6 +148,12 @@ fn main() {
                     Err(error) => eprintln!("Animated desktop inspection failed: {error}"),
                 }
             }
+            if std::env::var_os("LUMINA_ANIMATED_HOST_MONITOR").is_some() {
+                match animated_wallpaper::validate_animated_desktop_host() {
+                    Ok(message) => eprintln!("Animated host monitor result: {message}"),
+                    Err(error) => eprintln!("Animated host monitor failed: {error}"),
+                }
+            }
             scheduler_for_setup.restart();
             Ok(())
         })
@@ -205,6 +211,7 @@ fn main() {
             animated_wallpaper::open_animated_prototype,
             animated_wallpaper::open_animated_prototype_test,
             animated_wallpaper::inspect_animated_desktop_host,
+            animated_wallpaper::validate_animated_desktop_host,
             animated_wallpaper::open_native_animated_prototype_test,
             animated_wallpaper::open_animated_desktop_poc,
             animated_wallpaper::open_animated_desktop_recovery_poc,

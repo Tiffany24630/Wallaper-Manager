@@ -36,6 +36,20 @@ pub(crate) enum SurfaceState {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostObservation {
+    Stable,
+    Changed,
+    TransientError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostReaction {
+    NoAction,
+    Invalidated,
+    RetryLater,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MonitorSurface {
     pub(crate) monitor_id: String,
@@ -115,6 +129,18 @@ impl MonitorCoordinator {
 
     pub(crate) fn invalidate_host(&mut self) {
         self.host_valid = false;
+    }
+
+    pub(crate) fn observe_host(&mut self, observation: HostObservation) -> HostReaction {
+        match observation {
+            HostObservation::Stable => HostReaction::NoAction,
+            HostObservation::TransientError => HostReaction::RetryLater,
+            HostObservation::Changed if self.host_valid => {
+                self.invalidate_host();
+                HostReaction::Invalidated
+            }
+            HostObservation::Changed => HostReaction::NoAction,
+        }
     }
 
     pub(crate) fn rediscover_host(&mut self) {
@@ -217,7 +243,8 @@ pub(crate) fn simulated_topologies() -> [Vec<MonitorSpec>; 2] {
 #[cfg(test)]
 mod tests {
     use super::{
-        simulated_topologies, LogicalBounds, MonitorCoordinator, MonitorSpec, SurfaceState,
+        simulated_topologies, HostObservation, HostReaction, LogicalBounds, MonitorCoordinator,
+        MonitorSpec, SurfaceState,
     };
 
     fn monitor(id: &str, x: i32, dpi: u32) -> MonitorSpec {
@@ -335,6 +362,41 @@ mod tests {
         assert_eq!(
             coordinator.surface(&b.id).unwrap().state,
             SurfaceState::Active
+        );
+    }
+
+    #[test]
+    fn stable_host_does_not_trigger_repeated_recovery() {
+        let mut coordinator = MonitorCoordinator::default();
+        assert_eq!(
+            coordinator.observe_host(HostObservation::Stable),
+            HostReaction::NoAction
+        );
+        assert!(coordinator.host_is_valid());
+        assert_eq!(
+            coordinator.observe_host(HostObservation::TransientError),
+            HostReaction::RetryLater
+        );
+        assert!(coordinator.host_is_valid());
+    }
+
+    #[test]
+    fn changed_host_invalidates_only_once_until_rediscovery() {
+        let mut coordinator = MonitorCoordinator::default();
+        assert_eq!(
+            coordinator.observe_host(HostObservation::Changed),
+            HostReaction::Invalidated
+        );
+        assert_eq!(
+            coordinator.observe_host(HostObservation::Changed),
+            HostReaction::NoAction
+        );
+        let generation = coordinator.host_generation();
+        coordinator.rediscover_host();
+        assert_eq!(coordinator.host_generation(), generation + 1);
+        assert_eq!(
+            coordinator.observe_host(HostObservation::Stable),
+            HostReaction::NoAction
         );
     }
 
