@@ -6,8 +6,8 @@ use std::{
 };
 
 use image::{
-    codecs::gif::{GifEncoder, Repeat},
-    Delay, Frame, Rgba, RgbaImage,
+    codecs::gif::{GifDecoder, GifEncoder, Repeat},
+    AnimationDecoder, Delay, Frame, ImageDecoder, Rgba, RgbaImage,
 };
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use uuid::Uuid;
@@ -24,6 +24,165 @@ use recovery::{
 };
 
 const MAX_PROTOTYPE_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_ANIMATED_FILE_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_ANIMATED_DIMENSION: u32 = 8192;
+pub(crate) const MAX_ANIMATED_PIXEL_AREA: u64 = 33_177_600;
+pub(crate) const MAX_ESTIMATED_DECODED_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_ANIMATED_FRAMES: u32 = 240;
+pub(crate) const MAX_ANIMATED_DURATION_MS: u64 = 10 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnimatedResourceInfo {
+    pub(crate) file_bytes: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixel_area: u64,
+    pub(crate) frame_count: u32,
+    pub(crate) duration_ms: u64,
+    pub(crate) estimated_decoded_frame_bytes: u64,
+}
+
+fn resource_limit_reason(
+    file_bytes: u64,
+    width: u32,
+    height: u32,
+    monitor_width: u32,
+    monitor_height: u32,
+) -> Option<&'static str> {
+    if file_bytes > MAX_PROTOTYPE_MEDIA_BYTES || file_bytes > MAX_ANIMATED_FILE_BYTES {
+        return Some("ResourceLimitExceeded:file_size");
+    }
+    if width == 0
+        || height == 0
+        || width > MAX_ANIMATED_DIMENSION
+        || height > MAX_ANIMATED_DIMENSION
+    {
+        return Some("ResourceLimitExceeded:dimensions");
+    }
+    let area = u64::from(width).saturating_mul(u64::from(height));
+    if area > MAX_ANIMATED_PIXEL_AREA {
+        return Some("ResourceLimitExceeded:pixel_area");
+    }
+    if monitor_width > 0
+        && monitor_height > 0
+        && (width > monitor_width.saturating_mul(4) || height > monitor_height.saturating_mul(4))
+    {
+        return Some("ResourceLimitExceeded:monitor_ratio");
+    }
+    if area.saturating_mul(4) > MAX_ESTIMATED_DECODED_FRAME_BYTES {
+        return Some("ResourceLimitExceeded:decoded_frame");
+    }
+    None
+}
+
+pub(crate) fn validate_animated_gif(
+    path: &Path,
+    monitor_width: u32,
+    monitor_height: u32,
+) -> Result<AnimatedResourceInfo, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("MediaError: no se pudo leer el archivo: {error}"))?;
+    if !metadata.is_file() {
+        return Err("MediaError: la ruta no es un archivo".into());
+    }
+    let file_bytes = metadata.len();
+    if file_bytes == 0 {
+        return Err("MediaError: el archivo está vacío".into());
+    }
+    if file_bytes > MAX_PROTOTYPE_MEDIA_BYTES || file_bytes > MAX_ANIMATED_FILE_BYTES {
+        return Err(format!(
+            "ResourceLimitExceeded: archivo de {file_bytes} bytes supera el límite práctico de {} bytes (techo absoluto {} bytes)",
+            MAX_ANIMATED_FILE_BYTES, MAX_PROTOTYPE_MEDIA_BYTES
+        ));
+    }
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+        != Some("gif")
+    {
+        return Err("MediaError: el POC animado solo admite GIF".into());
+    }
+
+    let file = fs::File::open(path)
+        .map_err(|error| format!("MediaError: no se pudo abrir el GIF: {error}"))?;
+    let decoder = GifDecoder::new(std::io::BufReader::new(file))
+        .map_err(|error| format!("MediaError: formato GIF inválido: {error}"))?;
+    let (width, height) = decoder.dimensions();
+    if let Some(reason) =
+        resource_limit_reason(file_bytes, width, height, monitor_width, monitor_height)
+    {
+        return Err(reason.to_string());
+    }
+    let pixel_area = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| "ResourceLimitExceeded: overflow en el área del GIF".to_string())?;
+    if width == 0
+        || height == 0
+        || width > MAX_ANIMATED_DIMENSION
+        || height > MAX_ANIMATED_DIMENSION
+    {
+        return Err(format!(
+            "ResourceLimitExceeded: dimensiones {width}x{height} superan el máximo de {MAX_ANIMATED_DIMENSION}"
+        ));
+    }
+    if pixel_area > MAX_ANIMATED_PIXEL_AREA {
+        return Err(format!(
+            "ResourceLimitExceeded: área de {pixel_area} píxeles supera el máximo de {MAX_ANIMATED_PIXEL_AREA}"
+        ));
+    }
+    if monitor_width > 0
+        && monitor_height > 0
+        && (width > monitor_width.saturating_mul(4) || height > monitor_height.saturating_mul(4))
+    {
+        return Err(format!(
+            "ResourceLimitExceeded: resolución {width}x{height} es desproporcionada para el monitor {monitor_width}x{monitor_height}"
+        ));
+    }
+    let estimated_decoded_frame_bytes = pixel_area
+        .checked_mul(4)
+        .ok_or_else(|| "ResourceLimitExceeded: overflow de memoria estimada".to_string())?;
+    if estimated_decoded_frame_bytes > MAX_ESTIMATED_DECODED_FRAME_BYTES {
+        return Err(format!(
+            "ResourceLimitExceeded: frame RGBA estimado de {estimated_decoded_frame_bytes} bytes supera el máximo de {MAX_ESTIMATED_DECODED_FRAME_BYTES}"
+        ));
+    }
+
+    let mut frame_count = 0u32;
+    let mut duration_ms = 0u64;
+    for frame in decoder.into_frames() {
+        let frame =
+            frame.map_err(|error| format!("MediaError: no se pudo decodificar el GIF: {error}"))?;
+        frame_count = frame_count.saturating_add(1);
+        if frame_count > MAX_ANIMATED_FRAMES {
+            return Err(format!(
+                "ResourceLimitExceeded: el GIF supera {MAX_ANIMATED_FRAMES} frames"
+            ));
+        }
+        let (numerator, denominator) = frame.delay().numer_denom_ms();
+        let frame_ms = u64::from(numerator).div_ceil(u64::from(denominator.max(1)));
+        duration_ms = duration_ms.saturating_add(frame_ms);
+        if duration_ms > MAX_ANIMATED_DURATION_MS {
+            return Err(format!(
+                "ResourceLimitExceeded: duración acumulada supera {MAX_ANIMATED_DURATION_MS} ms"
+            ));
+        }
+    }
+    if frame_count == 0 {
+        return Err("MediaError: el GIF no contiene frames".into());
+    }
+
+    Ok(AnimatedResourceInfo {
+        file_bytes,
+        width,
+        height,
+        pixel_area,
+        frame_count,
+        duration_ms,
+        estimated_decoded_frame_bytes,
+    })
+}
 
 #[derive(Debug)]
 struct PrototypeSurfaceRecord {
@@ -278,6 +437,17 @@ pub async fn open_animated_prototype(
     let position = monitor.position();
     let size = monitor.size();
     let bounds = bounds_from_geometry(position.x, position.y, size.width, size.height)?;
+    if extension == "gif" {
+        let resource = validate_animated_gif(&source, bounds.width, bounds.height)?;
+        eprintln!(
+            "Animated resource accepted: {}x{} frames={} duration_ms={} estimated_decoded_frame_bytes={}",
+            resource.width,
+            resource.height,
+            resource.frame_count,
+            resource.duration_ms,
+            resource.estimated_decoded_frame_bytes
+        );
+    }
     let label = format!("animated-prototype-{monitor_index}");
 
     if app.get_webview_window(&label).is_some() {
@@ -1038,8 +1208,9 @@ pub fn close_all_animated_prototypes(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounds_from_geometry, create_diagnostic_gif, encode_query_component, smoke_variant_options,
-        validate_media_source,
+        bounds_from_geometry, create_diagnostic_gif, encode_query_component, resource_limit_reason,
+        smoke_variant_options, validate_animated_gif, validate_media_source,
+        MAX_ANIMATED_DIMENSION, MAX_ANIMATED_FILE_BYTES,
     };
     use image::GenericImageView;
     use uuid::Uuid;
@@ -1088,6 +1259,39 @@ mod tests {
         let image = image::open(&path).unwrap();
         assert_eq!(image.dimensions(), (320, 180));
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn animated_resource_limits_reject_oversized_dimensions_area_memory_and_file() {
+        assert_eq!(
+            resource_limit_reason(MAX_ANIMATED_FILE_BYTES + 1, 320, 180, 2560, 1440),
+            Some("ResourceLimitExceeded:file_size")
+        );
+        assert_eq!(
+            resource_limit_reason(1, MAX_ANIMATED_DIMENSION + 1, 1, 2560, 1440),
+            Some("ResourceLimitExceeded:dimensions")
+        );
+        assert_eq!(
+            resource_limit_reason(1, 6000, 6000, 8192, 8192),
+            Some("ResourceLimitExceeded:pixel_area")
+        );
+        assert_eq!(
+            resource_limit_reason(1, 5000, 4000, 8192, 8192),
+            Some("ResourceLimitExceeded:decoded_frame")
+        );
+        assert_eq!(resource_limit_reason(1, 320, 180, 2560, 1440), None);
+    }
+
+    #[test]
+    fn small_diagnostic_gif_is_accepted_with_measured_metadata() {
+        let path = std::env::temp_dir().join(format!("lumina-resource-{}.gif", Uuid::new_v4()));
+        create_diagnostic_gif(&path).unwrap();
+        let info = validate_animated_gif(&path, 2560, 1440).unwrap();
+        assert_eq!((info.width, info.height), (320, 180));
+        assert_eq!(info.frame_count, 2);
+        assert!(info.duration_ms > 0);
+        assert_eq!(info.estimated_decoded_frame_bytes, 320 * 180 * 4);
         std::fs::remove_file(path).unwrap();
     }
 

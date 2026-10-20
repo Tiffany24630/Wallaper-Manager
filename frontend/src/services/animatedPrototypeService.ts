@@ -29,4 +29,16 @@ export const animatedPrototypeService = {
   close(monitorIndex = 0): Promise<void> {
     return tauriInvoke("close_animated_prototype", { monitorIndex });
   },
+
+  reportMediaError(
+    surfaceId: string,
+    kind: "media" | "webview",
+    reason?: string,
+  ): Promise<void> {
+    return tauriInvoke("report_animated_media_error", {
+      surfaceId,
+      kind,
+      reason,
+    });
+  },
 };

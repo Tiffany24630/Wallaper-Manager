@@ -118,7 +118,12 @@ fn main() {
                     }
                 });
             }
-            if std::env::var_os("LUMINA_NATIVE_ANIMATED_TEST").is_some() {
+            if std::env::var_os("LUMINA_ANIMATED_NATIVE_MEDIA_ERROR_TEST").is_some() {
+                match animated_wallpaper::open_animated_desktop_poc(app.handle().clone(), 0) {
+                    Ok(()) => eprintln!("Native animated media error test started"),
+                    Err(error) => eprintln!("Native animated media error test failed: {error}"),
+                }
+            } else if std::env::var_os("LUMINA_NATIVE_ANIMATED_TEST").is_some() {
                 match animated_wallpaper::open_native_animated_prototype_test(
                     app.handle().clone(),
                     0,

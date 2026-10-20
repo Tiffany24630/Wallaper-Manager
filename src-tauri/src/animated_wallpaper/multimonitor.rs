@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+pub(crate) const MAX_ACTIVE_ANIMATED_SURFACES: usize = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct LogicalBounds {
     pub(crate) x: i32,
@@ -90,6 +92,9 @@ impl MonitorCoordinator {
         }
         if !self.host_valid {
             return Err("el host compartido no es válido");
+        }
+        if self.active_count() >= MAX_ACTIVE_ANIMATED_SURFACES {
+            return Err("se alcanzÃ³ el lÃ­mite global de superficies animadas");
         }
         let sequence = self.surfaces.len() + 1;
         self.surfaces.insert(
@@ -312,6 +317,20 @@ mod tests {
         coordinator.mark_unavailable(&a.id);
         coordinator.create(&a).unwrap();
         assert_eq!(coordinator.active_count(), 1);
+    }
+
+    #[test]
+    fn global_surface_limit_rejects_third_and_releases_after_cleanup() {
+        let a = monitor("display-a", 0, 96);
+        let b = monitor("display-b", 1920, 96);
+        let c = monitor("display-c", 3840, 96);
+        let mut coordinator = MonitorCoordinator::default();
+        coordinator.create(&a).unwrap();
+        coordinator.create(&b).unwrap();
+        assert!(coordinator.create(&c).is_err());
+        coordinator.mark_unavailable(&a.id);
+        coordinator.create(&c).unwrap();
+        assert_eq!(coordinator.active_count(), 2);
     }
 
     #[test]

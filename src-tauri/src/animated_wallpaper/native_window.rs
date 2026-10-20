@@ -3,7 +3,7 @@ use super::{
     recovery::{
         RecoveryLifecycle, RecoveryPolicy, RecoveryProbe, RecoveryScenario, StartupRecoveryPlan,
     },
-    MonitorBounds,
+    validate_animated_gif, MonitorBounds,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -18,12 +18,12 @@ use std::{
 
 use tauri::AppHandle;
 use webview2_com::{
-    CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
+    CoTaskMemPWSTR, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, Microsoft::Web::WebView2::Win32::*,
     NavigationCompletedEventHandler, WebMessageReceivedEventHandler,
 };
 use windows_webview2::{
-    core::{w, Interface, HSTRING, PCWSTR},
+    core::{w, Interface, HSTRING, PCWSTR, PWSTR},
     Win32::{
         Foundation::{
             GetLastError, E_POINTER, HINSTANCE, HWND, LPARAM, LRESULT, WIN32_ERROR, WPARAM,
@@ -50,6 +50,12 @@ const NATIVE_WINDOW_CLASS: PCWSTR = w!("LuminaNativeAnimatedPrototype");
 const MAX_NATIVE_SURFACES: usize = 1;
 const MAX_NATIVE_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 const WM_NATIVE_MEDIA_ERROR: u32 = WM_APP + 59;
+
+fn is_native_media_error_payload(json: &str) -> bool {
+    serde_json::from_str::<String>(json)
+        .map(|message| message == "lumina-media-error")
+        .unwrap_or(false)
+}
 
 static NATIVE_SURFACE: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
 static NATIVE_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
@@ -416,6 +422,12 @@ fn native_html(media_path: &Path) -> String {
         "https://lumina.local/{}",
         encode_uri_component(filename)
     ));
+    let diagnostic_error = if std::env::var_os("LUMINA_ANIMATED_NATIVE_MEDIA_ERROR_TEST").is_some()
+    {
+        "<script>window.addEventListener('load', function() { setTimeout(function() { document.querySelector('img').src = 'https://lumina.local/__lumina_controlled_error__.gif'; }, 700); });</script>"
+    } else {
+        ""
+    };
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><style>
         html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:#111827}}
@@ -427,6 +439,7 @@ fn native_html(media_path: &Path) -> String {
         <div id="status">Native HWND WebView2 · cargando GIF…</div>
         <img src="{uri}" alt="GIF de diagnóstico" onload="document.getElementById('status').textContent='Native HWND WebView2 · GIF cargado'" onerror="document.getElementById('status').textContent='Native HWND WebView2 · error de carga'">
         <script>document.querySelector('img').addEventListener('error', function() {{ window.chrome?.webview?.postMessage('lumina-media-error'); }});</script>
+        {diagnostic_error}
         </body></html>"#
     )
 }
@@ -435,6 +448,7 @@ fn create_webview(
     hwnd: HWND,
     bounds: MonitorBounds,
     media_path: &Path,
+    surface_id: &str,
 ) -> Result<ICoreWebView2Controller, String> {
     let (environment_tx, environment_rx) = mpsc::channel();
     let options = ICoreWebView2EnvironmentOptions::from(CoreWebView2EnvironmentOptions::default());
@@ -538,9 +552,25 @@ fn create_webview(
                 format!("WebViewError: no se pudo registrar NavigationCompleted: {error}")
             })?;
         let media_error_hwnd = hwnd.0 as isize;
-        let media_error_handler =
-            WebMessageReceivedEventHandler::create(Box::new(move |_webview, _args| {
-                eprintln!("[NativeAnimated] MEDIA_ERROR_MESSAGE_RECEIVED");
+        let media_error_surface_id = surface_id.to_string();
+        let media_error_handler = WebMessageReceivedEventHandler::create(Box::new(
+            move |_webview, args| {
+                let mut message = PWSTR::null();
+                let valid = args
+                    .and_then(|args| args.WebMessageAsJson(&mut message).ok())
+                    .is_some_and(|_| {
+                        let message = CoTaskMemPWSTR::from(message);
+                        is_native_media_error_payload(&message.to_string())
+                    });
+                if !valid {
+                    eprintln!(
+                        "[NativeAnimated] MEDIA_ERROR_MESSAGE_IGNORED surface_id={media_error_surface_id} reason=invalid_payload"
+                    );
+                    return Ok(());
+                }
+                eprintln!(
+                    "[NativeAnimated] MEDIA_ERROR_MESSAGE_RECEIVED surface_id={media_error_surface_id}"
+                );
                 let _ = PostMessageW(
                     Some(HWND(media_error_hwnd as *mut _)),
                     WM_NATIVE_MEDIA_ERROR,
@@ -548,7 +578,8 @@ fn create_webview(
                     LPARAM(0),
                 );
                 Ok(())
-            }));
+            },
+        ));
         webview
             .add_WebMessageReceived(&media_error_handler, &mut token)
             .map_err(|error| {
@@ -565,7 +596,19 @@ fn create_webview(
     Ok(controller)
 }
 
-fn validate_native_media(media_path: &Path) -> Result<(), String> {
+#[allow(unreachable_code)]
+fn validate_native_media(media_path: &Path, bounds: MonitorBounds) -> Result<(), String> {
+    validate_animated_gif(media_path, bounds.width, bounds.height).map(|resource| {
+        eprintln!(
+            "[NativeAnimated] RESOURCE_ACCEPTED dimensions={}x{} frames={} duration_ms={} estimated_decoded_frame_bytes={}",
+            resource.width,
+            resource.height,
+            resource.frame_count,
+            resource.duration_ms,
+            resource.estimated_decoded_frame_bytes
+        );
+    })?;
+    return Ok(());
     let metadata = std::fs::metadata(media_path)
         .map_err(|error| format!("MediaError: no se pudo leer el archivo: {error}"))?;
     if !metadata.is_file() {
@@ -618,7 +661,7 @@ fn run_native_surface(
         if !com_initialized {
             return Err("CoInitializeEx no pudo inicializar COM".into());
         }
-        if let Err(error) = validate_native_media(&media_path) {
+        if let Err(error) = validate_native_media(&media_path, bounds) {
             let decision = surface_lifecycle.fail(super::recovery::SurfaceFailureKind::Media);
             eprintln!(
                 "[NativeAnimated] MEDIA_FAILURE state={:?} attempts={} decision={decision:?} error={error}",
@@ -645,7 +688,11 @@ fn run_native_surface(
         } else {
             false
         };
-        let controller = match create_webview(hwnd, bounds, &media_path) {
+        let surface_id = surface_key
+            .as_deref()
+            .unwrap_or("native-single")
+            .to_string();
+        let controller = match create_webview(hwnd, bounds, &media_path, &surface_id) {
             Ok(controller) => {
                 surface_lifecycle
                     .webview_ready()
@@ -716,7 +763,7 @@ fn run_native_surface(
             if message.message == WM_NATIVE_MEDIA_ERROR {
                 let decision = surface_lifecycle.fail(super::recovery::SurfaceFailureKind::Media);
                 eprintln!(
-                    "[NativeAnimated] MEDIA_FAILURE state={:?} attempts={} decision={decision:?}",
+                    "[NativeAnimated] MEDIA_FAILURE surface_id={surface_id} state={:?} attempts={} decision={decision:?}",
                     surface_lifecycle.state(),
                     surface_lifecycle.failures()
                 );
@@ -811,6 +858,16 @@ fn open_internal(
         return Err("Ya existe una superficie HWND nativa; ciérrala antes de abrir otra".into());
     }
     drop(active);
+    if multi_surfaces()
+        .lock()
+        .expect("multi surface mutex poisoned")
+        .len()
+        >= super::multimonitor::MAX_ACTIVE_ANIMATED_SURFACES
+    {
+        return Err(
+            "ResourceLimitExceeded: se alcanzó el límite global de superficies animadas".into(),
+        );
+    }
     if let Some(previous_thread) = native_thread()
         .lock()
         .expect("native thread mutex poisoned")
@@ -914,6 +971,16 @@ fn open_physical_surface_internal(
         return Err(format!(
             "El monitor {monitor_id} todavía está cerrando su superficie anterior"
         ));
+    }
+    if multi_surfaces()
+        .lock()
+        .expect("multi surface mutex poisoned")
+        .len()
+        >= super::multimonitor::MAX_ACTIVE_ANIMATED_SURFACES
+    {
+        return Err(
+            "ResourceLimitExceeded: se alcanzÃ³ el lÃ­mite global de superficies animadas".into(),
+        );
     }
 
     let path = prototype_directory(app)?.join(format!(
@@ -1388,7 +1455,8 @@ pub fn close() -> Result<(), String> {
 mod tests {
     use super::{
         active_multi_temporaries, classify_multi_temporary, cleanup_orphaned_multi_temporaries,
-        create_diagnostic_gif, validate_native_media, TemporaryClassification,
+        create_diagnostic_gif, is_native_media_error_payload, validate_native_media,
+        TemporaryClassification,
     };
     use std::{
         collections::BTreeSet,
@@ -1459,32 +1527,83 @@ mod tests {
     fn native_media_validation_rejects_missing_empty_wrong_format_and_large_files() {
         let directory = test_directory();
         let missing = directory.join("missing.gif");
-        assert!(validate_native_media(&missing)
-            .unwrap_err()
-            .contains("MediaError"));
+        assert!(validate_native_media(
+            &missing,
+            super::MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440
+            }
+        )
+        .unwrap_err()
+        .contains("MediaError"));
 
         let empty = directory.join("empty.gif");
         fs::write(&empty, []).unwrap();
-        assert!(validate_native_media(&empty)
-            .unwrap_err()
-            .contains("MediaError"));
+        assert!(validate_native_media(
+            &empty,
+            super::MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440
+            }
+        )
+        .unwrap_err()
+        .contains("MediaError"));
 
         let wrong_format = directory.join("wrong.txt");
         fs::write(&wrong_format, b"not media").unwrap();
-        assert!(validate_native_media(&wrong_format)
-            .unwrap_err()
-            .contains("MediaError"));
+        assert!(validate_native_media(
+            &wrong_format,
+            super::MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440
+            }
+        )
+        .unwrap_err()
+        .contains("MediaError"));
 
         let large = directory.join("large.gif");
         let file = fs::File::create(&large).unwrap();
         file.set_len(super::MAX_NATIVE_MEDIA_BYTES + 1).unwrap();
-        assert!(validate_native_media(&large)
-            .unwrap_err()
-            .contains("límite"));
+        assert!(validate_native_media(
+            &large,
+            super::MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440
+            }
+        )
+        .unwrap_err()
+        .contains("límite"));
 
         let valid = directory.join("valid.gif");
         create_diagnostic_gif(&valid).unwrap();
-        assert!(validate_native_media(&valid).is_ok());
+        assert!(validate_native_media(
+            &valid,
+            super::MonitorBounds {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440
+            }
+        )
+        .is_ok());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_media_error_payload_requires_exact_message() {
+        assert!(is_native_media_error_payload("\"lumina-media-error\""));
+        assert!(!is_native_media_error_payload("\"other-message\""));
+        assert!(!is_native_media_error_payload("not-json"));
+        assert!(!is_native_media_error_payload(
+            "{\"message\":\"lumina-media-error\"}"
+        ));
     }
 }
