@@ -104,7 +104,9 @@ fn stop_worker(worker: Worker) {
         *requested = true;
         wake_condition.notify_one();
     }
-    let _ = worker.handle.join();
+    if worker.handle.join().is_err() {
+        eprintln!("[DynamicScheduler] SCHEDULER_WORKER_JOIN_FAILED");
+    }
 }
 
 fn run_worker(

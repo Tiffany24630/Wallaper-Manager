@@ -845,6 +845,14 @@ fn native_html(media_path: &Path) -> String {
     )
 }
 
+fn close_webview_after_initialization_failure(controller: &ICoreWebView2Controller, stage: &str) {
+    unsafe {
+        if let Err(error) = controller.Close() {
+            eprintln!("[NativeAnimated] WEBVIEW2_CLOSE_FAILED stage={stage} error={error}");
+        }
+    }
+}
+
 fn create_webview(
     hwnd: HWND,
     bounds: MonitorBounds,
@@ -901,12 +909,12 @@ fn create_webview(
         .map_err(|error| format!("WebView2 devolvió un error al crear el Controller: {error}"))?;
     let webview = unsafe {
         controller.CoreWebView2().map_err(|error| {
-            controller.Close().ok();
+            close_webview_after_initialization_failure(&controller, "core_webview");
             format!("WebViewError: no se pudo obtener ICoreWebView2: {error}")
         })?
     };
     let webview3 = webview.cast::<ICoreWebView2_3>().map_err(|error| {
-        unsafe { controller.Close().ok() };
+        close_webview_after_initialization_failure(&controller, "host_mapping_interface");
         format!("WebViewError: WebView2 no expone el mapeo de host local: {error}")
     })?;
     let folder = media_path
@@ -922,7 +930,7 @@ fn create_webview(
                 COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW,
             )
             .map_err(|error| {
-                controller.Close().ok();
+                close_webview_after_initialization_failure(&controller, "host_mapping");
                 format!("WebViewError: no se pudo mapear el medio local: {error}")
             })?;
     }
@@ -934,11 +942,11 @@ fn create_webview(
     };
     unsafe {
         controller.SetBounds(rect).map_err(|error| {
-            controller.Close().ok();
+            close_webview_after_initialization_failure(&controller, "set_bounds");
             format!("WebViewError: no se pudo ajustar el tamaño: {error}")
         })?;
         controller.SetIsVisible(true).map_err(|error| {
-            controller.Close().ok();
+            close_webview_after_initialization_failure(&controller, "set_visible");
             format!("WebViewError: no se pudo mostrar WebView2: {error}")
         })?;
         let navigation_handler = NavigationCompletedEventHandler::create(Box::new(|_, _| {
@@ -949,7 +957,7 @@ fn create_webview(
         webview
             .add_NavigationCompleted(&navigation_handler, &mut token)
             .map_err(|error| {
-                controller.Close().ok();
+                close_webview_after_initialization_failure(&controller, "navigation_handler");
                 format!("WebViewError: no se pudo registrar NavigationCompleted: {error}")
             })?;
         let media_error_hwnd = hwnd.0 as isize;
@@ -985,24 +993,28 @@ fn create_webview(
                     );
                     return Ok(());
                 };
-                let _ = PostMessageW(
+                if let Err(error) = PostMessageW(
                     Some(HWND(media_error_hwnd as *mut _)),
                     message_id,
                     WPARAM(0),
                     LPARAM(0),
-                );
+                ) {
+                    eprintln!(
+                        "[NativeAnimated] MEDIA_MESSAGE_POST_FAILED surface_id={media_error_surface_id} error={error}"
+                    );
+                }
                 Ok(())
             },
         ));
         webview
             .add_WebMessageReceived(&media_error_handler, &mut token)
             .map_err(|error| {
-                controller.Close().ok();
+                close_webview_after_initialization_failure(&controller, "message_handler");
                 format!("WebViewError: no se pudo registrar el canal de errores de media: {error}")
             })?;
         let html = HSTRING::from(native_html(media_path));
         webview.NavigateToString(&html).map_err(|error| {
-            controller.Close().ok();
+            close_webview_after_initialization_failure(&controller, "navigate_html");
             format!("MediaError: no se pudo cargar el HTML del GIF: {error}")
         })?;
     }
@@ -1067,6 +1079,7 @@ fn run_native_surface(
     ready: mpsc::Sender<Result<isize, String>>,
 ) {
     let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
+    let cleanup_reached = AtomicBool::new(false);
     let result = (|| {
         let mut lifecycle = RecoveryLifecycle::new();
         let mut surface_lifecycle = super::recovery::AnimatedSurfaceLifecycle::new();
@@ -1084,6 +1097,9 @@ fn run_native_surface(
                 surface_lifecycle.failures()
             );
             return Err(error);
+        }
+        if surface_key.is_none() && native_surface_closing().load(Ordering::Acquire) {
+            return Err("La creación del renderer nativo fue cancelada".into());
         }
         let hwnd = create_native_window(bounds, variant)?;
         let mut applied_bounds = bounds;
@@ -1300,6 +1316,7 @@ fn run_native_surface(
             .lock()
             .expect("active temporary mutex poisoned")
             .remove(&media_path);
+        cleanup_reached.store(true, Ordering::Release);
         if std::env::var_os("LUMINA_ANIMATED_DESKTOP_POC_FINAL_SNAPSHOT").is_some() {
             match desktop_host::snapshot_current_desktop() {
                 Ok(snapshot) => eprintln!(
@@ -1320,6 +1337,13 @@ fn run_native_surface(
     })();
 
     if let Err(error) = result {
+        if !cleanup_reached.load(Ordering::Acquire) {
+            let _ = std::fs::remove_file(&media_path);
+            active_multi_temporaries()
+                .lock()
+                .expect("active temporary mutex poisoned")
+                .remove(&media_path);
+        }
         let _ = ready.send(Err(error.clone()));
         eprintln!("[NativeAnimated] error: {error}");
     }
@@ -1392,18 +1416,31 @@ fn open_internal(
     match ready_rx.recv_timeout(Duration::from_secs(15)) {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => {
-            let _ = std::fs::remove_file(&path);
             if let Some(handle) = native_thread()
                 .lock()
                 .expect("native thread mutex poisoned")
                 .take()
             {
-                let _ = handle.join();
+                if handle.join().is_err() {
+                    eprintln!(
+                        "[NativeAnimated] NATIVE_THREAD_JOIN_FAILED stage=initialization_error"
+                    );
+                }
             }
             Err(error)
         }
         Err(_) => {
-            let _ = std::fs::remove_file(&path);
+            native_surface_closing().store(true, Ordering::Release);
+            let join_error = native_thread()
+                .lock()
+                .expect("native thread mutex poisoned")
+                .take()
+                .and_then(|handle| handle.join().err());
+            if join_error.is_some() {
+                eprintln!(
+                    "[NativeAnimated] NATIVE_THREAD_JOIN_FAILED stage=initialization_timeout"
+                );
+            }
             Err(
                 "El renderer nativo no confirmó su inicialización dentro del tiempo esperado"
                     .into(),
@@ -1607,17 +1644,17 @@ fn open_physical_surface_internal(
                     .expect("desired surfaces mutex poisoned")
                     .remove(&monitor_id);
             }
-            let _ = std::fs::remove_file(&path);
-            active_multi_temporaries()
-                .lock()
-                .expect("active temporary mutex poisoned")
-                .remove(&path);
             if let Some(handle) = multi_threads()
                 .lock()
                 .expect("multi thread mutex poisoned")
                 .remove(&monitor_id)
             {
-                let _ = handle.join();
+                if handle.join().is_err() {
+                    eprintln!(
+                        "[MultiMonitorPOC] NATIVE_THREAD_JOIN_FAILED monitor_id={} stage=initialization_error",
+                        monitor_id
+                    );
+                }
             }
             Err(error)
         }
@@ -1625,18 +1662,18 @@ fn open_physical_surface_internal(
             if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
                 coordinator.abort(&assignment);
             }
-            let _ = close_physical_surface(&monitor_id);
+            if let Err(close_error) = close_physical_surface(&monitor_id) {
+                eprintln!(
+                    "[MultiMonitorPOC] INITIALIZATION_CLEANUP_FAILED monitor_id={} error={close_error}",
+                    monitor_id
+                );
+            }
             if remember_desired {
                 desired_surfaces()
                     .lock()
                     .expect("desired surfaces mutex poisoned")
                     .remove(&monitor_id);
             }
-            let _ = std::fs::remove_file(&path);
-            active_multi_temporaries()
-                .lock()
-                .expect("active temporary mutex poisoned")
-                .remove(&path);
             Err(format!(
                 "La superficie del monitor {monitor_id} no confirmó su inicialización"
             ))
@@ -1767,7 +1804,9 @@ fn stop_host_watcher() {
             *requested = true;
             wake_condition.notify_one();
         }
-        let _ = watcher.thread.join();
+        if watcher.thread.join().is_err() {
+            eprintln!("[HostMonitor] WATCHER_JOIN_FAILED");
+        }
     }
 }
 

@@ -202,6 +202,33 @@ fn activation_matches(record: &PrototypeSurfaceRecord, activation_id: &str) -> b
     record.activation_id == activation_id
 }
 
+fn diagnostic_surface_conflicts(has_current_assignment: bool, has_pending_operation: bool) -> bool {
+    has_current_assignment || has_pending_operation
+}
+
+fn ensure_diagnostic_surface_is_isolated(monitor_id: &MonitorIdentity) -> Result<(), String> {
+    let coordinator = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?;
+    if !matches!(
+        coordinator.lifecycle(),
+        wallpaper_coordinator::CoordinatorLifecycle::Ready
+    ) {
+        return Err(
+            "El POC diagnóstico no puede crear una superficie fuera del lifecycle Ready".into(),
+        );
+    }
+    if diagnostic_surface_conflicts(
+        coordinator.current(monitor_id).is_some(),
+        coordinator.pending(monitor_id).is_some(),
+    ) {
+        return Err(format!(
+            "El POC diagnóstico no puede crear una superficie sobre una asignación coordinada para {monitor_id}"
+        ));
+    }
+    Ok(())
+}
+
 fn prototype_surface_label(monitor_id: &MonitorIdentity) -> String {
     let encoded = monitor_id
         .as_str()
@@ -762,48 +789,6 @@ pub async fn open_animated_prototype(
         }
     };
 
-    if let Err(error) = register_prototype_surface(&label, &activation_id, assignment.clone()) {
-        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
-            coordinator.abort(&assignment);
-        }
-        let _ = window.close();
-        let _ = fs::remove_file(&cleanup_path);
-        return Err(error);
-    }
-
-    if workerw_mode {
-        #[cfg(target_os = "windows")]
-        if let Err(error) = desktop_host::attach_to_worker_w(&window, bounds) {
-            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
-                coordinator.abort(&assignment);
-            }
-            let _ = window.close();
-            let _ = fs::remove_file(&cleanup_path);
-            return Err(format!(
-                "No se pudo activar el host WorkerW experimental: {error}"
-            ));
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
-                coordinator.abort(&assignment);
-            }
-            let _ = window.close();
-            let _ = fs::remove_file(&cleanup_path);
-            return Err("El host WorkerW experimental solo está disponible en Windows".into());
-        }
-    }
-
-    if let Err(error) = window.set_ignore_cursor_events(options.ignore_cursor_events) {
-        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
-            coordinator.abort(&assignment);
-        }
-        let _ = window.close();
-        let _ = fs::remove_file(&cleanup_path);
-        return Err(format!(
-            "No se pudo configurar la interacción del prototipo: {error}"
-        ));
-    }
     let event_cleanup_path = cleanup_path.clone();
     let event_label = label.clone();
     let event_activation_id = activation_id.clone();
@@ -814,17 +799,75 @@ pub async fn open_animated_prototype(
             finish_prototype_close(&event_label, Some(&event_activation_id));
             eprintln!("WEBVIEW2_CLOSED surface={event_label} source=tauri_destroyed");
             eprintln!("HWND_DESTROYED surface={event_label} source=tauri_destroyed");
-            eprintln!("TEMPORARY_CLEANED surface={event_label} removed={temporary_removed}");
+            if temporary_removed {
+                eprintln!("TEMPORARY_CLEANED surface={event_label} removed=true");
+            } else {
+                eprintln!(
+                    "TEMPORARY_CLEANUP_PENDING surface={event_label} removed=false reason=destroyed_confirmed_but_file_unavailable"
+                );
+            }
             eprintln!("ANIMATED_SURFACE_CLOSED surface={event_label}");
         }
     });
+
+    if let Err(error) = register_prototype_surface(&label, &activation_id, assignment.clone()) {
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&assignment);
+        }
+        if let Err(close_error) = window.close() {
+            eprintln!("ANIMATED_SURFACE_CLOSE_REQUEST_FAILED surface={label} error={close_error}");
+        }
+        return Err(error);
+    }
+
+    if workerw_mode {
+        #[cfg(target_os = "windows")]
+        if let Err(error) = desktop_host::attach_to_worker_w(&window, bounds) {
+            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                coordinator.abort(&assignment);
+            }
+            if let Err(close_error) = window.close() {
+                eprintln!(
+                    "ANIMATED_SURFACE_CLOSE_REQUEST_FAILED surface={label} error={close_error}"
+                );
+            }
+            return Err(format!(
+                "No se pudo activar el host WorkerW experimental: {error}"
+            ));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                coordinator.abort(&assignment);
+            }
+            if let Err(close_error) = window.close() {
+                eprintln!(
+                    "ANIMATED_SURFACE_CLOSE_REQUEST_FAILED surface={label} error={close_error}"
+                );
+            }
+            return Err("El host WorkerW experimental solo está disponible en Windows".into());
+        }
+    }
+
+    if let Err(error) = window.set_ignore_cursor_events(options.ignore_cursor_events) {
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&assignment);
+        }
+        if let Err(close_error) = window.close() {
+            eprintln!("ANIMATED_SURFACE_CLOSE_REQUEST_FAILED surface={label} error={close_error}");
+        }
+        return Err(format!(
+            "No se pudo configurar la interacción del prototipo: {error}"
+        ));
+    }
     if let Err(error) = window.show() {
         begin_explicit_prototype_close(&label);
         if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
             coordinator.abort(&assignment);
         }
-        let _ = window.close();
-        let _ = fs::remove_file(&cleanup_path);
+        if let Err(close_error) = window.close() {
+            eprintln!("ANIMATED_SURFACE_CLOSE_REQUEST_FAILED surface={label} error={close_error}");
+        }
         return Err(format!(
             "No se pudo mostrar la superficie WebView2: {error}"
         ));
@@ -885,6 +928,7 @@ pub fn open_native_animated_prototype_test(
     #[cfg(target_os = "windows")]
     {
         let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
+        ensure_diagnostic_surface_is_isolated(&monitor_identity)?;
         let monitors = app
             .get_webview_window("main")
             .ok_or("No se encontró la ventana principal de Lumina")?
@@ -910,6 +954,7 @@ pub fn open_animated_desktop_poc(app: AppHandle, monitor_id: String) -> Result<(
     #[cfg(target_os = "windows")]
     {
         let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
+        ensure_diagnostic_surface_is_isolated(&monitor_identity)?;
         let monitors = app
             .get_webview_window("main")
             .ok_or("No se encontró la ventana principal de Lumina")?
@@ -938,6 +983,7 @@ pub fn open_animated_desktop_recovery_poc(
     #[cfg(target_os = "windows")]
     {
         let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
+        ensure_diagnostic_surface_is_isolated(&monitor_identity)?;
         let monitors = app
             .get_webview_window("main")
             .ok_or("No se encontró la ventana principal de Lumina")?
@@ -1685,10 +1731,11 @@ pub fn close_all_animated_prototypes(app: &AppHandle) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_matches, bounds_from_geometry, create_diagnostic_gif, encode_query_component,
-        prototype_surface_label, resource_limit_reason, smoke_variant_options,
-        validate_animated_gif, validate_media_source, AnimatedSurfaceLifecycle,
-        PrototypeSurfaceRecord, MAX_ANIMATED_DIMENSION, MAX_ANIMATED_FILE_BYTES,
+        activation_matches, bounds_from_geometry, create_diagnostic_gif,
+        diagnostic_surface_conflicts, encode_query_component, prototype_surface_label,
+        resource_limit_reason, smoke_variant_options, validate_animated_gif, validate_media_source,
+        AnimatedSurfaceLifecycle, PrototypeSurfaceRecord, MAX_ANIMATED_DIMENSION,
+        MAX_ANIMATED_FILE_BYTES,
     };
     use crate::models::monitor_assignment::MonitorIdentity;
     use crate::models::monitor_assignment::WallpaperBackend;
@@ -1731,6 +1778,13 @@ mod tests {
             prototype_surface_label(&first),
             prototype_surface_label(&second)
         );
+    }
+
+    #[test]
+    fn diagnostic_surface_is_rejected_when_coordinator_state_exists() {
+        assert!(!diagnostic_surface_conflicts(false, false));
+        assert!(diagnostic_surface_conflicts(true, false));
+        assert!(diagnostic_surface_conflicts(false, true));
     }
 
     #[test]
