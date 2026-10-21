@@ -167,12 +167,16 @@ pub fn restore_monitor_wallpapers(app: &tauri::AppHandle) -> Result<(), String> 
     }
     wallpaper::set_mode(mode)
         .map_err(|e| format!("Windows no pudo restaurar el modo de ajuste: {e}"))?;
+    let mut restore_errors = Vec::new();
     for (monitor_id, wallpaper_id) in assignments {
         let Ok(path) = conn.query_row(
             "SELECT path FROM wallpapers WHERE id = ?1",
             [&wallpaper_id],
             |row| row.get::<_, String>(0),
         ) else {
+            restore_errors.push(format!(
+                "{monitor_id}: no se encontró el wallpaper persistido {wallpaper_id}"
+            ));
             continue;
         };
         if std::path::Path::new(&path).is_file() {
@@ -186,26 +190,39 @@ pub fn restore_monitor_wallpapers(app: &tauri::AppHandle) -> Result<(), String> 
                 if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
                     coordinator.abort(&operation);
                 }
-                return Err(format!(
-                    "Windows no pudo restaurar el fondo del monitor: {error}"
+                restore_errors.push(format!(
+                    "{monitor_id}: Windows no pudo restaurar el fondo: {error}"
                 ));
+                continue;
             }
             let mut coordinator = wallpaper_coordinator::global()
                 .lock()
                 .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?;
-            if let Err(error) = coordinator.confirm_previous_deactivated(&operation) {
+            let coordinator_result = (|| {
+                coordinator.confirm_previous_deactivated(&operation)?;
+                coordinator.confirm_activated(&operation)?;
+                coordinator.commit(&operation)
+            })();
+            if let Err(error) = coordinator_result {
                 coordinator.abort(&operation);
-                return Err(error.to_string());
+                restore_errors.push(format!(
+                    "{monitor_id}: restaurado físicamente, pero no confirmado en el coordinador: {error}"
+                ));
             }
-            coordinator
-                .confirm_activated(&operation)
-                .map_err(|error| error.to_string())?;
-            coordinator
-                .commit(&operation)
-                .map_err(|error| error.to_string())?;
+        } else {
+            restore_errors.push(format!(
+                "{monitor_id}: el archivo persistido no está disponible"
+            ));
         }
     }
-    Ok(())
+    if restore_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "No se pudieron restaurar todos los monitores: {}",
+            restore_errors.join("; ")
+        ))
+    }
 }
 
 #[tauri::command]

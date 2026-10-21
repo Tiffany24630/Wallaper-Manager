@@ -11,6 +11,7 @@ use commands::{
     system::*, wallpaper::*,
 };
 use dynamic::DynamicScheduler;
+use models::wallpaper_coordinator;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
@@ -28,6 +29,38 @@ fn should_minimize_to_tray() -> bool {
         .unwrap_or(true)
 }
 
+fn shutdown_runtime(app: &tauri::AppHandle, scheduler: &DynamicScheduler) {
+    // Stop producers before closing their consumers. This prevents a final
+    // scheduler rotation from reserving work while surfaces are being torn
+    // down. The coordinator remains in ShuttingDown until surface cleanup has
+    // had a chance to release its own assignments.
+    scheduler.stop();
+    if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+        match coordinator.begin_shutdown() {
+            Ok(cancelled) => {
+                eprintln!("WALLPAPER_COORDINATOR_SHUTTING_DOWN cancelled_pending={cancelled}")
+            }
+            Err(error) => eprintln!("WALLPAPER_COORDINATOR_SHUTDOWN_BEGIN_FAILED error={error}"),
+        }
+    } else {
+        eprintln!("WALLPAPER_COORDINATOR_SHUTDOWN_BEGIN_FAILED error=lock");
+    }
+    let pending_surface_confirmations = animated_wallpaper::close_all_animated_prototypes(app);
+    if pending_surface_confirmations != 0 {
+        eprintln!(
+            "WALLPAPER_COORDINATOR_CLOSE_CONFIRMATION_PENDING count={pending_surface_confirmations}"
+        );
+    }
+    if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+        match coordinator.finish_shutdown() {
+            Ok(()) => eprintln!("WALLPAPER_COORDINATOR_SHUTDOWN_COMPLETE"),
+            Err(error) => eprintln!("WALLPAPER_COORDINATOR_SHUTDOWN_INCOMPLETE error={error}"),
+        }
+    } else {
+        eprintln!("WALLPAPER_COORDINATOR_SHUTDOWN_INCOMPLETE error=lock");
+    }
+}
+
 fn main() {
     let scheduler = DynamicScheduler::default();
     let scheduler_for_setup = scheduler.clone();
@@ -36,6 +69,12 @@ fn main() {
         .manage(scheduler)
         .setup(move |app| {
             db::initialize(app.handle()).map_err(std::io::Error::other)?;
+            wallpaper_coordinator::global()
+                .lock()
+                .map_err(|_| std::io::Error::other("No se pudo bloquear el coordinador"))?
+                .initialize()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            eprintln!("WALLPAPER_COORDINATOR_READY");
             if let Err(error) = animated_wallpaper::prepare_animated_startup(app.handle()) {
                 eprintln!("No se pudo preparar el arranque limpio del POC animado: {error}");
             }
@@ -287,9 +326,9 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .build(tauri::generate_context!());
     match result {
-        Ok(app) => app.run(|app, event| {
+        Ok(app) => app.run(move |app, event| {
             if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
-                animated_wallpaper::close_all_animated_prototypes(app);
+                shutdown_runtime(app, &scheduler_for_shutdown);
             }
         }),
         Err(error) => {
@@ -297,5 +336,4 @@ fn main() {
             panic!("No se pudo iniciar Lumina: {error}");
         }
     }
-    scheduler_for_shutdown.stop();
 }

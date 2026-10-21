@@ -20,6 +20,7 @@ enum PendingPhase {
 struct PendingOperation {
     operation: AssignmentOperation,
     previous: Option<MonitorAssignment>,
+    previous_deactivated: bool,
     phase: PendingPhase,
 }
 
@@ -29,14 +30,27 @@ pub(crate) enum CoordinatorResult {
     NoPreviousBackend,
     Activated,
     Committed,
+    CommittedResourceReadyVisibilityUnverified,
     Released,
     Obsolete,
     AbortedPreviousActive,
     AbortedWithoutBackend,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssignmentEvidence {
+    Confirmed,
+    ResourceReadyVisibilityUnverified,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CoordinatorError {
+    NotInitialized,
+    InitializationInProgress,
+    AlreadyInitialized,
+    ShuttingDown,
+    Shutdown,
+    InitializationFailed,
     InvalidMonitor,
     Unavailable,
     Ambiguous,
@@ -49,6 +63,12 @@ pub(crate) enum CoordinatorError {
 impl std::fmt::Display for CoordinatorError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::NotInitialized => "coordinator is not initialized",
+            Self::InitializationInProgress => "coordinator initialization is in progress",
+            Self::AlreadyInitialized => "coordinator is already initialized",
+            Self::ShuttingDown => "coordinator is shutting down",
+            Self::Shutdown => "coordinator is shut down",
+            Self::InitializationFailed => "coordinator initialization failed",
             Self::InvalidMonitor => "la identidad del monitor no es vÃ¡lida",
             Self::Unavailable => "el monitor no estÃ¡ disponible",
             Self::Ambiguous => "la identidad del monitor es ambigua",
@@ -62,13 +82,117 @@ impl std::fmt::Display for CoordinatorError {
 
 impl std::error::Error for CoordinatorError {}
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoordinatorLifecycle {
+    Uninitialized,
+    Initializing,
+    Ready,
+    ShuttingDown,
+    Shutdown,
+    InitializationFailed,
+}
+
+#[derive(Debug)]
 pub(crate) struct WallpaperCoordinator {
     registry: MonitorAssignmentRegistry,
     pending: BTreeMap<MonitorIdentity, PendingOperation>,
+    evidence: BTreeMap<MonitorIdentity, AssignmentEvidence>,
+    lifecycle: CoordinatorLifecycle,
+}
+
+impl Default for WallpaperCoordinator {
+    fn default() -> Self {
+        // Local coordinators used by isolated model tests start ready. The
+        // process-wide coordinator is explicitly initialized during startup.
+        Self {
+            registry: MonitorAssignmentRegistry::default(),
+            pending: BTreeMap::new(),
+            evidence: BTreeMap::new(),
+            lifecycle: CoordinatorLifecycle::Ready,
+        }
+    }
 }
 
 impl WallpaperCoordinator {
+    pub(crate) fn uninitialized() -> Self {
+        Self {
+            registry: MonitorAssignmentRegistry::default(),
+            pending: BTreeMap::new(),
+            evidence: BTreeMap::new(),
+            lifecycle: CoordinatorLifecycle::Uninitialized,
+        }
+    }
+
+    pub(crate) fn lifecycle(&self) -> CoordinatorLifecycle {
+        self.lifecycle
+    }
+
+    pub(crate) fn initialize(&mut self) -> Result<(), CoordinatorError> {
+        match self.lifecycle {
+            CoordinatorLifecycle::Uninitialized => {
+                self.lifecycle = CoordinatorLifecycle::Initializing;
+                self.lifecycle = CoordinatorLifecycle::Ready;
+                Ok(())
+            }
+            CoordinatorLifecycle::Initializing => Err(CoordinatorError::InitializationInProgress),
+            CoordinatorLifecycle::Ready => Err(CoordinatorError::AlreadyInitialized),
+            CoordinatorLifecycle::ShuttingDown | CoordinatorLifecycle::Shutdown => {
+                Err(CoordinatorError::Shutdown)
+            }
+            CoordinatorLifecycle::InitializationFailed => {
+                Err(CoordinatorError::InitializationFailed)
+            }
+        }
+    }
+
+    pub(crate) fn begin_shutdown(&mut self) -> Result<usize, CoordinatorError> {
+        match self.lifecycle {
+            CoordinatorLifecycle::Ready => {
+                self.lifecycle = CoordinatorLifecycle::ShuttingDown;
+                let cancelled = self.pending.len();
+                self.pending.clear();
+                Ok(cancelled)
+            }
+            CoordinatorLifecycle::ShuttingDown | CoordinatorLifecycle::Shutdown => Ok(0),
+            CoordinatorLifecycle::Uninitialized | CoordinatorLifecycle::InitializationFailed => {
+                self.lifecycle = CoordinatorLifecycle::Shutdown;
+                Ok(0)
+            }
+            CoordinatorLifecycle::Initializing => {
+                self.lifecycle = CoordinatorLifecycle::ShuttingDown;
+                self.pending.clear();
+                Ok(0)
+            }
+        }
+    }
+
+    pub(crate) fn finish_shutdown(&mut self) -> Result<(), CoordinatorError> {
+        match self.lifecycle {
+            CoordinatorLifecycle::ShuttingDown => {
+                self.pending.clear();
+                self.registry = MonitorAssignmentRegistry::default();
+                self.evidence.clear();
+                self.lifecycle = CoordinatorLifecycle::Shutdown;
+                Ok(())
+            }
+            CoordinatorLifecycle::Shutdown => Ok(()),
+            _ => Err(CoordinatorError::ShuttingDown),
+        }
+    }
+
+    fn ensure_ready(&self) -> Result<(), CoordinatorError> {
+        match self.lifecycle {
+            CoordinatorLifecycle::Ready => Ok(()),
+            CoordinatorLifecycle::Uninitialized => Err(CoordinatorError::NotInitialized),
+            CoordinatorLifecycle::Initializing => Err(CoordinatorError::InitializationInProgress),
+            CoordinatorLifecycle::ShuttingDown => Err(CoordinatorError::ShuttingDown),
+            CoordinatorLifecycle::Shutdown => Err(CoordinatorError::Shutdown),
+            CoordinatorLifecycle::InitializationFailed => {
+                Err(CoordinatorError::InitializationFailed)
+            }
+        }
+    }
+
     pub(crate) fn reserve_resolved(
         &mut self,
         resolution: MonitorResolution,
@@ -86,6 +210,7 @@ impl WallpaperCoordinator {
         monitor: MonitorIdentity,
         backend: WallpaperBackend,
     ) -> Result<AssignmentOperation, CoordinatorError> {
+        self.ensure_ready()?;
         if monitor.as_str().trim().is_empty() {
             return Err(CoordinatorError::InvalidMonitor);
         }
@@ -105,6 +230,7 @@ impl WallpaperCoordinator {
                     .registry
                     .current(&operation.assignment.monitor)
                     .cloned(),
+                previous_deactivated: false,
                 phase: PendingPhase::Prepared,
             },
         );
@@ -118,14 +244,24 @@ impl WallpaperCoordinator {
         &mut self,
         operation: &AssignmentOperation,
     ) -> Result<CoordinatorResult, CoordinatorError> {
-        let Some(pending) = self.pending.get(operation.assignment.monitor_ref()) else {
-            return Err(CoordinatorError::Obsolete);
+        self.ensure_ready()?;
+        let had_previous = {
+            let Some(pending) = self.pending.get_mut(operation.assignment.monitor_ref()) else {
+                return Err(CoordinatorError::Obsolete);
+            };
+            if pending.operation != *operation
+                || pending.phase != PendingPhase::Prepared
+                || pending.previous_deactivated
+            {
+                return Err(CoordinatorError::Obsolete);
+            }
+            let had_previous = pending.previous.is_some();
+            pending.previous_deactivated = true;
+            had_previous
         };
-        if pending.operation != *operation {
-            return Err(CoordinatorError::Obsolete);
-        }
-        if pending.previous.is_some() {
+        if had_previous {
             self.registry.invalidate(operation.assignment.monitor_ref());
+            self.evidence.remove(operation.assignment.monitor_ref());
             Ok(CoordinatorResult::PreviousDeactivated)
         } else {
             Ok(CoordinatorResult::NoPreviousBackend)
@@ -136,6 +272,7 @@ impl WallpaperCoordinator {
         &mut self,
         operation: &AssignmentOperation,
     ) -> Result<CoordinatorResult, CoordinatorError> {
+        self.ensure_ready()?;
         let Some(pending) = self.pending.get_mut(operation.assignment.monitor_ref()) else {
             return Err(CoordinatorError::Obsolete);
         };
@@ -150,6 +287,15 @@ impl WallpaperCoordinator {
         &mut self,
         operation: &AssignmentOperation,
     ) -> Result<CoordinatorResult, CoordinatorError> {
+        self.commit_with_evidence(operation, AssignmentEvidence::Confirmed)
+    }
+
+    pub(crate) fn commit_with_evidence(
+        &mut self,
+        operation: &AssignmentOperation,
+        evidence: AssignmentEvidence,
+    ) -> Result<CoordinatorResult, CoordinatorError> {
+        self.ensure_ready()?;
         let Some(pending) = self.pending.get(&operation.assignment.monitor) else {
             return Err(CoordinatorError::Obsolete);
         };
@@ -160,7 +306,14 @@ impl WallpaperCoordinator {
         self.registry
             .activate(operation.assignment.clone())
             .map_err(|_| CoordinatorError::Obsolete)?;
-        Ok(CoordinatorResult::Committed)
+        self.evidence
+            .insert(operation.assignment.monitor.clone(), evidence);
+        Ok(match evidence {
+            AssignmentEvidence::Confirmed => CoordinatorResult::Committed,
+            AssignmentEvidence::ResourceReadyVisibilityUnverified => {
+                CoordinatorResult::CommittedResourceReadyVisibilityUnverified
+            }
+        })
     }
 
     pub(crate) fn abort(&mut self, operation: &AssignmentOperation) -> CoordinatorResult {
@@ -196,6 +349,14 @@ impl WallpaperCoordinator {
         self.registry.current(monitor)
     }
 
+    pub(crate) fn evidence(&self, monitor: &MonitorIdentity) -> Option<AssignmentEvidence> {
+        self.evidence.get(monitor).copied()
+    }
+
+    pub(crate) fn is_physically_confirmed(&self, monitor: &MonitorIdentity) -> bool {
+        self.evidence(monitor) == Some(AssignmentEvidence::Confirmed)
+    }
+
     pub(crate) fn pending(&self, monitor: &MonitorIdentity) -> Option<&AssignmentOperation> {
         self.pending.get(monitor).map(|pending| &pending.operation)
     }
@@ -223,6 +384,7 @@ impl WallpaperCoordinator {
             .is_some_and(|assignment| assignment.generation == generation)
         {
             self.registry.invalidate(monitor);
+            self.evidence.remove(monitor);
             return CoordinatorResult::Released;
         }
         CoordinatorResult::Obsolete
@@ -235,16 +397,172 @@ impl WallpaperCoordinator {
 
 pub(crate) fn global() -> &'static Mutex<WallpaperCoordinator> {
     static INSTANCE: OnceLock<Mutex<WallpaperCoordinator>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(WallpaperCoordinator::default()))
+    INSTANCE.get_or_init(|| Mutex::new(WallpaperCoordinator::uninitialized()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CoordinatorError, CoordinatorResult, WallpaperCoordinator};
+    use super::{
+        AssignmentEvidence, CoordinatorError, CoordinatorLifecycle, CoordinatorResult,
+        WallpaperCoordinator,
+    };
     use crate::models::monitor_assignment::{MonitorIdentity, MonitorResolution, WallpaperBackend};
 
     fn monitor(value: &str) -> MonitorIdentity {
         MonitorIdentity::new(value).unwrap()
+    }
+
+    #[test]
+    fn lifecycle_requires_explicit_initialization_for_process_coordinator() {
+        let mut coordinator = WallpaperCoordinator::uninitialized();
+        assert_eq!(coordinator.lifecycle(), CoordinatorLifecycle::Uninitialized);
+        assert_eq!(
+            coordinator.reserve(monitor("native-a"), WallpaperBackend::Static),
+            Err(CoordinatorError::NotInitialized)
+        );
+        coordinator.initialize().unwrap();
+        assert_eq!(coordinator.lifecycle(), CoordinatorLifecycle::Ready);
+        assert_eq!(
+            coordinator.initialize(),
+            Err(CoordinatorError::AlreadyInitialized)
+        );
+    }
+
+    #[test]
+    fn shutdown_rejects_new_operations_and_cancels_pending_work() {
+        let mut coordinator = WallpaperCoordinator::default();
+        let operation = coordinator
+            .reserve(monitor("native-a"), WallpaperBackend::Static)
+            .unwrap();
+        assert_eq!(coordinator.begin_shutdown(), Ok(1));
+        assert_eq!(coordinator.lifecycle(), CoordinatorLifecycle::ShuttingDown);
+        assert_eq!(
+            coordinator.reserve(monitor("native-b"), WallpaperBackend::Animated),
+            Err(CoordinatorError::ShuttingDown)
+        );
+        assert_eq!(coordinator.abort(&operation), CoordinatorResult::Obsolete);
+        coordinator.finish_shutdown().unwrap();
+        assert_eq!(coordinator.lifecycle(), CoordinatorLifecycle::Shutdown);
+        assert_eq!(
+            coordinator.reserve(monitor("native-a"), WallpaperBackend::Static),
+            Err(CoordinatorError::Shutdown)
+        );
+    }
+
+    #[test]
+    fn stale_commit_cannot_succeed_after_shutdown() {
+        let mut coordinator = WallpaperCoordinator::default();
+        let operation = coordinator
+            .reserve(monitor("native-a"), WallpaperBackend::Static)
+            .unwrap();
+        coordinator.begin_shutdown().unwrap();
+        assert_eq!(
+            coordinator.commit(&operation),
+            Err(CoordinatorError::ShuttingDown)
+        );
+        coordinator.finish_shutdown().unwrap();
+        assert_eq!(
+            coordinator.commit(&operation),
+            Err(CoordinatorError::Shutdown)
+        );
+    }
+
+    #[test]
+    fn shutdown_is_idempotent_and_does_not_reopen_coordinator() {
+        let mut coordinator = WallpaperCoordinator::default();
+        assert_eq!(coordinator.begin_shutdown(), Ok(0));
+        assert_eq!(coordinator.begin_shutdown(), Ok(0));
+        coordinator.finish_shutdown().unwrap();
+        coordinator.finish_shutdown().unwrap();
+        assert_eq!(coordinator.lifecycle(), CoordinatorLifecycle::Shutdown);
+    }
+
+    #[test]
+    fn late_release_after_shutdown_cannot_change_coordinator_state() {
+        let mut coordinator = WallpaperCoordinator::default();
+        let operation = coordinator
+            .reserve(monitor("native-a"), WallpaperBackend::Static)
+            .unwrap();
+        activate(&mut coordinator, &operation);
+        coordinator.begin_shutdown().unwrap();
+        coordinator.finish_shutdown().unwrap();
+        assert_eq!(coordinator.release(&operation), CoordinatorResult::Obsolete);
+        assert!(coordinator.current(&monitor("native-a")).is_none());
+        assert_eq!(coordinator.lifecycle(), CoordinatorLifecycle::Shutdown);
+    }
+
+    #[test]
+    fn resource_ready_does_not_claim_physical_visibility() {
+        let mut coordinator = WallpaperCoordinator::default();
+        let operation = coordinator
+            .reserve(monitor("native-a"), WallpaperBackend::Animated)
+            .unwrap();
+        activate(&mut coordinator, &operation);
+        // The normal helper represents a backend whose physical effect was
+        // confirmed. Animated media readiness uses the explicit weaker path.
+        let mut unverified = WallpaperCoordinator::default();
+        let animated = unverified
+            .reserve(monitor("native-a"), WallpaperBackend::Animated)
+            .unwrap();
+        unverified.confirm_previous_deactivated(&animated).unwrap();
+        unverified.confirm_activated(&animated).unwrap();
+        assert_eq!(
+            unverified
+                .commit_with_evidence(
+                    &animated,
+                    AssignmentEvidence::ResourceReadyVisibilityUnverified,
+                )
+                .unwrap(),
+            CoordinatorResult::CommittedResourceReadyVisibilityUnverified
+        );
+        assert_eq!(
+            unverified.evidence(&monitor("native-a")),
+            Some(AssignmentEvidence::ResourceReadyVisibilityUnverified)
+        );
+        assert!(!unverified.is_physically_confirmed(&monitor("native-a")));
+        assert!(coordinator.is_physically_confirmed(&monitor("native-a")));
+    }
+
+    #[test]
+    fn previous_deactivation_cannot_be_confirmed_out_of_order() {
+        let mut coordinator = WallpaperCoordinator::default();
+        let operation = coordinator
+            .reserve(monitor("native-a"), WallpaperBackend::Animated)
+            .unwrap();
+        coordinator
+            .confirm_previous_deactivated(&operation)
+            .unwrap();
+        assert_eq!(
+            coordinator.confirm_previous_deactivated(&operation),
+            Err(CoordinatorError::Obsolete)
+        );
+        coordinator.confirm_activated(&operation).unwrap();
+        assert_eq!(
+            coordinator.confirm_previous_deactivated(&operation),
+            Err(CoordinatorError::Obsolete)
+        );
+    }
+
+    #[test]
+    fn animated_failure_after_previous_deactivation_reports_no_backend() {
+        let mut coordinator = WallpaperCoordinator::default();
+        let static_operation = coordinator
+            .reserve(monitor("native-a"), WallpaperBackend::Static)
+            .unwrap();
+        activate(&mut coordinator, &static_operation);
+
+        let animated_operation = coordinator
+            .reserve(monitor("native-a"), WallpaperBackend::Animated)
+            .unwrap();
+        assert_eq!(
+            coordinator.confirm_previous_deactivated(&animated_operation),
+            Ok(CoordinatorResult::PreviousDeactivated)
+        );
+        assert_eq!(
+            coordinator.abort(&animated_operation),
+            CoordinatorResult::AbortedWithoutBackend
+        );
+        assert!(coordinator.current(&monitor("native-a")).is_none());
     }
 
     fn activate(coordinator: &mut WallpaperCoordinator, operation: &super::AssignmentOperation) {

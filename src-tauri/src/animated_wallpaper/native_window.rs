@@ -19,7 +19,7 @@ use std::{
 
 use crate::models::monitor_assignment::MonitorIdentity;
 use crate::models::monitor_assignment::WallpaperBackend;
-use crate::models::wallpaper_coordinator::{self, AssignmentOperation};
+use crate::models::wallpaper_coordinator::{self, AssignmentEvidence, AssignmentOperation};
 use tauri::AppHandle;
 use webview2_com::{
     CoTaskMemPWSTR, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
@@ -1531,7 +1531,10 @@ fn open_physical_surface_internal(
                         .confirm_activated(&assignment)
                         .map_err(|error| error.to_string())?;
                     coordinator
-                        .commit(&assignment)
+                        .commit_with_evidence(
+                            &assignment,
+                            AssignmentEvidence::ResourceReadyVisibilityUnverified,
+                        )
                         .map_err(|error| error.to_string())
                 });
             if let Err(error) = commit_result {
@@ -1542,7 +1545,7 @@ fn open_physical_surface_internal(
                 return Err(error.to_string());
             }
             eprintln!(
-                "[MultiMonitorPOC] RENDERER_CREATED monitor_id={} hwnd=0x{:x} host=0x{:x}",
+                "[MultiMonitorPOC] RENDERER_CREATED monitor_id={} hwnd=0x{:x} host=0x{:x} resource_ready=true visibility=unverified effective=false",
                 monitor_id, hwnd, desktop_host.1
             );
             start_host_watcher();

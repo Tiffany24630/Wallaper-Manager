@@ -10,7 +10,7 @@ use crate::models::monitor_assignment::{
     resolve_monitor_identities, MonitorGeometry, MonitorIdentity, MonitorResolution,
     UiMonitorDescriptor,
 };
-use crate::models::wallpaper_coordinator::{self, AssignmentOperation};
+use crate::models::wallpaper_coordinator::{self, AssignmentEvidence, AssignmentOperation};
 use image::{
     codecs::gif::{GifDecoder, GifEncoder, Repeat},
     AnimationDecoder, Delay, Frame, ImageDecoder, Rgba, RgbaImage,
@@ -195,6 +195,7 @@ struct PrototypeSurfaceRecord {
     lifecycle: AnimatedSurfaceLifecycle,
     activation_id: String,
     assignment: AssignmentOperation,
+    destroyed_confirmed: bool,
 }
 
 fn activation_matches(record: &PrototypeSurfaceRecord, activation_id: &str) -> bool {
@@ -247,6 +248,7 @@ fn register_prototype_surface(
             lifecycle,
             activation_id: activation_id.to_string(),
             assignment,
+            destroyed_confirmed: false,
         },
     );
     Ok(())
@@ -269,8 +271,23 @@ fn finish_prototype_close(label: &str, activation_id: Option<&str>) {
             eprintln!("ANIMATED_SURFACE_CLOSE_IGNORED surface={label} reason=stale_activation");
             return;
         }
+        if record.destroyed_confirmed {
+            eprintln!(
+                "ANIMATED_DESTROYED_IGNORED surface={label} activation={} reason=duplicate_confirmation",
+                record.activation_id
+            );
+            return;
+        }
+        record.destroyed_confirmed = true;
         record.lifecycle.finish_close();
-        Some(record.assignment.clone())
+        let assignment = record.assignment.clone();
+        eprintln!(
+            "ANIMATED_DESTROYED_CONFIRMED surface={label} activation={} monitor={} generation={}",
+            record.activation_id,
+            assignment.assignment.monitor,
+            assignment.assignment.generation.value()
+        );
+        Some(assignment)
     } else {
         None
     };
@@ -1538,7 +1555,10 @@ pub fn report_animated_ready(
                 .confirm_activated(&assignment)
                 .map_err(|error| error.to_string())?;
             coordinator
-                .commit(&assignment)
+                .commit_with_evidence(
+                    &assignment,
+                    AssignmentEvidence::ResourceReadyVisibilityUnverified,
+                )
                 .map_err(|error| error.to_string())
         });
     if let Err(error) = activation_result {
@@ -1551,7 +1571,9 @@ pub fn report_animated_ready(
         }
         return Err(error);
     }
-    eprintln!("ANIMATED_READY surface={surface_id} activation={activation_id} backend=animated");
+    eprintln!(
+        "ANIMATED_READY surface={surface_id} activation={activation_id} backend=animated resource_ready=true visibility=unverified effective=false"
+    );
     Ok(())
 }
 
@@ -1609,10 +1631,14 @@ pub fn report_animated_media_error(
     if let Some(window) = app.get_webview_window(&surface_id) {
         if let Err(error) = window.close() {
             eprintln!("ANIMATED_MEDIA_ERROR_CLOSE_FAILED surface={surface_id} error={error}");
-            finish_prototype_close(&surface_id, Some(&activation_id));
+            eprintln!(
+                "ANIMATED_CLOSE_CONFIRMATION_PENDING surface={surface_id} activation={activation_id} reason=close_request_failed"
+            );
         }
     } else {
-        finish_prototype_close(&surface_id, Some(&activation_id));
+        eprintln!(
+            "ANIMATED_CLOSE_CONFIRMATION_PENDING surface={surface_id} activation={activation_id} reason=window_not_found"
+        );
     }
 
     if decision == FailureDecision::FallbackRequired {
@@ -1621,18 +1647,39 @@ pub fn report_animated_media_error(
     Ok(())
 }
 
-pub fn close_all_animated_prototypes(app: &AppHandle) {
+/// Requests shutdown of every animated surface owned by this process.
+///
+/// Native surfaces join their message threads synchronously. Tauri/WebView2
+/// surfaces are asynchronous: the `Destroyed` event is the only confirmation
+/// that their HWND/WebView2 lifecycle actually finished. The return value is
+/// therefore the number of Tauri surfaces still awaiting that callback.
+pub fn close_all_animated_prototypes(app: &AppHandle) -> usize {
+    let mut pending_destroyed_callbacks = 0;
     #[cfg(target_os = "windows")]
     {
-        let _ = native_window::close();
+        if let Err(error) = native_window::close() {
+            eprintln!("ANIMATED_NATIVE_CLOSE_FAILED error={error}");
+        }
         native_window::close_all_physical_surfaces();
     }
     for (label, window) in app.webview_windows() {
         if label.starts_with("animated-prototype-") {
             begin_explicit_prototype_close(&label);
-            let _ = window.close();
+            match window.close() {
+                Ok(()) => {
+                    pending_destroyed_callbacks += 1;
+                    eprintln!("ANIMATED_CLOSE_REQUESTED surface={label} confirmation=Destroyed");
+                }
+                Err(error) => {
+                    eprintln!("ANIMATED_CLOSE_REQUEST_FAILED surface={label} error={error}")
+                }
+            }
         }
     }
+    if pending_destroyed_callbacks > 0 {
+        eprintln!("ANIMATED_CLOSE_CONFIRMATION_PENDING count={pending_destroyed_callbacks}");
+    }
+    pending_destroyed_callbacks
 }
 
 #[cfg(test)]
@@ -1696,6 +1743,7 @@ mod tests {
             lifecycle: AnimatedSurfaceLifecycle::new(),
             activation_id: "activation-old".into(),
             assignment,
+            destroyed_confirmed: false,
         };
         assert!(activation_matches(&old, "activation-old"));
         assert!(!activation_matches(&old, "activation-new"));
