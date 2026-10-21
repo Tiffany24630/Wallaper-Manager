@@ -5,6 +5,10 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use crate::models::monitor_assignment::{
+    resolve_monitor_identities, MonitorGeometry, MonitorIdentity, MonitorResolution,
+    UiMonitorDescriptor,
+};
 use image::{
     codecs::gif::{GifDecoder, GifEncoder, Repeat},
     AnimationDecoder, Delay, Frame, ImageDecoder, Rgba, RgbaImage,
@@ -194,6 +198,16 @@ fn activation_matches(record: &PrototypeSurfaceRecord, activation_id: &str) -> b
     record.activation_id == activation_id
 }
 
+fn prototype_surface_label(monitor_id: &MonitorIdentity) -> String {
+    let encoded = monitor_id
+        .as_str()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("animated-prototype-{encoded}")
+}
+
 static PROTOTYPE_SURFACES: OnceLock<Mutex<BTreeMap<String, PrototypeSurfaceRecord>>> =
     OnceLock::new();
 
@@ -252,7 +266,7 @@ fn finish_prototype_close(label: &str, activation_id: Option<&str>) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MonitorBounds {
+pub(crate) struct MonitorBounds {
     x: i32,
     y: i32,
     width: u32,
@@ -333,6 +347,160 @@ fn bounds_from_geometry(x: i32, y: i32, width: u32, height: u32) -> Result<Monit
     .validate()
     .map_err(|error| format!("Geometría de monitor inválida: {error}"))?;
     Ok(bounds)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn resolve_monitor_for_identity(
+    app: &AppHandle,
+    monitor_id: &MonitorIdentity,
+) -> Result<(MonitorBounds, u32), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("No se encontrÃ³ la ventana principal de Lumina")?;
+    let monitors = window
+        .available_monitors()
+        .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
+    let ui = monitors
+        .iter()
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            Ok(UiMonitorDescriptor {
+                name: monitor.name().cloned(),
+                geometry: MonitorGeometry::new(position.x, position.y, size.width, size.height)
+                    .map_err(str::to_string)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let native = crate::utils::windows_wallpaper::native_monitor_descriptors()
+        .map_err(|error| error.to_string())?;
+    let resolutions = resolve_monitor_identities(&ui, &native).map_err(str::to_string)?;
+    let Some((monitor, resolution)) = monitors.iter().zip(resolutions).find(|(_, result)| {
+        matches!(result, MonitorResolution::Resolved(identity) if identity == monitor_id)
+    }) else {
+        if native.iter().any(|descriptor| descriptor.device_path == monitor_id.as_str()) {
+            return Err("La identidad del monitor existe, pero no pudo correlacionarse inequÃ­vocamente con Tauri".into());
+        }
+        return Err("El monitor solicitado ya no estÃ¡ disponible".into());
+    };
+    let position = monitor.position();
+    let size = monitor.size();
+    let bounds = bounds_from_geometry(position.x, position.y, size.width, size.height)?;
+    let dpi = (monitor.scale_factor() * 96.0).round() as u32;
+    if dpi == 0 {
+        return Err("El monitor no tiene un DPI vÃ¡lido".into());
+    }
+    let _ = resolution;
+    Ok((bounds, dpi))
+}
+
+#[cfg(target_os = "windows")]
+fn monitor_position_for_identity(
+    monitors: &[tauri::Monitor],
+    monitor_id: &MonitorIdentity,
+) -> Result<usize, String> {
+    let ui = monitors
+        .iter()
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            Ok(UiMonitorDescriptor {
+                name: monitor.name().cloned(),
+                geometry: MonitorGeometry::new(position.x, position.y, size.width, size.height)
+                    .map_err(str::to_string)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let native = crate::utils::windows_wallpaper::native_monitor_descriptors()
+        .map_err(|error| error.to_string())?;
+    let resolutions = resolve_monitor_identities(&ui, &native).map_err(str::to_string)?;
+    resolutions
+        .iter()
+        .position(|resolution| matches!(resolution, MonitorResolution::Resolved(identity) if identity == monitor_id))
+        .ok_or_else(|| "El monitor solicitado no estÃ¡ disponible o es ambiguo".into())
+}
+
+#[cfg(target_os = "windows")]
+fn resolved_monitor_identities(
+    monitors: &[tauri::Monitor],
+) -> Result<Vec<MonitorIdentity>, String> {
+    let ui = monitors
+        .iter()
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            Ok(UiMonitorDescriptor {
+                name: monitor.name().cloned(),
+                geometry: MonitorGeometry::new(position.x, position.y, size.width, size.height)
+                    .map_err(str::to_string)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let native = crate::utils::windows_wallpaper::native_monitor_descriptors()
+        .map_err(|error| error.to_string())?;
+    resolve_monitor_identities(&ui, &native)
+        .map_err(str::to_string)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, resolution)| match resolution {
+            MonitorResolution::Resolved(identity) => Ok(identity),
+            MonitorResolution::Ambiguous => {
+                Err(format!("La identidad del monitor {index} es ambigua"))
+            }
+            MonitorResolution::Unavailable => Err(format!(
+                "La identidad nativa del monitor {index} no estÃ¡ disponible"
+            )),
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+pub fn primary_monitor_identity(app: &AppHandle) -> Result<String, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("No se encontrÃ³ la ventana principal de Lumina")?;
+    let primary = window
+        .primary_monitor()
+        .map_err(|error| format!("No se pudo obtener el monitor principal: {error}"))?
+        .ok_or("Windows no expuso un monitor principal")?;
+    let position = primary.position();
+    let size = primary.size();
+    let geometry = MonitorGeometry::new(position.x, position.y, size.width, size.height)
+        .map_err(str::to_string)?;
+    let monitors = window
+        .available_monitors()
+        .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
+    let ui = monitors
+        .iter()
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            Ok(UiMonitorDescriptor {
+                name: monitor.name().cloned(),
+                geometry: MonitorGeometry::new(position.x, position.y, size.width, size.height)
+                    .map_err(str::to_string)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let native = crate::utils::windows_wallpaper::native_monitor_descriptors()
+        .map_err(|error| error.to_string())?;
+    let resolutions = resolve_monitor_identities(&ui, &native).map_err(str::to_string)?;
+    let index = ui
+        .iter()
+        .position(|entry| entry.geometry == geometry)
+        .ok_or("El monitor principal no aparece en la enumeraciÃ³n actual")?;
+    match &resolutions[index] {
+        MonitorResolution::Resolved(identity) => Ok(identity.as_str().to_string()),
+        MonitorResolution::Ambiguous => Err("La identidad del monitor principal es ambigua".into()),
+        MonitorResolution::Unavailable => {
+            Err("La identidad del monitor principal no estÃ¡ disponible".into())
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn primary_monitor_identity(_app: &AppHandle) -> Result<String, String> {
+    Err("La identidad nativa de monitores solo estÃ¡ disponible en Windows".into())
 }
 
 fn validate_media_source(path: &Path) -> Result<&'static str, String> {
@@ -441,10 +609,11 @@ fn create_diagnostic_gif(path: &Path) -> Result<(), String> {
 #[tauri::command]
 pub async fn open_animated_prototype(
     app: AppHandle,
-    monitor_index: usize,
+    monitor_id: String,
     media_path: String,
     diagnostic: bool,
 ) -> Result<(), String> {
+    let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
     let source = PathBuf::from(media_path);
     let extension = validate_media_source(&source)?;
     let monitors = app
@@ -453,7 +622,7 @@ pub async fn open_animated_prototype(
         .available_monitors()
         .map_err(|e| format!("No se pudieron enumerar los monitores: {e}"))?;
     let monitor = monitors
-        .get(monitor_index)
+        .get(monitor_position_for_identity(&monitors, &monitor_identity)?)
         .ok_or("El monitor seleccionado ya no está disponible")?;
     let position = monitor.position();
     let size = monitor.size();
@@ -469,7 +638,7 @@ pub async fn open_animated_prototype(
             resource.estimated_decoded_frame_bytes
         );
     }
-    let label = format!("animated-prototype-{monitor_index}");
+    let label = prototype_surface_label(&monitor_identity);
     let activation_id = Uuid::new_v4().to_string();
 
     if app.get_webview_window(&label).is_some() {
@@ -636,17 +805,18 @@ pub fn validate_animated_desktop_host() -> Result<String, String> {
 #[tauri::command]
 pub fn open_native_animated_prototype_test(
     app: AppHandle,
-    monitor_index: usize,
+    monitor_id: String,
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
         let monitors = app
             .get_webview_window("main")
             .ok_or("No se encontró la ventana principal de Lumina")?
             .available_monitors()
             .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
         let monitor = monitors
-            .get(monitor_index)
+            .get(monitor_position_for_identity(&monitors, &monitor_identity)?)
             .ok_or("El monitor seleccionado ya no está disponible")?;
         let position = monitor.position();
         let size = monitor.size();
@@ -655,22 +825,23 @@ pub fn open_native_animated_prototype_test(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, monitor_index);
+        let _ = (app, monitor_id);
         Err("El renderer HWND nativo solo está disponible en Windows".into())
     }
 }
 
 #[tauri::command]
-pub fn open_animated_desktop_poc(app: AppHandle, monitor_index: usize) -> Result<(), String> {
+pub fn open_animated_desktop_poc(app: AppHandle, monitor_id: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
         let monitors = app
             .get_webview_window("main")
             .ok_or("No se encontró la ventana principal de Lumina")?
             .available_monitors()
             .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
         let monitor = monitors
-            .get(monitor_index)
+            .get(monitor_position_for_identity(&monitors, &monitor_identity)?)
             .ok_or("El monitor seleccionado ya no está disponible")?;
         let position = monitor.position();
         let size = monitor.size();
@@ -679,7 +850,7 @@ pub fn open_animated_desktop_poc(app: AppHandle, monitor_index: usize) -> Result
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, monitor_index);
+        let _ = (app, monitor_id);
         Err("El POC de escritorio solo está disponible en Windows".into())
     }
 }
@@ -687,17 +858,18 @@ pub fn open_animated_desktop_poc(app: AppHandle, monitor_index: usize) -> Result
 #[tauri::command]
 pub fn open_animated_desktop_recovery_poc(
     app: AppHandle,
-    monitor_index: usize,
+    monitor_id: String,
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
         let monitors = app
             .get_webview_window("main")
             .ok_or("No se encontró la ventana principal de Lumina")?
             .available_monitors()
             .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
         let monitor = monitors
-            .get(monitor_index)
+            .get(monitor_position_for_identity(&monitors, &monitor_identity)?)
             .ok_or("El monitor seleccionado ya no está disponible")?;
         let position = monitor.position();
         let size = monitor.size();
@@ -706,21 +878,22 @@ pub fn open_animated_desktop_recovery_poc(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, monitor_index);
+        let _ = (app, monitor_id);
         Err("El POC de recuperación solo está disponible en Windows".into())
     }
 }
 
 #[cfg(target_os = "windows")]
-pub fn open_animated_lifecycle_poc(app: AppHandle, monitor_index: usize) -> Result<(), String> {
+pub fn open_animated_lifecycle_poc(app: AppHandle, monitor_id: String) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or("No se encontró la ventana principal de Lumina")?;
-    let monitor = window
+    let monitor_identity = MonitorIdentity::new(monitor_id).map_err(str::to_string)?;
+    let monitors = window
         .available_monitors()
-        .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?
-        .into_iter()
-        .nth(monitor_index)
+        .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
+    let monitor = monitors
+        .get(monitor_position_for_identity(&monitors, &monitor_identity)?)
         .ok_or("No existe el monitor solicitado")?;
     let position = monitor.position();
     let size = monitor.size();
@@ -733,7 +906,7 @@ pub fn open_animated_lifecycle_poc(app: AppHandle, monitor_index: usize) -> Resu
             experiment.candidate_count
         ));
     }
-    let monitor_id = "lifecycle-primary".to_string();
+    let monitor_id = monitor_identity;
     native_window::open_physical_surface(&app, monitor_id.clone(), bounds, dpi, host)?;
     eprintln!(
         "[LifecyclePOC] HOST_VALIDATED monitor_id={} bounds=({},{} {}x{}) dpi={} candidate_count={}",
@@ -841,9 +1014,7 @@ pub fn open_animated_multimonitor_poc(app: AppHandle) -> Result<(), String> {
         let monitors = window
             .available_monitors()
             .map_err(|error| format!("No se pudieron enumerar los monitores: {error}"))?;
-        let native_ids = crate::utils::windows_wallpaper::available_monitor_ids()
-            .ok()
-            .filter(|ids| ids.len() == monitors.len());
+        let resolved_ids = resolved_monitor_identities(&monitors)?;
         let dpi = window
             .hwnd()
             .ok()
@@ -863,16 +1034,10 @@ pub fn open_animated_multimonitor_poc(app: AppHandle) -> Result<(), String> {
         for (index, monitor) in monitors.iter().enumerate() {
             let position = monitor.position();
             let size = monitor.size();
-            let id = native_ids
-                .as_ref()
-                .and_then(|ids| ids.get(index).cloned())
-                .or_else(|| monitor.name().cloned().filter(|name| !name.is_empty()))
-                .unwrap_or_else(|| {
-                    format!(
-                        "display-{}-{}-{}-{}",
-                        position.x, position.y, size.width, size.height
-                    )
-                });
+            let id = resolved_ids
+                .get(index)
+                .cloned()
+                .ok_or("La identidad nativa del monitor no estÃ¡ disponible")?;
             let spec = multimonitor::MonitorSpec {
                 id,
                 bounds: multimonitor::LogicalBounds {
@@ -1029,18 +1194,13 @@ pub fn open_animated_host_watcher_poc(app: AppHandle) -> Result<(), String> {
             "[HostMonitorPOC] MONITOR_READY id=watcher-primary bounds=({},{} {}x{}) dpi={} candidate_count={}",
             bounds.x, bounds.y, bounds.width, bounds.height, dpi, experiment.candidate_count
         );
-        native_window::open_physical_surface(
-            &app,
-            "watcher-primary".to_string(),
-            bounds,
-            dpi,
-            host,
-        )?;
+        native_window::open_physical_surface(&app, "watcher-primary".into(), bounds, dpi, host)?;
         if std::env::var_os("LUMINA_ANIMATED_HOST_WATCHER_AUTOCLOSE").is_some() {
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 eprintln!("[HostMonitorPOC] EXPLICIT_CLOSE_COMMAND");
-                if let Err(error) = native_window::close_physical_surface("watcher-primary") {
+                let monitor_id: MonitorIdentity = "watcher-primary".into();
+                if let Err(error) = native_window::close_physical_surface(&monitor_id) {
                     eprintln!("[HostMonitorPOC] EXPLICIT_CLOSE_FAILED error={error}");
                 }
             });
@@ -1079,18 +1239,15 @@ pub fn open_animated_multimonitor_physical_poc(app: AppHandle) -> Result<(), Str
             return Ok(());
         }
 
-        let native_ids = crate::utils::windows_wallpaper::available_monitor_ids()
-            .ok()
-            .filter(|ids| ids.len() == monitors.len());
-        let mut created: Vec<String> = Vec::new();
+        let resolved_ids = resolved_monitor_identities(&monitors)?;
+        let mut created: Vec<MonitorIdentity> = Vec::new();
         for (index, monitor) in monitors.iter().take(2).enumerate() {
             let position = monitor.position();
             let size = monitor.size();
-            let id = native_ids
-                .as_ref()
-                .and_then(|ids| ids.get(index).cloned())
-                .or_else(|| monitor.name().cloned().filter(|name| !name.is_empty()))
-                .unwrap_or_else(|| format!("display-{}-{}-{}", position.x, position.y, size.width));
+            let id = resolved_ids
+                .get(index)
+                .cloned()
+                .ok_or("La identidad nativa del monitor no estÃ¡ disponible")?;
             let bounds = bounds_from_geometry(position.x, position.y, size.width, size.height)?;
             let dpi = (monitor.scale_factor() * 96.0).round() as u32;
             eprintln!(
@@ -1235,6 +1392,7 @@ pub fn close_native_animated_prototype() -> Result<(), String> {
 pub fn close_animated_multimonitor_physical_poc(monitor_id: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        let monitor_id = MonitorIdentity::new(monitor_id).map_err(str::to_string)?;
         return native_window::close_physical_surface(&monitor_id);
     }
     #[cfg(not(target_os = "windows"))]
@@ -1247,14 +1405,14 @@ pub fn close_animated_multimonitor_physical_poc(monitor_id: String) -> Result<()
 #[tauri::command]
 pub async fn open_animated_prototype_test(
     app: AppHandle,
-    monitor_index: usize,
+    monitor_id: String,
 ) -> Result<(), String> {
     let path = prototype_directory(&app)?.join(format!("diagnostic-{}.gif", Uuid::new_v4()));
     create_diagnostic_gif(&path)?;
     let diagnostic = std::env::var_os("LUMINA_ANIMATED_SMOKE_WALLPAPER").is_none();
     let result = open_animated_prototype(
         app,
-        monitor_index,
+        monitor_id,
         path.to_string_lossy().into_owned(),
         diagnostic,
     )
@@ -1264,8 +1422,9 @@ pub async fn open_animated_prototype_test(
 }
 
 #[tauri::command]
-pub fn close_animated_prototype(app: AppHandle, monitor_index: usize) -> Result<(), String> {
-    let label = format!("animated-prototype-{monitor_index}");
+pub fn close_animated_prototype(app: AppHandle, monitor_id: String) -> Result<(), String> {
+    let monitor_identity = MonitorIdentity::new(monitor_id).map_err(str::to_string)?;
+    let label = prototype_surface_label(&monitor_identity);
     if let Some(window) = app.get_webview_window(&label) {
         begin_explicit_prototype_close(&label);
         window
@@ -1359,10 +1518,11 @@ pub fn close_all_animated_prototypes(app: &AppHandle) {
 mod tests {
     use super::{
         activation_matches, bounds_from_geometry, create_diagnostic_gif, encode_query_component,
-        resource_limit_reason, smoke_variant_options, validate_animated_gif, validate_media_source,
-        AnimatedSurfaceLifecycle, PrototypeSurfaceRecord, MAX_ANIMATED_DIMENSION,
-        MAX_ANIMATED_FILE_BYTES,
+        prototype_surface_label, resource_limit_reason, smoke_variant_options,
+        validate_animated_gif, validate_media_source, AnimatedSurfaceLifecycle,
+        PrototypeSurfaceRecord, MAX_ANIMATED_DIMENSION, MAX_ANIMATED_FILE_BYTES,
     };
+    use crate::models::monitor_assignment::MonitorIdentity;
     use image::GenericImageView;
     use uuid::Uuid;
 
@@ -1394,11 +1554,12 @@ mod tests {
     }
 
     #[test]
-    fn prototype_labels_are_isolated_by_monitor_index() {
-        assert_eq!(format!("animated-prototype-{}", 0), "animated-prototype-0");
+    fn prototype_labels_are_isolated_by_monitor_identity() {
+        let first: MonitorIdentity = "\\\\?\\DISPLAY-A".into();
+        let second: MonitorIdentity = "\\\\?\\DISPLAY-B".into();
         assert_ne!(
-            format!("animated-prototype-{}", 0),
-            format!("animated-prototype-{}", 1)
+            prototype_surface_label(&first),
+            prototype_surface_label(&second)
         );
     }
 

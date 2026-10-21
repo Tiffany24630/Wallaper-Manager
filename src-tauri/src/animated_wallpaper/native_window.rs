@@ -17,6 +17,7 @@ use std::{
     time::Duration,
 };
 
+use crate::models::monitor_assignment::MonitorIdentity;
 use tauri::AppHandle;
 use webview2_com::{
     CoTaskMemPWSTR, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
@@ -78,21 +79,23 @@ fn is_native_media_error_payload(json: &str) -> bool {
 
 static NATIVE_SURFACE: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
 static NATIVE_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
-static MULTI_SURFACES: OnceLock<Mutex<BTreeMap<String, isize>>> = OnceLock::new();
-static MULTI_THREADS: OnceLock<Mutex<BTreeMap<String, thread::JoinHandle<()>>>> = OnceLock::new();
+static MULTI_SURFACES: OnceLock<Mutex<BTreeMap<MonitorIdentity, isize>>> = OnceLock::new();
+static MULTI_THREADS: OnceLock<Mutex<BTreeMap<MonitorIdentity, thread::JoinHandle<()>>>> =
+    OnceLock::new();
 static REGISTERED_DESKTOP_HOST: OnceLock<Mutex<Option<desktop_host::RawDesktopHost>>> =
     OnceLock::new();
-static DESIRED_SURFACES: OnceLock<Mutex<BTreeMap<String, DesiredSurface>>> = OnceLock::new();
+static DESIRED_SURFACES: OnceLock<Mutex<BTreeMap<MonitorIdentity, DesiredSurface>>> =
+    OnceLock::new();
 static HOST_WATCHER: OnceLock<Mutex<Option<HostWatcher>>> = OnceLock::new();
 static ACTIVE_MULTI_TEMPORARIES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 static DESKTOP_LIFECYCLE: OnceLock<Mutex<LifecycleRuntime>> = OnceLock::new();
-static CLOSING_SURFACES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+static CLOSING_SURFACES: OnceLock<Mutex<BTreeSet<MonitorIdentity>>> = OnceLock::new();
 static NATIVE_SURFACE_CLOSING: OnceLock<AtomicBool> = OnceLock::new();
 
 #[derive(Clone)]
 struct DesiredSurface {
     app: AppHandle,
-    monitor_id: String,
+    monitor_id: MonitorIdentity,
     bounds: MonitorBounds,
     dpi: u32,
 }
@@ -197,11 +200,11 @@ fn native_thread() -> &'static Mutex<Option<thread::JoinHandle<()>>> {
     NATIVE_THREAD.get_or_init(|| Mutex::new(None))
 }
 
-fn multi_surfaces() -> &'static Mutex<BTreeMap<String, isize>> {
+fn multi_surfaces() -> &'static Mutex<BTreeMap<MonitorIdentity, isize>> {
     MULTI_SURFACES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn multi_threads() -> &'static Mutex<BTreeMap<String, thread::JoinHandle<()>>> {
+fn multi_threads() -> &'static Mutex<BTreeMap<MonitorIdentity, thread::JoinHandle<()>>> {
     MULTI_THREADS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -215,7 +218,7 @@ fn register_desktop_host(host: desktop_host::RawDesktopHost) {
         .expect("registered host mutex poisoned") = Some(host);
 }
 
-fn desired_surfaces() -> &'static Mutex<BTreeMap<String, DesiredSurface>> {
+fn desired_surfaces() -> &'static Mutex<BTreeMap<MonitorIdentity, DesiredSurface>> {
     DESIRED_SURFACES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -227,32 +230,32 @@ fn active_multi_temporaries() -> &'static Mutex<BTreeSet<PathBuf>> {
     ACTIVE_MULTI_TEMPORARIES.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
-fn closing_surfaces() -> &'static Mutex<BTreeSet<String>> {
+fn closing_surfaces() -> &'static Mutex<BTreeSet<MonitorIdentity>> {
     CLOSING_SURFACES.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
-fn mark_surface_closing(monitor_id: &str) {
+fn mark_surface_closing(monitor_id: &MonitorIdentity) {
     closing_surfaces()
         .lock()
         .expect("closing surfaces mutex poisoned")
-        .insert(monitor_id.to_string());
+        .insert(monitor_id.clone());
 }
 
-fn clear_surface_closing(monitor_id: &str) {
+fn clear_surface_closing(monitor_id: &MonitorIdentity) {
     closing_surfaces()
         .lock()
         .expect("closing surfaces mutex poisoned")
         .remove(monitor_id);
 }
 
-fn is_surface_closing(monitor_id: &str) -> bool {
+fn is_surface_closing(monitor_id: &MonitorIdentity) -> bool {
     closing_surfaces()
         .lock()
         .expect("closing surfaces mutex poisoned")
         .contains(monitor_id)
 }
 
-fn is_current_surface_window(monitor_id: Option<&str>, hwnd: HWND) -> bool {
+fn is_current_surface_window(monitor_id: Option<&MonitorIdentity>, hwnd: HWND) -> bool {
     if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
         return false;
     }
@@ -269,7 +272,7 @@ fn native_surface_closing() -> &'static AtomicBool {
     NATIVE_SURFACE_CLOSING.get_or_init(|| AtomicBool::new(false))
 }
 
-fn update_desired_surface_geometry(monitor_id: &str, bounds: MonitorBounds, dpi: u32) {
+fn update_desired_surface_geometry(monitor_id: &MonitorIdentity, bounds: MonitorBounds, dpi: u32) {
     if let Some(surface) = desired_surfaces()
         .lock()
         .expect("desired surfaces mutex poisoned")
@@ -333,7 +336,7 @@ fn apply_native_geometry_change(
     hwnd: HWND,
     current_bounds: &mut MonitorBounds,
     current_dpi: &mut u32,
-    surface_key: Option<&str>,
+    surface_key: Option<&MonitorIdentity>,
     attached_to_desktop: bool,
     controller: &ICoreWebView2Controller,
 ) -> Result<(), String> {
@@ -1028,7 +1031,7 @@ fn run_native_surface(
     media_path: std::path::PathBuf,
     variant: ZOrderVariant,
     desktop_host_target: Option<desktop_host::RawDesktopHost>,
-    surface_key: Option<String>,
+    surface_key: Option<MonitorIdentity>,
     ready: mpsc::Sender<Result<isize, String>>,
 ) {
     let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
@@ -1082,9 +1085,9 @@ fn run_native_surface(
             false
         };
         let surface_id = surface_key
-            .as_deref()
-            .unwrap_or("native-single")
-            .to_string();
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "native-single".to_string());
         let controller = match create_webview(hwnd, bounds, &media_path, &surface_id) {
             Ok(controller) => {
                 surface_lifecycle
@@ -1155,9 +1158,9 @@ fn run_native_surface(
                 break;
             }
             if message.message == WM_DISPLAYCHANGE || message.message == WM_DPICHANGED {
-                if surface_key.as_deref().is_some_and(is_surface_closing)
+                if surface_key.as_ref().is_some_and(is_surface_closing)
                     || (surface_key.is_none() && native_surface_closing().load(Ordering::Acquire))
-                    || !is_current_surface_window(surface_key.as_deref(), hwnd)
+                    || !is_current_surface_window(surface_key.as_ref(), hwnd)
                 {
                     eprintln!(
                         "[GeometryNative] GEOMETRY_IGNORED reason=closing_or_stale_surface hwnd={:?} surface_id={:?}",
@@ -1169,7 +1172,7 @@ fn run_native_surface(
                     hwnd,
                     &mut applied_bounds,
                     &mut applied_dpi,
-                    surface_key.as_deref(),
+                    surface_key.as_ref(),
                     attached_to_desktop,
                     &controller,
                 ) {
@@ -1362,7 +1365,7 @@ pub fn open_desktop_poc(app: &AppHandle, monitor: MonitorBounds) -> Result<(), S
 
 pub fn open_physical_surface(
     app: &AppHandle,
-    monitor_id: String,
+    monitor_id: MonitorIdentity,
     monitor: MonitorBounds,
     dpi: u32,
     desktop_host: desktop_host::RawDesktopHost,
@@ -1372,7 +1375,7 @@ pub fn open_physical_surface(
 
 fn open_physical_surface_internal(
     app: &AppHandle,
-    monitor_id: String,
+    monitor_id: MonitorIdentity,
     monitor: MonitorBounds,
     dpi: u32,
     desktop_host: desktop_host::RawDesktopHost,
@@ -1686,11 +1689,22 @@ fn recover_desired_surfaces() -> bool {
             );
             continue;
         };
+        let geometry = super::resolve_monitor_for_identity(&surface.app, &surface.monitor_id);
+        let (bounds, dpi) = match geometry {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "[HostMonitor] SURFACE_RECOVERY_SKIPPED monitor_id={} reason=monitor_unavailable error={error}",
+                    surface.monitor_id
+                );
+                continue;
+            }
+        };
         match open_physical_surface_internal(
             &surface.app,
             surface.monitor_id.clone(),
-            surface.bounds,
-            surface.dpi,
+            bounds,
+            dpi,
             host,
             false,
         ) {
@@ -1714,8 +1728,9 @@ fn recover_desired_surfaces() -> bool {
     recovered == desired_count
 }
 
-fn sanitize_monitor_id(value: &str) -> String {
+fn sanitize_monitor_id(value: &MonitorIdentity) -> String {
     value
+        .as_str()
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
@@ -1727,7 +1742,7 @@ fn sanitize_monitor_id(value: &str) -> String {
         .collect()
 }
 
-pub fn close_physical_surface(monitor_id: &str) -> Result<(), String> {
+pub fn close_physical_surface(monitor_id: &MonitorIdentity) -> Result<(), String> {
     desired_surfaces()
         .lock()
         .expect("desired surfaces mutex poisoned")
@@ -1774,7 +1789,7 @@ pub fn close_physical_surface(monitor_id: &str) -> Result<(), String> {
     result
 }
 
-fn stop_physical_surface(monitor_id: &str) -> Result<(), String> {
+fn stop_physical_surface(monitor_id: &MonitorIdentity) -> Result<(), String> {
     mark_surface_closing(monitor_id);
     let hwnd = multi_surfaces()
         .lock()
@@ -1812,7 +1827,7 @@ pub fn close_all_physical_surfaces() {
         .expect("desired surfaces mutex poisoned")
         .clear();
     stop_host_watcher();
-    let ids: Vec<String> = multi_surfaces()
+    let ids: Vec<MonitorIdentity> = multi_surfaces()
         .lock()
         .expect("multi surface mutex poisoned")
         .keys()

@@ -100,9 +100,17 @@ fn main() {
             if std::env::var_os("LUMINA_ANIMATED_SMOKE_TEST").is_some() {
                 let smoke_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(error) =
-                        animated_wallpaper::open_animated_prototype_test(smoke_handle, 0).await
-                    {
+                    let result = match animated_wallpaper::primary_monitor_identity(&smoke_handle) {
+                        Ok(monitor_id) => {
+                            animated_wallpaper::open_animated_prototype_test(
+                                smoke_handle,
+                                monitor_id,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
                         eprintln!("Animated WebView2 smoke test failed: {error}");
                     }
                 });
@@ -110,43 +118,66 @@ fn main() {
             if std::env::var_os("LUMINA_ANIMATED_MEDIA_ERROR_TEST").is_some() {
                 let media_error_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(error) =
-                        animated_wallpaper::open_animated_prototype_test(media_error_handle, 0)
-                            .await
-                    {
+                    let result =
+                        match animated_wallpaper::primary_monitor_identity(&media_error_handle) {
+                            Ok(monitor_id) => {
+                                animated_wallpaper::open_animated_prototype_test(
+                                    media_error_handle,
+                                    monitor_id,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                    if let Err(error) = result {
                         eprintln!("Animated media error test failed: {error}");
                     }
                 });
             }
             if std::env::var_os("LUMINA_ANIMATED_NATIVE_MEDIA_ERROR_TEST").is_some() {
-                match animated_wallpaper::open_animated_desktop_poc(app.handle().clone(), 0) {
+                let monitor_id =
+                    animated_wallpaper::primary_monitor_identity(app.handle()).unwrap_or_default();
+                match animated_wallpaper::open_animated_desktop_poc(
+                    app.handle().clone(),
+                    monitor_id,
+                ) {
                     Ok(()) => eprintln!("Native animated media error test started"),
                     Err(error) => eprintln!("Native animated media error test failed: {error}"),
                 }
             } else if std::env::var_os("LUMINA_NATIVE_ANIMATED_TEST").is_some() {
                 match animated_wallpaper::open_native_animated_prototype_test(
                     app.handle().clone(),
-                    0,
+                    animated_wallpaper::primary_monitor_identity(app.handle()).unwrap_or_default(),
                 ) {
                     Ok(()) => eprintln!("Native animated WebView2 smoke test started"),
                     Err(error) => eprintln!("Native animated WebView2 smoke test failed: {error}"),
                 }
             }
             if std::env::var_os("LUMINA_ANIMATED_DESKTOP_POC").is_some() {
-                match animated_wallpaper::open_animated_desktop_poc(app.handle().clone(), 0) {
+                let monitor_id =
+                    animated_wallpaper::primary_monitor_identity(app.handle()).unwrap_or_default();
+                match animated_wallpaper::open_animated_desktop_poc(
+                    app.handle().clone(),
+                    monitor_id,
+                ) {
                     Ok(()) => eprintln!("Animated desktop POC started"),
                     Err(error) => eprintln!("Animated desktop POC refused or failed: {error}"),
                 }
             } else if std::env::var_os("LUMINA_ANIMATED_RECOVERY_TEST").is_some() {
                 match animated_wallpaper::open_animated_desktop_recovery_poc(
                     app.handle().clone(),
-                    0,
+                    animated_wallpaper::primary_monitor_identity(app.handle()).unwrap_or_default(),
                 ) {
                     Ok(()) => eprintln!("Animated desktop recovery POC started"),
                     Err(error) => eprintln!("Animated desktop recovery POC failed: {error}"),
                 }
             } else if std::env::var_os("LUMINA_ANIMATED_LIFECYCLE_TEST").is_some() {
-                match animated_wallpaper::open_animated_lifecycle_poc(app.handle().clone(), 0) {
+                let monitor_id =
+                    animated_wallpaper::primary_monitor_identity(app.handle()).unwrap_or_default();
+                match animated_wallpaper::open_animated_lifecycle_poc(
+                    app.handle().clone(),
+                    monitor_id,
+                ) {
                     Ok(()) => eprintln!("Animated lifecycle POC started"),
                     Err(error) => eprintln!("Animated lifecycle POC failed: {error}"),
                 }

@@ -2,8 +2,11 @@ use crate::{
     db::get_connection,
     dynamic::DynamicScheduler,
     models::monitor::MonitorInfo,
+    models::monitor_assignment::{
+        resolve_monitor_identities, MonitorGeometry, MonitorResolution, UiMonitorDescriptor,
+    },
     models::monitor_playlist::MonitorPlaylist,
-    utils::windows_wallpaper::{available_monitor_ids, set_monitor_wallpaper},
+    utils::windows_wallpaper::{native_monitor_descriptors, set_monitor_wallpaper},
 };
 use tauri::Manager;
 use tauri::State;
@@ -13,25 +16,47 @@ fn current_monitor_ids(app: &tauri::AppHandle) -> Result<Vec<String>, String> {
         .get_webview_window("main")
         .ok_or("No se encontró la ventana principal")?;
     let monitors = window.available_monitors().map_err(|e| e.to_string())?;
-    let native_ids = available_monitor_ids()
-        .ok()
-        .filter(|ids| ids.len() == monitors.len());
-    Ok(monitors
-        .into_iter()
-        .enumerate()
-        .map(|(index, monitor)| {
-            native_ids
-                .as_ref()
-                .and_then(|ids| ids.get(index).cloned())
-                .or_else(|| {
-                    monitor
-                        .name()
-                        .cloned()
-                        .filter(|name| !name.trim().is_empty())
-                })
-                .unwrap_or_else(|| format!("monitor-{index}"))
+    resolve_monitor_ids(&monitors)
+}
+
+fn resolve_monitor_ids(monitors: &[tauri::Monitor]) -> Result<Vec<String>, String> {
+    let ui = monitors
+        .iter()
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            Ok(UiMonitorDescriptor {
+                name: monitor.name().cloned(),
+                geometry: MonitorGeometry::new(position.x, position.y, size.width, size.height)
+                    .map_err(str::to_string)?,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>, String>>()?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let native = native_monitor_descriptors().map_err(|error| error.to_string())?;
+        let resolutions = resolve_monitor_identities(&ui, &native).map_err(str::to_string)?;
+        return resolutions
+            .into_iter()
+            .enumerate()
+            .map(|(index, resolution)| match resolution {
+                MonitorResolution::Resolved(identity) => Ok(identity.as_str().to_string()),
+                MonitorResolution::Ambiguous => {
+                    Err(format!("La identidad del monitor {index} es ambigua"))
+                }
+                MonitorResolution::Unavailable => Err(format!(
+                    "La identidad nativa del monitor {index} no está disponible"
+                )),
+            })
+            .collect();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ui;
+        Err("La resolución nativa de monitores solo está disponible en Windows".into())
+    }
 }
 
 fn restorable_assignments(
@@ -80,25 +105,7 @@ pub fn get_monitors(app: tauri::AppHandle) -> Result<Vec<MonitorInfo>, String> {
         .ok_or("No se encontró la ventana principal")?;
     let available = window.available_monitors().map_err(|e| e.to_string())?;
     let primary = window.primary_monitor().map_err(|e| e.to_string())?;
-    let native_ids = available_monitor_ids()
-        .ok()
-        .filter(|ids| ids.len() == available.len());
-    let ids: Vec<String> = available
-        .iter()
-        .enumerate()
-        .map(|(index, monitor)| {
-            native_ids
-                .as_ref()
-                .and_then(|ids| ids.get(index).cloned())
-                .or_else(|| {
-                    monitor
-                        .name()
-                        .cloned()
-                        .filter(|name| !name.trim().is_empty())
-                })
-                .unwrap_or_else(|| format!("monitor-{index}"))
-        })
-        .collect();
+    let ids = resolve_monitor_ids(&available)?;
     Ok(available
         .into_iter()
         .enumerate()

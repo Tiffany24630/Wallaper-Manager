@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::models::monitor_assignment::MonitorIdentity;
+
 use serde::Serialize;
 
 pub(crate) const MAX_ACTIVE_ANIMATED_SURFACES: usize = 2;
@@ -91,7 +93,7 @@ impl GeometrySnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct MonitorSpec {
-    pub(crate) id: String,
+    pub(crate) id: MonitorIdentity,
     pub(crate) bounds: LogicalBounds,
     pub(crate) dpi: u32,
     pub(crate) primary: bool,
@@ -121,7 +123,7 @@ pub(crate) enum HostReaction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MonitorSurface {
-    pub(crate) monitor_id: String,
+    pub(crate) monitor_id: MonitorIdentity,
     pub(crate) host_id: String,
     pub(crate) host_generation: u64,
     pub(crate) renderer_id: String,
@@ -133,7 +135,7 @@ pub(crate) struct MonitorSurface {
 
 #[derive(Debug)]
 pub(crate) struct MonitorCoordinator {
-    surfaces: BTreeMap<String, MonitorSurface>,
+    surfaces: BTreeMap<MonitorIdentity, MonitorSurface>,
     host_generation: u64,
     host_valid: bool,
 }
@@ -185,7 +187,7 @@ impl MonitorCoordinator {
         Ok(())
     }
 
-    pub(crate) fn begin_cleanup(&mut self, monitor_id: &str) {
+    pub(crate) fn begin_cleanup(&mut self, monitor_id: &MonitorIdentity) {
         if let Some(surface) = self.surfaces.get_mut(monitor_id) {
             if surface.state == SurfaceState::Active {
                 surface.state = SurfaceState::Stopping;
@@ -193,13 +195,13 @@ impl MonitorCoordinator {
         }
     }
 
-    pub(crate) fn finish_cleanup(&mut self, monitor_id: &str) {
+    pub(crate) fn finish_cleanup(&mut self, monitor_id: &MonitorIdentity) {
         if let Some(surface) = self.surfaces.get_mut(monitor_id) {
             surface.state = SurfaceState::Unavailable;
         }
     }
 
-    pub(crate) fn mark_unavailable(&mut self, monitor_id: &str) {
+    pub(crate) fn mark_unavailable(&mut self, monitor_id: &MonitorIdentity) {
         self.begin_cleanup(monitor_id);
         self.finish_cleanup(monitor_id);
     }
@@ -235,7 +237,7 @@ impl MonitorCoordinator {
 
     pub(crate) fn update_geometry(
         &mut self,
-        monitor_id: &str,
+        monitor_id: &MonitorIdentity,
         bounds: LogicalBounds,
         dpi: u32,
     ) -> Result<GeometryChange, &'static str> {
@@ -267,7 +269,7 @@ impl MonitorCoordinator {
             .count()
     }
 
-    pub(crate) fn surface(&self, monitor_id: &str) -> Option<&MonitorSurface> {
+    pub(crate) fn surface(&self, monitor_id: &MonitorIdentity) -> Option<&MonitorSurface> {
         self.surfaces.get(monitor_id)
     }
 }

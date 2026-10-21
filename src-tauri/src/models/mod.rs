@@ -1,5 +1,6 @@
 pub mod cursor;
 pub mod monitor;
+pub mod monitor_assignment;
 pub mod monitor_playlist;
 pub mod playlist;
 pub mod settings;
