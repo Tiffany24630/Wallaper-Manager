@@ -17,8 +17,8 @@ use std::{
     time::Duration,
 };
 
-use crate::models::monitor_assignment::MonitorIdentity;
 use crate::models::monitor_assignment::WallpaperBackend;
+use crate::models::monitor_assignment::{MonitorAssignment, MonitorIdentity};
 use crate::models::wallpaper_coordinator::{self, AssignmentEvidence, AssignmentOperation};
 use tauri::AppHandle;
 use webview2_com::{
@@ -107,6 +107,8 @@ struct DesiredSurface {
     monitor_id: MonitorIdentity,
     bounds: MonitorBounds,
     dpi: u32,
+    assignment: AssignmentOperation,
+    suspended: bool,
 }
 
 struct HostWatcher {
@@ -1498,6 +1500,8 @@ fn open_physical_surface_internal(
                     monitor_id: monitor_id.clone(),
                     bounds: monitor,
                     dpi,
+                    assignment: assignment.clone(),
+                    suspended: false,
                 },
             );
     }
@@ -1548,6 +1552,16 @@ fn open_physical_surface_internal(
                 "[MultiMonitorPOC] RENDERER_CREATED monitor_id={} hwnd=0x{:x} host=0x{:x} resource_ready=true visibility=unverified effective=false",
                 monitor_id, hwnd, desktop_host.1
             );
+            if !remember_desired {
+                if let Ok(mut desired) = desired_surfaces().lock() {
+                    if let Some(surface) = desired.get_mut(&monitor_id) {
+                        surface.bounds = monitor;
+                        surface.dpi = dpi;
+                        surface.assignment = assignment.clone();
+                        surface.suspended = false;
+                    }
+                }
+            }
             start_host_watcher();
             Ok(())
         }
@@ -1620,6 +1634,16 @@ fn release_animated_assignment_if_current(monitor_id: &MonitorIdentity) {
     }
 }
 
+fn desired_assignment_is_recoverable(
+    current: Option<&MonitorAssignment>,
+    desired: &AssignmentOperation,
+    suspended: bool,
+    allow_suspended_without_assignment: bool,
+) -> bool {
+    current.is_some_and(|current| current == &desired.assignment)
+        || (allow_suspended_without_assignment && suspended && current.is_none())
+}
+
 pub fn validate_registered_desktop_host() -> Result<desktop_host::HostValidation, String> {
     let host = registered_desktop_host()
         .lock()
@@ -1663,7 +1687,7 @@ fn start_host_watcher() {
             }
             if recovery_policy.exhausted() && timeout.timed_out() {
                 eprintln!("[HostMonitor] RECOVERY_PROBE low_frequency=true");
-                if recover_desired_surfaces() {
+                if recover_desired_surfaces(true) {
                     recovery_policy.on_success();
                 }
                 continue;
@@ -1677,7 +1701,7 @@ fn start_host_watcher() {
                 }
                 Ok(desktop_host::HostValidation::Changed(reason)) => {
                     eprintln!("[HostMonitor] HOST_CHANGED reason={reason}");
-                    if recover_desired_surfaces() {
+                    if recover_desired_surfaces(true) {
                         recovery_policy.on_success();
                     } else {
                         recovery_policy.on_failure();
@@ -1728,6 +1752,13 @@ pub fn suspend_desired_surfaces_for_lifecycle() -> Result<(), String> {
         .keys()
         .cloned()
         .collect::<Vec<_>>();
+    if let Ok(mut desired) = desired_surfaces().lock() {
+        for id in &ids {
+            if let Some(surface) = desired.get_mut(id) {
+                surface.suspended = true;
+            }
+        }
+    }
     let count = ids.len();
     for id in ids {
         stop_physical_surface(&id)?;
@@ -1737,10 +1768,10 @@ pub fn suspend_desired_surfaces_for_lifecycle() -> Result<(), String> {
 }
 
 pub fn recover_desired_surfaces_for_lifecycle() -> bool {
-    recover_desired_surfaces()
+    recover_desired_surfaces(true)
 }
 
-fn recover_desired_surfaces() -> bool {
+fn recover_desired_surfaces(allow_suspended_without_assignment: bool) -> bool {
     eprintln!("[HostMonitor] RECOVERY_STARTED");
     let desired = desired_surfaces()
         .lock()
@@ -1748,12 +1779,43 @@ fn recover_desired_surfaces() -> bool {
         .values()
         .cloned()
         .collect::<Vec<_>>();
-    let ids = multi_surfaces()
-        .lock()
-        .expect("multi surface mutex poisoned")
-        .keys()
-        .cloned()
+    let desired = desired
+        .into_iter()
+        .filter(|surface| {
+            let current = wallpaper_coordinator::global()
+                .lock()
+                .ok()
+                .and_then(|coordinator| coordinator.current(&surface.monitor_id).cloned());
+            if desired_assignment_is_recoverable(
+                current.as_ref(),
+                &surface.assignment,
+                surface.suspended,
+                allow_suspended_without_assignment,
+            ) {
+                true
+            } else {
+                eprintln!(
+                    "[HostMonitor] SURFACE_RECOVERY_SKIPPED monitor_id={} reason=obsolete_assignment",
+                    surface.monitor_id
+                );
+                if let Ok(mut desired) = desired_surfaces().lock() {
+                    desired.remove(&surface.monitor_id);
+                }
+                false
+            }
+        })
         .collect::<Vec<_>>();
+    let ids = desired
+        .iter()
+        .map(|surface| surface.monitor_id.clone())
+        .collect::<Vec<_>>();
+    if let Ok(mut desired_surfaces) = desired_surfaces().lock() {
+        for id in &ids {
+            if let Some(surface) = desired_surfaces.get_mut(id) {
+                surface.suspended = true;
+            }
+        }
+    }
     for id in ids {
         if let Err(error) = stop_physical_surface(&id) {
             eprintln!("[HostMonitor] RECOVERY_CLEANUP_FAILED monitor_id={id} error={error}");
@@ -2074,9 +2136,11 @@ pub fn close() -> Result<(), String> {
 mod tests {
     use super::{
         active_multi_temporaries, classify_multi_temporary, cleanup_orphaned_multi_temporaries,
-        create_diagnostic_gif, is_native_media_error_payload, validate_native_media,
-        NotificationRegistration, TemporaryClassification,
+        create_diagnostic_gif, desired_assignment_is_recoverable, is_native_media_error_payload,
+        validate_native_media, NotificationRegistration, TemporaryClassification,
     };
+    use crate::models::monitor_assignment::{MonitorIdentity, WallpaperBackend};
+    use crate::models::wallpaper_coordinator::WallpaperCoordinator;
     use std::{
         collections::BTreeSet,
         fs,
@@ -2134,6 +2198,37 @@ mod tests {
         assert!(second.mark_registered().is_ok());
         assert_ne!(first, second);
         assert!(second.take_registered());
+    }
+
+    #[test]
+    fn recovery_requires_the_current_assignment_or_explicit_suspend() {
+        let mut coordinator = WallpaperCoordinator::default();
+        let monitor: MonitorIdentity = "recovery-monitor".into();
+        let first = coordinator
+            .reserve(monitor.clone(), WallpaperBackend::Animated)
+            .unwrap();
+        coordinator.confirm_activated(&first).unwrap();
+        coordinator.commit(&first).unwrap();
+        assert!(desired_assignment_is_recoverable(
+            Some(&first.assignment),
+            &first,
+            false,
+            false
+        ));
+
+        let second = coordinator
+            .reserve(monitor, WallpaperBackend::Animated)
+            .unwrap();
+        assert!(!desired_assignment_is_recoverable(
+            Some(&first.assignment),
+            &second,
+            false,
+            false
+        ));
+        assert!(desired_assignment_is_recoverable(None, &first, true, true));
+        assert!(!desired_assignment_is_recoverable(
+            None, &first, false, true
+        ));
     }
 
     #[test]

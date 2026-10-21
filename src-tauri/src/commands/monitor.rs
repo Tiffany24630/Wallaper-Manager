@@ -232,6 +232,7 @@ pub fn assign_wallpaper_to_monitor(
     wallpaper_id: String,
     scheduler: State<'_, DynamicScheduler>,
 ) -> Result<(), String> {
+    let mut manual_operation = scheduler.begin_manual_operation();
     if !current_monitor_ids(&app)?
         .iter()
         .any(|id| id == &monitor_id)
@@ -301,7 +302,7 @@ pub fn assign_wallpaper_to_monitor(
         [],
     )
     .map_err(|e| e.to_string())?;
-    scheduler.stop();
+    manual_operation.complete();
     Ok(())
 }
 

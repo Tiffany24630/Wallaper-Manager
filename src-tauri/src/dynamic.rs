@@ -8,7 +8,7 @@ use crate::{
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -19,30 +19,99 @@ pub struct DynamicScheduler {
     apply_lock: Arc<Mutex<()>>,
 }
 
-struct Worker {
-    stop: Arc<AtomicBool>,
-    handle: JoinHandle<()>,
+pub struct ManualOperation<'a> {
+    scheduler: &'a DynamicScheduler,
+    guard: Option<std::sync::MutexGuard<'a, ()>>,
+    restart_on_drop: bool,
+    completed: bool,
 }
 
-impl DynamicScheduler {
-    pub fn restart(&self) {
-        self.stop();
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let apply_lock = Arc::clone(&self.apply_lock);
-        let handle = thread::spawn(move || run_worker(thread_stop, apply_lock));
-        *self.worker.lock().expect("dynamic scheduler lock") = Some(Worker { stop, handle });
+impl ManualOperation<'_> {
+    pub fn complete(&mut self) {
+        self.completed = true;
     }
 
-    pub fn stop(&self) {
-        if let Some(worker) = self.worker.lock().expect("dynamic scheduler lock").take() {
-            worker.stop.store(true, Ordering::Release);
-            let _ = worker.handle.join();
+    pub fn complete_and_resume(&mut self) {
+        self.completed = true;
+        if self.restart_on_drop {
+            self.restart_on_drop = false;
+            self.scheduler.restart();
         }
     }
 }
 
-fn run_worker(stop: Arc<AtomicBool>, apply_lock: Arc<Mutex<()>>) {
+impl Drop for ManualOperation<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        if self.restart_on_drop && !self.completed {
+            self.scheduler.restart();
+        }
+    }
+}
+
+struct Worker {
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    handle: JoinHandle<()>,
+}
+
+impl DynamicScheduler {
+    pub fn begin_manual_operation(&self) -> ManualOperation<'_> {
+        let restart_on_drop = self
+            .worker
+            .lock()
+            .expect("dynamic scheduler lock")
+            .is_some();
+        self.stop();
+        ManualOperation {
+            scheduler: self,
+            guard: Some(
+                self.apply_lock
+                    .lock()
+                    .expect("dynamic scheduler apply lock"),
+            ),
+            restart_on_drop,
+            completed: false,
+        }
+    }
+
+    pub fn restart(&self) {
+        let mut slot = self.worker.lock().expect("dynamic scheduler lock");
+        if let Some(worker) = slot.take() {
+            stop_worker(worker);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread_stop = Arc::clone(&stop);
+        let thread_wake = Arc::clone(&wake);
+        let apply_lock = Arc::clone(&self.apply_lock);
+        let handle = thread::spawn(move || run_worker(thread_stop, thread_wake, apply_lock));
+        *slot = Some(Worker { stop, wake, handle });
+    }
+
+    pub fn stop(&self) {
+        let mut slot = self.worker.lock().expect("dynamic scheduler lock");
+        if let Some(worker) = slot.take() {
+            stop_worker(worker);
+        }
+    }
+}
+
+fn stop_worker(worker: Worker) {
+    worker.stop.store(true, Ordering::Release);
+    let (wake_lock, wake_condition) = &*worker.wake;
+    if let Ok(mut requested) = wake_lock.lock() {
+        *requested = true;
+        wake_condition.notify_one();
+    }
+    let _ = worker.handle.join();
+}
+
+fn run_worker(
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    apply_lock: Arc<Mutex<()>>,
+) {
     loop {
         if stop.load(Ordering::Acquire) {
             return;
@@ -52,15 +121,12 @@ fn run_worker(stop: Arc<AtomicBool>, apply_lock: Arc<Mutex<()>>) {
             Ok(None) => return,
             Err(error) => {
                 set_dynamic_error(&error);
-                1
-            }
-        };
-        let seconds = interval.saturating_mul(60);
-        for _ in 0..seconds {
-            if stop.load(Ordering::Acquire) {
                 return;
             }
-            thread::sleep(Duration::from_secs(1));
+        };
+        let duration = Duration::from_secs(interval.saturating_mul(60) as u64);
+        if !wait_for_next_cycle(&stop, &wake, duration) {
+            return;
         }
     }
 }
@@ -125,6 +191,13 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
             let operation = match operation {
                 Ok(operation) => operation,
                 Err(error) => {
+                    if matches!(
+                        error,
+                        crate::models::wallpaper_coordinator::CoordinatorError::ShuttingDown
+                            | crate::models::wallpaper_coordinator::CoordinatorError::Shutdown
+                    ) {
+                        return Ok(None);
+                    }
                     set_monitor_playlist_error(&conn, &monitor_id, &error.to_string());
                     continue;
                 }
@@ -154,6 +227,9 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
                             .map_err(|e| e.to_string())?;
                         }
                         Err(error) => {
+                            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                                coordinator.abort(&operation);
+                            }
                             set_monitor_playlist_error(&conn, &monitor_id, &error.to_string())
                         }
                     }
@@ -223,6 +299,28 @@ fn scaling_mode(conn: &rusqlite::Connection) -> wallpaper::Mode {
     }
 }
 
+fn wait_for_next_cycle(
+    stop: &AtomicBool,
+    wake: &Arc<(Mutex<bool>, Condvar)>,
+    duration: Duration,
+) -> bool {
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
+    let (wake_lock, wake_condition) = &**wake;
+    let Ok(guard) = wake_lock.lock() else {
+        return false;
+    };
+    let wait = wake_condition.wait_timeout_while(guard, duration, |requested| {
+        !*requested && !stop.load(Ordering::Acquire)
+    });
+    let Ok((mut guard, _)) = wait else {
+        return false;
+    };
+    *guard = false;
+    !stop.load(Ordering::Acquire)
+}
+
 fn playlist_wallpapers(
     conn: &rusqlite::Connection,
     playlist_id: &str,
@@ -270,7 +368,9 @@ fn set_dynamic_error(error: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_next_id, DYNAMIC_INTERVALS};
+    use super::{select_next_id, wait_for_next_cycle, DynamicScheduler, DYNAMIC_INTERVALS};
+    use std::sync::{atomic::AtomicBool, Arc, Condvar, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn accepts_only_supported_intervals() {
@@ -297,5 +397,26 @@ mod tests {
         assert_eq!(select_next_id(&items, Some("three")), Some("one".into()));
         assert_eq!(select_next_id(&items, Some("deleted")), Some("one".into()));
         assert_eq!(select_next_id(&[], Some("deleted")), None);
+    }
+
+    #[test]
+    fn stopped_scheduler_does_not_wait_for_an_interval() {
+        let stop = AtomicBool::new(true);
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+
+        assert!(!wait_for_next_cycle(&stop, &wake, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn manual_operation_serializes_application_access_and_stop_is_idempotent() {
+        let scheduler = DynamicScheduler::default();
+        scheduler.stop();
+        scheduler.stop();
+
+        let mut operation = scheduler.begin_manual_operation();
+        assert!(scheduler.apply_lock.try_lock().is_err());
+        operation.complete();
+        drop(operation);
+        assert!(scheduler.apply_lock.try_lock().is_ok());
     }
 }

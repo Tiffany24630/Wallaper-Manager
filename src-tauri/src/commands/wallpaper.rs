@@ -180,6 +180,7 @@ pub fn set_active_wallpaper(
     wallpaper_id: String,
     scheduler: State<'_, DynamicScheduler>,
 ) -> Result<(), String> {
+    let mut manual_operation = scheduler.begin_manual_operation();
     set_active_wallpaper_internal(wallpaper_id.clone())?;
     let conn = get_connection().map_err(|e| e.to_string())?;
     conn.execute(
@@ -189,7 +190,7 @@ pub fn set_active_wallpaper(
     .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM monitor_playlists", [])
         .map_err(|e| e.to_string())?;
-    scheduler.stop();
+    manual_operation.complete();
     Ok(())
 }
 
@@ -334,7 +335,8 @@ pub fn scan_wallpaper_folder() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn rotate_random_wallpaper() -> Result<(), String> {
+pub fn rotate_random_wallpaper(scheduler: State<'_, DynamicScheduler>) -> Result<(), String> {
+    let mut manual_operation = scheduler.begin_manual_operation();
     let conn = get_connection().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare("SELECT id FROM wallpapers")
@@ -347,6 +349,7 @@ pub fn rotate_random_wallpaper() -> Result<(), String> {
     if let Some(random) = ids.choose(&mut rand::thread_rng()) {
         set_active_wallpaper_internal(random.clone())?;
     }
+    manual_operation.complete_and_resume();
     Ok(())
 }
 
@@ -444,7 +447,12 @@ fn replace_validated_image(
 }
 
 #[tauri::command]
-pub fn rotate_wallpaper_version(wallpaper_id: String, degrees: u16) -> Result<(), String> {
+pub fn rotate_wallpaper_version(
+    wallpaper_id: String,
+    degrees: u16,
+    scheduler: State<'_, DynamicScheduler>,
+) -> Result<(), String> {
+    let mut manual_operation = scheduler.begin_manual_operation();
     if !matches!(degrees, 0 | 90 | 180 | 270) {
         return Err("La rotación debe ser 0°, 90°, 180° o 270°".into());
     }
@@ -494,6 +502,7 @@ pub fn rotate_wallpaper_version(wallpaper_id: String, degrees: u16) -> Result<()
     if active == 1 {
         set_active_wallpaper_internal(wallpaper_id)?;
     }
+    manual_operation.complete_and_resume();
     Ok(())
 }
 
