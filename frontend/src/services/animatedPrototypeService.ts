@@ -5,7 +5,7 @@ export const animatedPrototypeService = {
   async chooseMedia(): Promise<string | null> {
     const selected = await open({
       multiple: false,
-      filters: [{ name: "Animated media", extensions: ["mp4", "gif"] }],
+      filters: [{ name: "Animated GIF", extensions: ["gif"] }],
     });
     return typeof selected === "string" ? selected : null;
   },

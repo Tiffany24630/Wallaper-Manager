@@ -252,12 +252,23 @@ pub(crate) fn set_active_wallpaper_internal(wallpaper_id: String) -> Result<(), 
             return Err(error);
         }
     }
+    persist_active_wallpaper(&mut conn, &wallpaper_id).map_err(|error| {
+        format!(
+            "El fondo se aplicó físicamente, pero no se pudo persistir el estado activo: {error}"
+        )
+    })
+}
+
+fn persist_active_wallpaper(
+    conn: &mut rusqlite::Connection,
+    wallpaper_id: &str,
+) -> Result<(), String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute("UPDATE wallpapers SET active = 0", [])
         .map_err(|e| e.to_string())?;
     tx.execute(
         "UPDATE wallpapers SET active = 1 WHERE id = ?1",
-        [&wallpaper_id],
+        [wallpaper_id],
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
@@ -768,8 +779,9 @@ pub fn upscale_wallpaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        rename_wallpaper_in_connection, replace_validated_image, rotate_image, target_dimensions,
-        validate_ai_pixels, validate_generated_image, validate_wallpaper_name,
+        persist_active_wallpaper, rename_wallpaper_in_connection, replace_validated_image,
+        rotate_image, target_dimensions, validate_ai_pixels, validate_generated_image,
+        validate_wallpaper_name,
     };
     use crate::utils::thumbnail::generate_thumbnail;
     use image::{GenericImageView, RgbImage};
@@ -779,6 +791,38 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    #[test]
+    fn persists_active_wallpaper_atomically_in_sqlite() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE wallpapers(id TEXT PRIMARY KEY, active INTEGER NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO wallpapers(id, active) VALUES ('old', 1), ('new', 0)",
+            [],
+        )
+        .unwrap();
+
+        persist_active_wallpaper(&mut conn, "new").unwrap();
+
+        let active: Vec<String> = conn
+            .prepare("SELECT id FROM wallpapers WHERE active = 1 ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(active, vec!["new"]);
+    }
+
+    #[test]
+    fn persistence_failure_is_returned_without_faking_success() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let error = persist_active_wallpaper(&mut conn, "new").unwrap_err();
+        assert!(!error.is_empty());
+    }
     #[test]
     fn calculates_upscaled_resolution() {
         assert_eq!(target_dimensions(640, 360, 4).unwrap(), (2560, 1440));

@@ -108,14 +108,17 @@ pub fn get_monitors(app: tauri::AppHandle) -> Result<Vec<MonitorInfo>, String> {
     let available = window.available_monitors().map_err(|e| e.to_string())?;
     let primary = window.primary_monitor().map_err(|e| e.to_string())?;
     let ids = resolve_monitor_ids(&available)?;
+    if ids.len() != available.len() {
+        return Err(format!(
+            "La resolución nativa devolvió {} identidades para {} monitores",
+            ids.len(),
+            available.len()
+        ));
+    }
     Ok(available
         .into_iter()
-        .enumerate()
-        .map(|(index, monitor)| {
-            let id = ids
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| format!("monitor-{index}"));
+        .zip(ids)
+        .map(|(monitor, id)| {
             let name = monitor.name().cloned().unwrap_or_else(|| id.clone());
             let refresh_rate = refresh_rate_for(&name);
             MonitorInfo {
@@ -139,16 +142,24 @@ pub fn restore_monitor_wallpapers(app: &tauri::AppHandle) -> Result<(), String> 
         return Ok(());
     }
     let conn = get_connection().map_err(|e| e.to_string())?;
+    let mut restore_errors = Vec::new();
     let assignments: Vec<(String, String)> = {
         let mut statement = conn
             .prepare("SELECT monitor_id, wallpaper_id FROM monitor_wallpapers")
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|e| e.to_string())?
-            .filter_map(Result::ok)
-            .collect();
-        rows
+            .map_err(|e| e.to_string())?;
+        let mut assignments = Vec::new();
+        for row in rows {
+            match row {
+                Ok(assignment) => assignments.push(assignment),
+                Err(error) => restore_errors.push(format!(
+                    "monitor_wallpapers: no se pudo leer una asignación persistida: {error}"
+                )),
+            }
+        }
+        assignments
     };
     let scaling_mode: String = conn
         .query_row("SELECT scaling_mode FROM settings LIMIT 1", [], |row| {
@@ -162,12 +173,13 @@ pub fn restore_monitor_wallpapers(app: &tauri::AppHandle) -> Result<(), String> 
         _ => wallpaper::Mode::Crop,
     };
     let assignments = restorable_assignments(&ids, &assignments);
-    if assignments.is_empty() {
+    if assignments.is_empty() && restore_errors.is_empty() {
         return Ok(());
     }
-    wallpaper::set_mode(mode)
-        .map_err(|e| format!("Windows no pudo restaurar el modo de ajuste: {e}"))?;
-    let mut restore_errors = Vec::new();
+    if !assignments.is_empty() {
+        wallpaper::set_mode(mode)
+            .map_err(|e| format!("Windows no pudo restaurar el modo de ajuste: {e}"))?;
+    }
     for (monitor_id, wallpaper_id) in assignments {
         let Ok(path) = conn.query_row(
             "SELECT path FROM wallpapers WHERE id = ?1",

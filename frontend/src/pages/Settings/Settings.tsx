@@ -39,7 +39,7 @@ export default function Settings() {
   const [message, setMessage] = useState<string | null>(null);
   const [prototypeBusy, setPrototypeBusy] = useState(false);
   const [prototypeMediaPath, setPrototypeMediaPath] = useState<string | null>(null);
-  const [prototypeStatus, setPrototypeStatus] = useState("Selecciona un archivo MP4 o GIF para comenzar.");
+  const [prototypeStatus, setPrototypeStatus] = useState("Selecciona un archivo GIF para comenzar.");
   const [prototypeMonitors, setPrototypeMonitors] = useState<Monitor[]>([]);
   const [prototypeMonitorId, setPrototypeMonitorId] = useState("");
   const [playlists, setPlaylists] = useState<{ id: string; name: string }[]>([]);
@@ -106,7 +106,7 @@ export default function Settings() {
   async function openAnimatedPrototype() {
     setMessage(null);
     if (!prototypeMediaPath) {
-      setPrototypeStatus("Selecciona primero un archivo MP4 o GIF.");
+      setPrototypeStatus("Selecciona primero un archivo GIF.");
       return;
     }
     setPrototypeBusy(true);
@@ -227,7 +227,7 @@ export default function Settings() {
           {prototypeMediaPath && <div className="mt-1 truncate text-xs" title={prototypeMediaPath}>Archivo: {prototypeMediaPath.split(/[\\/]/).pop()}</div>}
         </div>
         <div className="mt-4 flex flex-wrap gap-3">
-          <button className="btn btn-secondary" type="button" onClick={() => void chooseAnimatedPrototypeMedia()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Seleccionar MP4/GIF</button>
+          <button className="btn btn-secondary" type="button" onClick={() => void chooseAnimatedPrototypeMedia()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Seleccionar GIF</button>
           <button className="btn btn-secondary" type="button" onClick={() => void openAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0 || !prototypeMediaPath}>Abrir prototipo</button>
           <button className="btn btn-secondary" type="button" onClick={() => void openGeneratedAnimatedPrototypeTest()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Probar GIF autónomo</button>
           <button className="btn btn-secondary" type="button" onClick={() => void closeAnimatedPrototype()} disabled={prototypeBusy || prototypeMonitors.length === 0}>Cerrar superficie</button>

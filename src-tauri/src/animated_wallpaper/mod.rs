@@ -38,6 +38,19 @@ pub(crate) const MAX_ANIMATED_FRAMES: u32 = 240;
 pub(crate) const MAX_ANIMATED_DURATION_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnimatedMediaFormat {
+    Gif,
+}
+
+impl AnimatedMediaFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Gif => "gif",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AnimatedResourceInfo {
     pub(crate) file_bytes: u64,
     pub(crate) width: u32,
@@ -579,7 +592,7 @@ pub fn primary_monitor_identity(_app: &AppHandle) -> Result<String, String> {
     Err("La identidad nativa de monitores solo estÃ¡ disponible en Windows".into())
 }
 
-fn validate_media_source(path: &Path) -> Result<&'static str, String> {
+fn validate_media_source(path: &Path) -> Result<AnimatedMediaFormat, String> {
     if !path.is_file() {
         return Err("El archivo multimedia seleccionado no existe o no es un archivo".into());
     }
@@ -597,9 +610,12 @@ fn validate_media_source(path: &Path) -> Result<&'static str, String> {
         .map(|value| value.to_ascii_lowercase())
         .as_deref()
     {
-        Some("mp4") => Ok("mp4"),
-        Some("gif") => Ok("gif"),
-        _ => Err("El prototipo solo admite archivos locales .mp4 o .gif".into()),
+        Some("mp4") => Err(
+            "ResourceFormatUnsupported: MP4 todavía no está admitido por el prototipo animado"
+                .into(),
+        ),
+        Some("gif") => Ok(AnimatedMediaFormat::Gif),
+        _ => Err("ResourceFormatUnsupported: el prototipo solo admite archivos GIF locales".into()),
     }
 }
 
@@ -691,7 +707,7 @@ pub async fn open_animated_prototype(
 ) -> Result<(), String> {
     let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
     let source = PathBuf::from(media_path);
-    let extension = validate_media_source(&source)?;
+    let format = validate_media_source(&source)?;
     let monitors = app
         .get_webview_window("main")
         .ok_or("No se encontró la ventana principal de Lumina")?
@@ -703,17 +719,15 @@ pub async fn open_animated_prototype(
     let position = monitor.position();
     let size = monitor.size();
     let bounds = bounds_from_geometry(position.x, position.y, size.width, size.height)?;
-    if extension == "gif" {
-        let resource = validate_animated_gif(&source, bounds.width, bounds.height)?;
-        eprintln!(
-            "Animated resource accepted: {}x{} frames={} duration_ms={} estimated_decoded_frame_bytes={}",
-            resource.width,
-            resource.height,
-            resource.frame_count,
-            resource.duration_ms,
-            resource.estimated_decoded_frame_bytes
-        );
-    }
+    let resource = validate_animated_gif(&source, bounds.width, bounds.height)?;
+    eprintln!(
+        "Animated resource accepted: {}x{} frames={} duration_ms={} estimated_decoded_frame_bytes={}",
+        resource.width,
+        resource.height,
+        resource.frame_count,
+        resource.duration_ms,
+        resource.estimated_decoded_frame_bytes
+    );
     let label = prototype_surface_label(&monitor_identity);
     let activation_id = Uuid::new_v4().to_string();
 
@@ -724,7 +738,7 @@ pub async fn open_animated_prototype(
         );
     }
 
-    let copied_media = copy_to_controlled_storage(&app, &source, extension)?;
+    let copied_media = copy_to_controlled_storage(&app, &source, format.extension())?;
     let media_query = encode_query_component(&copied_media.to_string_lossy());
     let error_test_query = if std::env::var_os("LUMINA_ANIMATED_MEDIA_ERROR_TEST").is_some() {
         "&mediaErrorTest=1"
@@ -1734,8 +1748,8 @@ mod tests {
         activation_matches, bounds_from_geometry, create_diagnostic_gif,
         diagnostic_surface_conflicts, encode_query_component, prototype_surface_label,
         resource_limit_reason, smoke_variant_options, validate_animated_gif, validate_media_source,
-        AnimatedSurfaceLifecycle, PrototypeSurfaceRecord, MAX_ANIMATED_DIMENSION,
-        MAX_ANIMATED_FILE_BYTES,
+        AnimatedMediaFormat, AnimatedSurfaceLifecycle, PrototypeSurfaceRecord,
+        MAX_ANIMATED_DIMENSION, MAX_ANIMATED_FILE_BYTES,
     };
     use crate::models::monitor_assignment::MonitorIdentity;
     use crate::models::monitor_assignment::WallpaperBackend;
@@ -1807,7 +1821,10 @@ mod tests {
     fn diagnostic_gif_is_readable_and_has_expected_dimensions() {
         let path = std::env::temp_dir().join(format!("lumina-diagnostic-{}.gif", Uuid::new_v4()));
         create_diagnostic_gif(&path).unwrap();
-        assert_eq!(validate_media_source(&path).unwrap(), "gif");
+        assert_eq!(
+            validate_media_source(&path).unwrap(),
+            AnimatedMediaFormat::Gif
+        );
         let image = image::open(&path).unwrap();
         assert_eq!(image.dimensions(), (320, 180));
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
@@ -1833,6 +1850,42 @@ mod tests {
             Some("ResourceLimitExceeded:decoded_frame")
         );
         assert_eq!(resource_limit_reason(1, 320, 180, 2560, 1440), None);
+    }
+
+    #[test]
+    fn media_contract_rejects_mp4_and_unsupported_extensions() {
+        let directory =
+            std::env::temp_dir().join(format!("lumina-media-contract-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mp4 = directory.join("clip.mp4");
+        std::fs::write(&mp4, b"not a video").unwrap();
+        let mp4_error = validate_media_source(&mp4).unwrap_err();
+        assert!(mp4_error.contains("MP4"));
+
+        let txt = directory.join("clip.txt");
+        std::fs::write(&txt, b"GIF89a").unwrap();
+        let text_error = validate_media_source(&txt).unwrap_err();
+        assert!(text_error.contains("ResourceFormatUnsupported"));
+        assert!(directory.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn malformed_or_truncated_gif_is_rejected_before_resource_use() {
+        let path = std::env::temp_dir().join(format!("lumina-truncated-{}.gif", Uuid::new_v4()));
+        std::fs::write(&path, b"GIF89a").unwrap();
+        let error = validate_animated_gif(&path, 2560, 1440).unwrap_err();
+        assert!(error.contains("MediaError"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn resource_limits_are_conservative_for_extreme_values() {
+        assert_eq!(
+            resource_limit_reason(u64::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX),
+            Some("ResourceLimitExceeded:file_size")
+        );
+        assert!(resource_limit_reason(1, u32::MAX, u32::MAX, 0, 0).is_some());
     }
 
     #[test]
