@@ -226,7 +226,6 @@ fn register_prototype_surface(
     let mut lifecycle = AnimatedSurfaceLifecycle::new();
     lifecycle.begin_create().map_err(str::to_string)?;
     lifecycle.webview_ready().map_err(str::to_string)?;
-    lifecycle.playing().map_err(str::to_string)?;
 
     let mut surfaces = prototype_surfaces()
         .lock()
@@ -277,7 +276,23 @@ fn finish_prototype_close(label: &str, activation_id: Option<&str>) {
     };
     if let Some(assignment) = assignment {
         if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
-            coordinator.release(&assignment);
+            let result = if coordinator
+                .pending(assignment.assignment.monitor_ref())
+                .is_some()
+            {
+                coordinator.abort(&assignment)
+            } else {
+                coordinator.release(&assignment)
+            };
+            eprintln!(
+                "ANIMATED_COORDINATOR_RELEASE generation={} result={result:?}",
+                assignment.assignment.generation.value()
+            );
+        } else {
+            eprintln!(
+                "ANIMATED_COORDINATOR_RELEASE generation={} result=CoordinatorLockFailed",
+                assignment.assignment.generation.value()
+            );
         }
     }
 }
@@ -797,40 +812,7 @@ pub async fn open_animated_prototype(
             "No se pudo mostrar la superficie WebView2: {error}"
         ));
     }
-    if let Err(error) = wallpaper_coordinator::global()
-        .lock()
-        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?
-        .confirm_previous_deactivated(&assignment)
-    {
-        begin_explicit_prototype_close(&label);
-        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
-            coordinator.abort(&assignment);
-        }
-        let _ = window.close();
-        let _ = fs::remove_file(&cleanup_path);
-        return Err(error.to_string());
-    }
-    let commit_result = wallpaper_coordinator::global()
-        .lock()
-        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())
-        .and_then(|mut coordinator| {
-            coordinator
-                .confirm_activated(&assignment)
-                .map_err(|error| error.to_string())?;
-            coordinator
-                .commit(&assignment)
-                .map_err(|error| error.to_string())
-        });
-    if let Err(error) = commit_result {
-        begin_explicit_prototype_close(&label);
-        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
-            coordinator.abort(&assignment);
-        }
-        let _ = window.close();
-        let _ = fs::remove_file(&cleanup_path);
-        return Err(error.to_string());
-    }
-    eprintln!("Animated prototype window shown: {label}");
+    eprintln!("Animated prototype window shown; awaiting media-ready confirmation: {label}");
     Ok(())
 }
 
@@ -1507,6 +1489,69 @@ pub fn close_animated_prototype(app: AppHandle, monitor_id: String) -> Result<()
             .close()
             .map_err(|e| format!("No se pudo cerrar la superficie WebView2: {e}"))?;
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn report_animated_ready(
+    app: AppHandle,
+    surface_id: String,
+    activation_id: String,
+) -> Result<(), String> {
+    let assignment = {
+        let mut surfaces = prototype_surfaces()
+            .lock()
+            .map_err(|_| "No se pudo bloquear el registro de superficies".to_string())?;
+        let Some(record) = surfaces.get_mut(&surface_id) else {
+            eprintln!("ANIMATED_READY_IGNORED surface={surface_id} reason=unknown_surface");
+            return Ok(());
+        };
+        if record.activation_id != activation_id {
+            eprintln!("ANIMATED_READY_IGNORED surface={surface_id} reason=stale_activation");
+            return Ok(());
+        }
+        if matches!(
+            record.lifecycle.state(),
+            AnimatedSurfaceState::Closing
+                | AnimatedSurfaceState::Closed
+                | AnimatedSurfaceState::FallbackRequired
+        ) {
+            eprintln!("ANIMATED_READY_IGNORED surface={surface_id} reason=not_active");
+            return Ok(());
+        }
+        if record.lifecycle.state() == AnimatedSurfaceState::Playing {
+            eprintln!("ANIMATED_READY_IGNORED surface={surface_id} reason=already_playing");
+            return Ok(());
+        }
+        record.lifecycle.playing().map_err(str::to_string)?;
+        record.assignment.clone()
+    };
+
+    let activation_result = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())
+        .and_then(|mut coordinator| {
+            coordinator
+                .confirm_previous_deactivated(&assignment)
+                .map_err(|error| error.to_string())?;
+            coordinator
+                .confirm_activated(&assignment)
+                .map_err(|error| error.to_string())?;
+            coordinator
+                .commit(&assignment)
+                .map_err(|error| error.to_string())
+        });
+    if let Err(error) = activation_result {
+        begin_explicit_prototype_close(&surface_id);
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&assignment);
+        }
+        if let Some(window) = app.get_webview_window(&surface_id) {
+            let _ = window.close();
+        }
+        return Err(error);
+    }
+    eprintln!("ANIMATED_READY surface={surface_id} activation={activation_id} backend=animated");
     Ok(())
 }
 

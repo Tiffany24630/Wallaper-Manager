@@ -30,6 +30,10 @@ export const animatedPrototypeService = {
     return tauriInvoke("close_animated_prototype", { monitorId });
   },
 
+  reportReady(surfaceId: string, activationId: string): Promise<void> {
+    return tauriInvoke("report_animated_ready", { surfaceId, activationId });
+  },
+
   reportMediaError(
     surfaceId: string,
     activationId: string,

@@ -281,6 +281,7 @@ fn main() {
             animated_wallpaper::close_native_animated_prototype,
             animated_wallpaper::close_animated_multimonitor_physical_poc,
             animated_wallpaper::close_animated_prototype,
+            animated_wallpaper::report_animated_ready,
             animated_wallpaper::report_animated_media_error,
         ])
         .plugin(tauri_plugin_dialog::init())

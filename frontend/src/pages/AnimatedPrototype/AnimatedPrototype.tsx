@@ -29,6 +29,12 @@ export default function AnimatedPrototype() {
       .catch((error) => console.error("No se pudo informar el error de media a Rust", error));
   };
 
+  const reportReady = () => {
+    void animatedPrototypeService
+      .reportReady(surfaceId, activationId)
+      .catch((error) => console.error("No se pudo confirmar el renderer animado", error));
+  };
+
   useEffect(() => {
     if (!mediaErrorTest || !isGif || !mediaUrl) return;
     const timer = window.setTimeout(() => {
@@ -55,7 +61,10 @@ export default function AnimatedPrototype() {
           ref={imageRef}
           src={mediaUrl}
           alt=""
-          onLoad={() => setStatus("GIF cargado; reproducción animada disponible")}
+          onLoad={() => {
+            setStatus("GIF cargado; reproducción animada disponible");
+            reportReady();
+          }}
           onError={() => reportMediaError("img_error")}
           style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
         />
@@ -68,7 +77,10 @@ export default function AnimatedPrototype() {
           playsInline
           controls={false}
           onLoadedData={() => setStatus("MP4 cargado; esperando reproducción")}
-          onCanPlay={() => setStatus("MP4 listo para reproducir")}
+          onCanPlay={() => {
+            setStatus("MP4 listo para reproducir");
+            reportReady();
+          }}
           onPlay={() => setStatus("MP4 reproduciéndose en loop y sin audio")}
           onError={() => reportMediaError("video_error")}
           style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}

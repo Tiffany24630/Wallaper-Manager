@@ -56,6 +56,7 @@ const NATIVE_WINDOW_CLASS: PCWSTR = w!("LuminaNativeAnimatedPrototype");
 const MAX_NATIVE_SURFACES: usize = 1;
 const MAX_NATIVE_MEDIA_BYTES: u64 = 512 * 1024 * 1024;
 const WM_NATIVE_MEDIA_ERROR: u32 = WM_APP + 59;
+const WM_NATIVE_MEDIA_READY: u32 = WM_APP + 60;
 const WM_DISPLAYCHANGE: u32 = 0x007E;
 const WM_DPICHANGED: u32 = 0x02E0;
 const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
@@ -76,6 +77,12 @@ unsafe extern "system" {
 fn is_native_media_error_payload(json: &str) -> bool {
     serde_json::from_str::<String>(json)
         .map(|message| message == "lumina-media-error")
+        .unwrap_or(false)
+}
+
+fn is_native_media_ready_payload(json: &str) -> bool {
+    serde_json::from_str::<String>(json)
+        .map(|message| message == "lumina-media-ready")
         .unwrap_or(false)
 }
 
@@ -822,7 +829,7 @@ fn native_html(media_path: &Path) -> String {
           color:#fff;background:rgba(15,23,42,.9);font-size:16px;z-index:2}}
         </style></head><body>
         <div id="status">Native HWND WebView2 · cargando GIF…</div>
-        <img src="{uri}" alt="GIF de diagnóstico" onload="document.getElementById('status').textContent='Native HWND WebView2 · GIF cargado'" onerror="document.getElementById('status').textContent='Native HWND WebView2 · error de carga'">
+        <img src="{uri}" alt="GIF de diagnóstico" onload="document.getElementById('status').textContent='Native HWND WebView2 · GIF cargado'; window.chrome?.webview?.postMessage('lumina-media-ready')" onerror="document.getElementById('status').textContent='Native HWND WebView2 · error de carga'">
         <script>document.querySelector('img').addEventListener('error', function() {{ window.chrome?.webview?.postMessage('lumina-media-error'); }});</script>
         {diagnostic_error}
         </body></html>"#
@@ -940,25 +947,38 @@ fn create_webview(
         let media_error_surface_id = surface_id.to_string();
         let media_error_handler = WebMessageReceivedEventHandler::create(Box::new(
             move |_webview, args| {
-                let mut message = PWSTR::null();
-                let valid = args
-                    .and_then(|args| args.WebMessageAsJson(&mut message).ok())
-                    .is_some_and(|_| {
+                let message = args.and_then(|args| {
+                    let mut message = PWSTR::null();
+                    args.WebMessageAsJson(&mut message).ok().map(|_| {
                         let message = CoTaskMemPWSTR::from(message);
-                        is_native_media_error_payload(&message.to_string())
-                    });
-                if !valid {
+                        message.to_string()
+                    })
+                });
+                let Some(message) = message else {
                     eprintln!(
                         "[NativeAnimated] MEDIA_ERROR_MESSAGE_IGNORED surface_id={media_error_surface_id} reason=invalid_payload"
                     );
                     return Ok(());
-                }
-                eprintln!(
-                    "[NativeAnimated] MEDIA_ERROR_MESSAGE_RECEIVED surface_id={media_error_surface_id}"
-                );
+                };
+                let message_id = if is_native_media_error_payload(&message) {
+                    eprintln!(
+                        "[NativeAnimated] MEDIA_ERROR_MESSAGE_RECEIVED surface_id={media_error_surface_id}"
+                    );
+                    WM_NATIVE_MEDIA_ERROR
+                } else if is_native_media_ready_payload(&message) {
+                    eprintln!(
+                        "[NativeAnimated] MEDIA_READY_MESSAGE_RECEIVED surface_id={media_error_surface_id}"
+                    );
+                    WM_NATIVE_MEDIA_READY
+                } else {
+                    eprintln!(
+                        "[NativeAnimated] MEDIA_MESSAGE_IGNORED surface_id={media_error_surface_id} reason=invalid_payload"
+                    );
+                    return Ok(());
+                };
                 let _ = PostMessageW(
                     Some(HWND(media_error_hwnd as *mut _)),
-                    WM_NATIVE_MEDIA_ERROR,
+                    message_id,
                     WPARAM(0),
                     LPARAM(0),
                 );
@@ -1124,9 +1144,6 @@ fn run_native_surface(
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = UpdateWindow(hwnd);
         }
-        surface_lifecycle
-            .playing()
-            .map_err(|error| error.to_string())?;
         lifecycle
             .create_renderer()
             .map_err(|error| error.to_string())?;
@@ -1136,7 +1153,7 @@ fn run_native_surface(
                 .expect("multi surface mutex poisoned")
                 .insert(key.clone(), hwnd.0 as isize);
             eprintln!(
-                "[MultiMonitorPOC] SURFACE_ACTIVE monitor_id={} hwnd={:?} bounds=({},{} {}x{})",
+                "[MultiMonitorPOC] SURFACE_CREATED_WAITING_READY monitor_id={} hwnd={:?} bounds=({},{} {}x{})",
                 key, hwnd, bounds.x, bounds.y, bounds.width, bounds.height
             );
         } else {
@@ -1146,10 +1163,7 @@ fn run_native_surface(
         }
         eprintln!("[NativeAnimated] ventana mostrada");
         log_window_diagnostics(hwnd, bounds, variant);
-        ready
-            .send(Ok(hwnd.0 as isize))
-            .map_err(|_| "El llamador cerró el POC".to_string())?;
-
+        let mut ready_sent = false;
         let mut message = MSG::default();
         loop {
             let status = unsafe { GetMessageW(&mut message, None, 0, 0).0 };
@@ -1158,6 +1172,23 @@ fn run_native_surface(
             }
             if status == 0 || message.message == WM_QUIT {
                 break;
+            }
+            if message.message == WM_NATIVE_MEDIA_READY {
+                if !ready_sent {
+                    surface_lifecycle
+                        .playing()
+                        .map_err(|error| error.to_string())?;
+                    ready_sent = true;
+                    if ready.send(Ok(hwnd.0 as isize)).is_err() {
+                        eprintln!(
+                            "[NativeAnimated] el llamador cerró el POC antes de confirmar ready"
+                        );
+                        unsafe {
+                            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                }
+                continue;
             }
             if message.message == WM_DISPLAYCHANGE || message.message == WM_DPICHANGED {
                 if surface_key.as_ref().is_some_and(is_surface_closing)
@@ -1545,6 +1576,7 @@ fn open_physical_surface_internal(
             if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
                 coordinator.abort(&assignment);
             }
+            let _ = close_physical_surface(&monitor_id);
             if remember_desired {
                 desired_surfaces()
                     .lock()
@@ -1571,8 +1603,17 @@ fn release_animated_assignment_if_current(monitor_id: &MonitorIdentity) {
             })
         });
         if let Some(operation) = operation {
-            coordinator.release(&operation);
+            let result = coordinator.release(&operation);
+            eprintln!(
+                "[MultiMonitorPOC] COORDINATOR_RELEASE monitor_id={} result={result:?}",
+                monitor_id
+            );
         }
+    } else {
+        eprintln!(
+            "[MultiMonitorPOC] COORDINATOR_RELEASE monitor_id={} result=CoordinatorLockFailed",
+            monitor_id
+        );
     }
 }
 
