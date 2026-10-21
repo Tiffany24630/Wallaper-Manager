@@ -279,6 +279,13 @@ fn is_current_surface_window(monitor_id: Option<&MonitorIdentity>, hwnd: HWND) -
     })
 }
 
+fn destroy_owned_window(hwnd: HWND, context: &str) -> Result<(), String> {
+    unsafe {
+        DestroyWindow(hwnd)
+            .map_err(|error| format!("DestroyWindow fallÃ³ ({context}) para {:?}: {error}", hwnd))
+    }
+}
+
 fn native_surface_closing() -> &'static AtomicBool {
     NATIVE_SURFACE_CLOSING.get_or_init(|| AtomicBool::new(false))
 }
@@ -1056,6 +1063,7 @@ fn run_native_surface(
     variant: ZOrderVariant,
     desktop_host_target: Option<desktop_host::RawDesktopHost>,
     surface_key: Option<MonitorIdentity>,
+    assignment: Option<AssignmentOperation>,
     ready: mpsc::Sender<Result<isize, String>>,
 ) {
     let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
@@ -1083,24 +1091,25 @@ fn run_native_surface(
         let mut lifecycle_notifications = match register_lifecycle_notifications(hwnd) {
             Ok(registration) => registration,
             Err(error) => {
-                unsafe {
-                    DestroyWindow(hwnd).ok();
+                if let Err(destroy_error) = destroy_owned_window(hwnd, "registro de notificaciones")
+                {
+                    eprintln!("[NativeAnimated] {destroy_error}");
                 }
                 return Err(error);
             }
         };
         if let Err(error) = apply_z_order(hwnd, variant) {
             unregister_lifecycle_notifications(hwnd, &mut lifecycle_notifications);
-            unsafe {
-                DestroyWindow(hwnd).ok();
+            if let Err(destroy_error) = destroy_owned_window(hwnd, "aplicaciÃ³n de Z-order") {
+                eprintln!("[NativeAnimated] {destroy_error}");
             }
             return Err(error);
         }
         let attached_to_desktop = if let Some(host) = desktop_host_target {
             if let Err(error) = desktop_host::attach_native_window(hwnd.0 as isize, host, bounds) {
                 unregister_lifecycle_notifications(hwnd, &mut lifecycle_notifications);
-                unsafe {
-                    DestroyWindow(hwnd).ok();
+                if let Err(destroy_error) = destroy_owned_window(hwnd, "asociaciÃ³n al host") {
+                    eprintln!("[NativeAnimated] {destroy_error}");
                 }
                 return Err(error);
             }
@@ -1127,17 +1136,15 @@ fn run_native_surface(
                     surface_lifecycle.failures()
                 );
                 unregister_lifecycle_notifications(hwnd, &mut lifecycle_notifications);
-                unsafe {
-                    if attached_to_desktop {
-                        if let Err(detach_error) =
-                            desktop_host::detach_native_window(hwnd.0 as isize)
-                        {
-                            eprintln!(
-                                "[NativeAnimated] error al separar tras fallo de WebView2: {detach_error}"
-                            );
-                        }
+                if attached_to_desktop {
+                    if let Err(detach_error) = desktop_host::detach_native_window(hwnd.0 as isize) {
+                        eprintln!(
+                            "[NativeAnimated] error al separar tras fallo de WebView2: {detach_error}"
+                        );
                     }
-                    DestroyWindow(hwnd).ok();
+                }
+                if let Err(destroy_error) = destroy_owned_window(hwnd, "fallo de WebView2") {
+                    eprintln!("[NativeAnimated] {destroy_error}");
                 }
                 return Err(error);
             }
@@ -1240,13 +1247,13 @@ fn run_native_surface(
         surface_lifecycle.begin_close();
         lifecycle.begin_cleanup();
         unregister_lifecycle_notifications(hwnd, &mut lifecycle_notifications);
-        unsafe {
-            if let Err(error) = controller.Close() {
-                eprintln!("[NativeAnimated] WEBVIEW2_CLOSE_FAILED error={error}");
-            }
+        let webview_close_error = unsafe { controller.Close().err() };
+        if let Some(error) = &webview_close_error {
+            eprintln!("[NativeAnimated] WEBVIEW2_CLOSE_FAILED error={error}");
+        } else {
+            eprintln!("[NativeAnimated] WebView2 destruido");
+            eprintln!("[RecoveryPOC] WEBVIEW2_CLOSED");
         }
-        eprintln!("[NativeAnimated] WebView2 destruido");
-        eprintln!("[RecoveryPOC] WEBVIEW2_CLOSED");
         let detach_error = if attached_to_desktop {
             desktop_host::detach_native_window(hwnd.0 as isize).err()
         } else {
@@ -1257,31 +1264,42 @@ fn run_native_surface(
         } else if attached_to_desktop {
             eprintln!("[RecoveryPOC] DETACHED");
         }
-        unsafe {
-            DestroyWindow(hwnd).ok();
-        }
-        eprintln!("[NativeAnimated] HWND destruido");
-        eprintln!("[RecoveryPOC] HWND_DESTROYED");
-        if let Some(key) = surface_key.as_ref() {
-            multi_surfaces()
-                .lock()
-                .expect("multi surface mutex poisoned")
-                .remove(key);
-            eprintln!("[MultiMonitorPOC] SURFACE_DESTROYED monitor_id={key}");
-            release_animated_assignment_if_current(key);
+        let destroy_error = destroy_owned_window(hwnd, "cierre de superficie").err();
+        if let Some(error) = &destroy_error {
+            eprintln!("[NativeAnimated] HWND_DESTROY_FAILED error={error}");
         } else {
-            *native_surface()
-                .lock()
-                .expect("native surface mutex poisoned") = None;
+            eprintln!("[NativeAnimated] HWND destruido");
+            eprintln!("[RecoveryPOC] HWND_DESTROYED");
+            if let Some(key) = surface_key.as_ref() {
+                multi_surfaces()
+                    .lock()
+                    .expect("multi surface mutex poisoned")
+                    .remove(key);
+                eprintln!("[MultiMonitorPOC] SURFACE_DESTROYED monitor_id={key}");
+                if let Some(assignment) = assignment.as_ref() {
+                    release_animated_assignment_if_current(assignment);
+                }
+            } else {
+                *native_surface()
+                    .lock()
+                    .expect("native surface mutex poisoned") = None;
+            }
         }
         lifecycle.finish_cleanup();
         surface_lifecycle.finish_close();
-        let _ = std::fs::remove_file(&media_path);
+        if webview_close_error.is_none() {
+            let _ = std::fs::remove_file(&media_path);
+            eprintln!("[NativeAnimated] temporal eliminado");
+        } else {
+            eprintln!(
+                "[NativeAnimated] temporal conservado porque WebView2 no confirmó su cierre path={}",
+                media_path.display()
+            );
+        }
         active_multi_temporaries()
             .lock()
             .expect("active temporary mutex poisoned")
             .remove(&media_path);
-        eprintln!("[NativeAnimated] temporal eliminado");
         if std::env::var_os("LUMINA_ANIMATED_DESKTOP_POC_FINAL_SNAPSHOT").is_some() {
             match desktop_host::snapshot_current_desktop() {
                 Ok(snapshot) => eprintln!(
@@ -1294,7 +1312,11 @@ fn run_native_surface(
                 }
             }
         }
-        detach_error.map_or(Ok(()), Err)
+        match (detach_error, destroy_error) {
+            (Some(error), _) => Err(error),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(()),
+        }
     })();
 
     if let Err(error) = result {
@@ -1354,7 +1376,15 @@ fn open_internal(
         variant.label()
     );
     let handle = thread::spawn(move || {
-        run_native_surface(monitor, thread_path, variant, desktop_host, None, ready_tx)
+        run_native_surface(
+            monitor,
+            thread_path,
+            variant,
+            desktop_host,
+            None,
+            None,
+            ready_tx,
+        )
     });
     *native_thread()
         .lock()
@@ -1508,6 +1538,7 @@ fn open_physical_surface_internal(
     let (ready_tx, ready_rx) = mpsc::channel();
     let thread_path = path.clone();
     let key = monitor_id.clone();
+    let thread_assignment = assignment.clone();
     let handle = thread::spawn(move || {
         run_native_surface(
             monitor,
@@ -1515,6 +1546,7 @@ fn open_physical_surface_internal(
             ZOrderVariant::ClickThrough,
             Some(desktop_host),
             Some(key),
+            Some(thread_assignment),
             ready_tx,
         )
     });
@@ -1612,24 +1644,18 @@ fn open_physical_surface_internal(
     }
 }
 
-fn release_animated_assignment_if_current(monitor_id: &MonitorIdentity) {
+fn release_animated_assignment_if_current(operation: &AssignmentOperation) {
     if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
-        let operation = coordinator.current(monitor_id).and_then(|assignment| {
-            (assignment.backend == WallpaperBackend::Animated).then(|| AssignmentOperation {
-                assignment: assignment.clone(),
-            })
-        });
-        if let Some(operation) = operation {
-            let result = coordinator.release(&operation);
-            eprintln!(
-                "[MultiMonitorPOC] COORDINATOR_RELEASE monitor_id={} result={result:?}",
-                monitor_id
-            );
-        }
+        let result = coordinator.release(operation);
+        eprintln!(
+            "[MultiMonitorPOC] COORDINATOR_RELEASE monitor_id={} generation={:?} result={result:?}",
+            operation.assignment.monitor, operation.assignment.generation
+        );
     } else {
         eprintln!(
-            "[MultiMonitorPOC] COORDINATOR_RELEASE monitor_id={} result=CoordinatorLockFailed",
-            monitor_id
+            "[MultiMonitorPOC] COORDINATOR_RELEASE monitor_id={} generation={:?} result=CoordinatorLockFailed",
+            operation.assignment.monitor,
+            operation.assignment.generation
         );
     }
 }

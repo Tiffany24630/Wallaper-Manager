@@ -362,6 +362,23 @@ pub fn attach_native_window(
         worker_w: HWND(host.1 as *mut _),
         shell_view: HWND(host.2 as *mut _),
     };
+    match validate_registered_host((
+        host.progman.0 as isize,
+        host.worker_w.0 as isize,
+        host.shell_view.0 as isize,
+    )) {
+        HostValidation::Stable => {}
+        HostValidation::Changed(reason) => {
+            return Err(format!(
+                "El host Explorer cambiÃ³ antes de SetParent: {reason}"
+            ));
+        }
+        HostValidation::Transient(reason) => {
+            return Err(format!(
+                "No se pudo revalidar el host Explorer antes de SetParent: {reason}"
+            ));
+        }
+    }
     let mut host_rect = RECT::default();
     unsafe {
         GetWindowRect(host.progman, &mut host_rect)

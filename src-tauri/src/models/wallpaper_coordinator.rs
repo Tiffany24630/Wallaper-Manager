@@ -56,6 +56,7 @@ pub(crate) enum CoordinatorError {
     Ambiguous,
     AlreadyPending,
     BackendNotCreated,
+    PreviousBackendStillActive,
     Obsolete,
     GenerationExhausted,
 }
@@ -74,6 +75,9 @@ impl std::fmt::Display for CoordinatorError {
             Self::Ambiguous => "la identidad del monitor es ambigua",
             Self::AlreadyPending => "ya existe una operaciÃ³n pendiente para el monitor",
             Self::BackendNotCreated => "el backend fÃ­sico no fue creado",
+            Self::PreviousBackendStillActive => {
+                "el backend animado anterior sigue activo fÃ­sicamente"
+            }
             Self::Obsolete => "la operaciÃ³n de asignaciÃ³n ya es obsoleta",
             Self::GenerationExhausted => "se agotaron las generaciones de asignaciÃ³n",
         })
@@ -245,6 +249,25 @@ impl WallpaperCoordinator {
         operation: &AssignmentOperation,
     ) -> Result<CoordinatorResult, CoordinatorError> {
         self.ensure_ready()?;
+        self.validate_previous_deactivated(operation)?;
+        let previous = self
+            .pending
+            .get(operation.assignment.monitor_ref())
+            .filter(|pending| {
+                pending.operation == *operation
+                    && pending.phase == PendingPhase::Prepared
+                    && !pending.previous_deactivated
+            })
+            .and_then(|pending| pending.previous.clone());
+        if previous.as_ref().is_some_and(|previous| {
+            previous.backend == WallpaperBackend::Animated
+                && self
+                    .registry
+                    .current(operation.assignment.monitor_ref())
+                    .is_some_and(|current| current == previous)
+        }) {
+            return Err(CoordinatorError::PreviousBackendStillActive);
+        }
         let had_previous = {
             let Some(pending) = self.pending.get_mut(operation.assignment.monitor_ref()) else {
                 return Err(CoordinatorError::Obsolete);
@@ -266,6 +289,32 @@ impl WallpaperCoordinator {
         } else {
             Ok(CoordinatorResult::NoPreviousBackend)
         }
+    }
+
+    pub(crate) fn validate_previous_deactivated(
+        &self,
+        operation: &AssignmentOperation,
+    ) -> Result<(), CoordinatorError> {
+        self.ensure_ready()?;
+        let Some(pending) = self.pending.get(operation.assignment.monitor_ref()) else {
+            return Err(CoordinatorError::Obsolete);
+        };
+        if pending.operation != *operation
+            || pending.phase != PendingPhase::Prepared
+            || pending.previous_deactivated
+        {
+            return Err(CoordinatorError::Obsolete);
+        }
+        if pending.previous.as_ref().is_some_and(|previous| {
+            previous.backend == WallpaperBackend::Animated
+                && self
+                    .registry
+                    .current(operation.assignment.monitor_ref())
+                    .is_some_and(|current| current == previous)
+        }) {
+            return Err(CoordinatorError::PreviousBackendStillActive);
+        }
+        Ok(())
     }
 
     pub(crate) fn confirm_activated(
@@ -622,6 +671,7 @@ mod tests {
         let static_operation = coordinator
             .reserve(monitor("native-a"), WallpaperBackend::Static)
             .unwrap();
+        coordinator.release(&animated);
         activate(&mut coordinator, &static_operation);
         assert_eq!(
             coordinator.commit(&animated),
@@ -747,6 +797,11 @@ mod tests {
         let static_operation = coordinator
             .reserve(monitor("native-a"), WallpaperBackend::Static)
             .unwrap();
+        assert_eq!(
+            coordinator.confirm_previous_deactivated(&static_operation),
+            Err(CoordinatorError::PreviousBackendStillActive)
+        );
+        assert_eq!(coordinator.release(&animated), CoordinatorResult::Released);
         activate(&mut coordinator, &static_operation);
         assert_eq!(
             coordinator.current(&monitor("native-a")).unwrap().backend,
@@ -816,6 +871,7 @@ mod tests {
         let replacement = coordinator
             .reserve(monitor("native-a"), WallpaperBackend::Static)
             .unwrap();
+        coordinator.release(&old);
         coordinator
             .confirm_previous_deactivated(&replacement)
             .unwrap();

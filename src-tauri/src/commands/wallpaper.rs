@@ -229,18 +229,27 @@ pub(crate) fn set_active_wallpaper_internal(wallpaper_id: String) -> Result<(), 
         let mut coordinator = wallpaper_coordinator::global()
             .lock()
             .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?;
-        for operation in &operations {
-            coordinator
-                .confirm_previous_deactivated(operation)
-                .map_err(|error| error.to_string())?;
-        }
-        for operation in &operations {
-            coordinator
-                .confirm_activated(operation)
-                .map_err(|error| error.to_string())?;
-            coordinator
-                .commit(operation)
-                .map_err(|error| error.to_string())?;
+        let coordination_result = (|| {
+            for operation in &operations {
+                coordinator
+                    .confirm_previous_deactivated(operation)
+                    .map_err(|error| error.to_string())?;
+            }
+            for operation in &operations {
+                coordinator
+                    .confirm_activated(operation)
+                    .map_err(|error| error.to_string())?;
+                coordinator
+                    .commit(operation)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = coordination_result {
+            for operation in &operations {
+                coordinator.abort(operation);
+            }
+            return Err(error);
         }
     }
     let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -264,7 +273,16 @@ fn reserve_static_for_all_monitors(
     for monitor_id in monitor_ids {
         let identity = MonitorIdentity::new(monitor_id).map_err(str::to_string)?;
         match coordinator.reserve(identity, WallpaperBackend::Static) {
-            Ok(operation) => operations.push(operation),
+            Ok(operation) => {
+                if let Err(error) = coordinator.validate_previous_deactivated(&operation) {
+                    for previous in &operations {
+                        coordinator.abort(previous);
+                    }
+                    coordinator.abort(&operation);
+                    return Err(error.to_string());
+                }
+                operations.push(operation)
+            }
             Err(error) => {
                 for operation in &operations {
                     coordinator.abort(operation);

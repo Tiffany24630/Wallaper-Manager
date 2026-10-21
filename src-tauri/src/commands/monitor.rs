@@ -186,6 +186,21 @@ pub fn restore_monitor_wallpapers(app: &tauri::AppHandle) -> Result<(), String> 
                 .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?
                 .reserve(identity, WallpaperBackend::Static)
                 .map_err(|error| error.to_string())?;
+            if let Err(error) = wallpaper_coordinator::global()
+                .lock()
+                .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())
+                .and_then(|coordinator| {
+                    coordinator
+                        .validate_previous_deactivated(&operation)
+                        .map_err(|error| error.to_string())
+                })
+            {
+                if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                    coordinator.abort(&operation);
+                }
+                restore_errors.push(format!("{monitor_id}: {error}"));
+                continue;
+            }
             if let Err(error) = set_monitor_wallpaper(&monitor_id, &path) {
                 if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
                     coordinator.abort(&operation);
@@ -266,6 +281,20 @@ pub fn assign_wallpaper_to_monitor(
         .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?
         .reserve(identity, WallpaperBackend::Static)
         .map_err(|error| error.to_string())?;
+    if let Err(error) = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())
+        .and_then(|coordinator| {
+            coordinator
+                .validate_previous_deactivated(&operation)
+                .map_err(|error| error.to_string())
+        })
+    {
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&operation);
+        }
+        return Err(error);
+    }
     if let Err(error) = set_monitor_wallpaper(&monitor_id, &path) {
         if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
             coordinator.abort(&operation);

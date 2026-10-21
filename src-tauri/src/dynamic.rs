@@ -202,6 +202,21 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
                     continue;
                 }
             };
+            if let Err(error) = wallpaper_coordinator::global()
+                .lock()
+                .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())
+                .and_then(|coordinator| {
+                    coordinator
+                        .validate_previous_deactivated(&operation)
+                        .map_err(|error| error.to_string())
+                })
+            {
+                if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                    coordinator.abort(&operation);
+                }
+                set_monitor_playlist_error(&conn, &monitor_id, &error);
+                continue;
+            }
             match set_monitor_wallpaper(&monitor_id, path) {
                 Ok(()) => {
                     let committed = wallpaper_coordinator::global()
