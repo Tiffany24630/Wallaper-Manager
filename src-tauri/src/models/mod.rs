@@ -6,3 +6,4 @@ pub mod playlist;
 pub mod settings;
 pub mod sync;
 pub mod wallpaper;
+pub mod wallpaper_coordinator;

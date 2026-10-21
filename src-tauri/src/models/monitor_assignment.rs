@@ -197,6 +197,35 @@ fn validate_native_descriptors(native: &[NativeMonitorDescriptor]) -> Result<(),
 }
 
 impl MonitorAssignmentRegistry {
+    pub(crate) fn reserve(
+        &mut self,
+        monitor: MonitorIdentity,
+        backend: WallpaperBackend,
+    ) -> Result<MonitorAssignment, &'static str> {
+        let next = self.next_generation.entry(monitor.clone()).or_insert(0);
+        *next = next
+            .checked_add(1)
+            .ok_or("se agotaron las generaciones de asignaciÃ³n del monitor")?;
+        Ok(MonitorAssignment {
+            monitor,
+            backend,
+            generation: AssignmentGeneration(*next),
+        })
+    }
+
+    pub(crate) fn activate(&mut self, assignment: MonitorAssignment) -> Result<(), &'static str> {
+        let next = self
+            .next_generation
+            .get(&assignment.monitor)
+            .copied()
+            .unwrap_or_default();
+        if next != assignment.generation.value() {
+            return Err("la asignaciÃ³n ya no es la generaciÃ³n vigente");
+        }
+        self.current.insert(assignment.monitor.clone(), assignment);
+        Ok(())
+    }
+
     pub(crate) fn begin(
         &mut self,
         monitor: MonitorIdentity,
@@ -231,10 +260,14 @@ impl MonitorAssignmentRegistry {
     pub(crate) fn compare(&self, left: &MonitorAssignment, right: &MonitorAssignment) -> bool {
         left == right
     }
+
+    pub(crate) fn assignments(&self) -> Vec<&MonitorAssignment> {
+        self.current.values().collect()
+    }
 }
 
 impl MonitorAssignment {
-    fn monitor_ref(&self) -> &MonitorIdentity {
+    pub(crate) fn monitor_ref(&self) -> &MonitorIdentity {
         &self.monitor
     }
 }

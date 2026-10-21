@@ -1,6 +1,10 @@
 use crate::{
-    commands::settings::DYNAMIC_INTERVALS, commands::wallpaper::set_active_wallpaper_internal,
-    db::get_connection, utils::windows_wallpaper::set_monitor_wallpaper,
+    commands::settings::DYNAMIC_INTERVALS,
+    commands::wallpaper::set_active_wallpaper_internal,
+    db::get_connection,
+    models::monitor_assignment::{MonitorIdentity, WallpaperBackend},
+    models::wallpaper_coordinator,
+    utils::windows_wallpaper::set_monitor_wallpaper,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -107,15 +111,59 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
                 .find(|(id, _)| id == &next_id)
                 .map(|(_, path)| path)
                 .expect("selected playlist wallpaper must exist");
+            let identity = match MonitorIdentity::new(monitor_id.clone()) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    set_monitor_playlist_error(&conn, &monitor_id, error);
+                    continue;
+                }
+            };
+            let operation = match wallpaper_coordinator::global().lock() {
+                Ok(mut coordinator) => coordinator.reserve(identity, WallpaperBackend::Static),
+                Err(_) => Err(crate::models::wallpaper_coordinator::CoordinatorError::Obsolete),
+            };
+            let operation = match operation {
+                Ok(operation) => operation,
+                Err(error) => {
+                    set_monitor_playlist_error(&conn, &monitor_id, &error.to_string());
+                    continue;
+                }
+            };
             match set_monitor_wallpaper(&monitor_id, path) {
                 Ok(()) => {
-                    conn.execute(
-                        "UPDATE monitor_playlists SET current_wallpaper_id = ?1, last_error = NULL WHERE monitor_id = ?2",
-                        (&next_id, &monitor_id),
-                    )
-                    .map_err(|e| e.to_string())?;
+                    let committed = wallpaper_coordinator::global()
+                        .lock()
+                        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())
+                        .and_then(|mut coordinator| {
+                            coordinator
+                                .confirm_previous_deactivated(&operation)
+                                .map_err(|error| error.to_string())?;
+                            coordinator
+                                .confirm_activated(&operation)
+                                .map_err(|error| error.to_string())?;
+                            coordinator
+                                .commit(&operation)
+                                .map_err(|error| error.to_string())
+                        });
+                    match committed {
+                        Ok(_) => {
+                            conn.execute(
+                                "UPDATE monitor_playlists SET current_wallpaper_id = ?1, last_error = NULL WHERE monitor_id = ?2",
+                                (&next_id, &monitor_id),
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        Err(error) => {
+                            set_monitor_playlist_error(&conn, &monitor_id, &error.to_string())
+                        }
+                    }
                 }
-                Err(error) => set_monitor_playlist_error(&conn, &monitor_id, &error.to_string()),
+                Err(error) => {
+                    if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                        coordinator.abort(&operation);
+                    }
+                    set_monitor_playlist_error(&conn, &monitor_id, &error.to_string());
+                }
             }
         }
         return Ok(Some(interval));

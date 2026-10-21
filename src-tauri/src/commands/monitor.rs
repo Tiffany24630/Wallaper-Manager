@@ -3,15 +3,17 @@ use crate::{
     dynamic::DynamicScheduler,
     models::monitor::MonitorInfo,
     models::monitor_assignment::{
-        resolve_monitor_identities, MonitorGeometry, MonitorResolution, UiMonitorDescriptor,
+        resolve_monitor_identities, MonitorGeometry, MonitorIdentity, MonitorResolution,
+        UiMonitorDescriptor, WallpaperBackend,
     },
     models::monitor_playlist::MonitorPlaylist,
+    models::wallpaper_coordinator,
     utils::windows_wallpaper::{native_monitor_descriptors, set_monitor_wallpaper},
 };
 use tauri::Manager;
 use tauri::State;
 
-fn current_monitor_ids(app: &tauri::AppHandle) -> Result<Vec<String>, String> {
+pub(crate) fn current_monitor_ids(app: &tauri::AppHandle) -> Result<Vec<String>, String> {
     let window = app
         .get_webview_window("main")
         .ok_or("No se encontró la ventana principal")?;
@@ -174,8 +176,33 @@ pub fn restore_monitor_wallpapers(app: &tauri::AppHandle) -> Result<(), String> 
             continue;
         };
         if std::path::Path::new(&path).is_file() {
-            set_monitor_wallpaper(&monitor_id, &path)
-                .map_err(|e| format!("Windows no pudo restaurar el fondo del monitor: {e}"))?;
+            let identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
+            let operation = wallpaper_coordinator::global()
+                .lock()
+                .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?
+                .reserve(identity, WallpaperBackend::Static)
+                .map_err(|error| error.to_string())?;
+            if let Err(error) = set_monitor_wallpaper(&monitor_id, &path) {
+                if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                    coordinator.abort(&operation);
+                }
+                return Err(format!(
+                    "Windows no pudo restaurar el fondo del monitor: {error}"
+                ));
+            }
+            let mut coordinator = wallpaper_coordinator::global()
+                .lock()
+                .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?;
+            if let Err(error) = coordinator.confirm_previous_deactivated(&operation) {
+                coordinator.abort(&operation);
+                return Err(error.to_string());
+            }
+            coordinator
+                .confirm_activated(&operation)
+                .map_err(|error| error.to_string())?;
+            coordinator
+                .commit(&operation)
+                .map_err(|error| error.to_string())?;
         }
     }
     Ok(())
@@ -215,8 +242,33 @@ pub fn assign_wallpaper_to_monitor(
     };
     wallpaper::set_mode(mode)
         .map_err(|e| format!("Windows no pudo cambiar el modo de ajuste: {e}"))?;
-    set_monitor_wallpaper(&monitor_id, &path)
-        .map_err(|e| format!("Windows no pudo aplicar el fondo al monitor: {e}"))?;
+    let identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
+    let operation = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?
+        .reserve(identity, WallpaperBackend::Static)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = set_monitor_wallpaper(&monitor_id, &path) {
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&operation);
+        }
+        return Err(format!(
+            "Windows no pudo aplicar el fondo al monitor: {error}"
+        ));
+    }
+    let mut coordinator = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?;
+    if let Err(error) = coordinator.confirm_previous_deactivated(&operation) {
+        coordinator.abort(&operation);
+        return Err(error.to_string());
+    }
+    coordinator
+        .confirm_activated(&operation)
+        .map_err(|error| error.to_string())?;
+    coordinator
+        .commit(&operation)
+        .map_err(|error| error.to_string())?;
     conn.execute(
         "INSERT OR REPLACE INTO monitor_wallpapers(monitor_id, wallpaper_id) VALUES(?1, ?2)",
         (&monitor_id, &wallpaper_id),

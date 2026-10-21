@@ -1,4 +1,9 @@
-use crate::dynamic::DynamicScheduler;
+use crate::{
+    dynamic::DynamicScheduler,
+    models::monitor_assignment::{MonitorIdentity, WallpaperBackend},
+    models::wallpaper_coordinator,
+    utils::windows_wallpaper::available_monitor_ids,
+};
 use chrono::Utc;
 use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat};
 use rand::seq::SliceRandom;
@@ -208,10 +213,35 @@ pub(crate) fn set_active_wallpaper_internal(wallpaper_id: String) -> Result<(), 
         "center" => wallpaper::Mode::Center,
         _ => wallpaper::Mode::Crop,
     };
-    wallpaper::set_mode(mode)
-        .map_err(|e| format!("Windows no pudo cambiar el modo de ajuste: {e}"))?;
-    wallpaper::set_from_path(&path)
-        .map_err(|e| format!("Windows no pudo aplicar el fondo: {e}"))?;
+    let operations = reserve_static_for_all_monitors()?;
+    if let Err(error) = wallpaper::set_mode(mode)
+        .map_err(|e| format!("Windows no pudo cambiar el modo de ajuste: {e}"))
+        .and_then(|_| {
+            wallpaper::set_from_path(&path)
+                .map_err(|e| format!("Windows no pudo aplicar el fondo: {e}"))
+        })
+    {
+        abort_operations(&operations);
+        return Err(error);
+    }
+    {
+        let mut coordinator = wallpaper_coordinator::global()
+            .lock()
+            .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?;
+        for operation in &operations {
+            coordinator
+                .confirm_previous_deactivated(operation)
+                .map_err(|error| error.to_string())?;
+        }
+        for operation in &operations {
+            coordinator
+                .confirm_activated(operation)
+                .map_err(|error| error.to_string())?;
+            coordinator
+                .commit(operation)
+                .map_err(|error| error.to_string())?;
+        }
+    }
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute("UPDATE wallpapers SET active = 0", [])
         .map_err(|e| e.to_string())?;
@@ -221,6 +251,36 @@ pub(crate) fn set_active_wallpaper_internal(wallpaper_id: String) -> Result<(), 
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
+}
+
+fn reserve_static_for_all_monitors(
+) -> Result<Vec<wallpaper_coordinator::AssignmentOperation>, String> {
+    let monitor_ids = available_monitor_ids().map_err(|error| error.to_string())?;
+    let mut operations = Vec::with_capacity(monitor_ids.len());
+    let mut coordinator = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?;
+    for monitor_id in monitor_ids {
+        let identity = MonitorIdentity::new(monitor_id).map_err(str::to_string)?;
+        match coordinator.reserve(identity, WallpaperBackend::Static) {
+            Ok(operation) => operations.push(operation),
+            Err(error) => {
+                for operation in &operations {
+                    coordinator.abort(operation);
+                }
+                return Err(error.to_string());
+            }
+        }
+    }
+    Ok(operations)
+}
+
+fn abort_operations(operations: &[wallpaper_coordinator::AssignmentOperation]) {
+    if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+        for operation in operations {
+            coordinator.abort(operation);
+        }
+    }
 }
 
 #[tauri::command]

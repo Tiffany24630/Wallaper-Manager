@@ -533,6 +533,37 @@ mod tests {
     }
 
     #[test]
+    fn monitor_identity_survives_enumeration_reordering_and_geometry_changes() {
+        let a = monitor("native-a", 0, 144);
+        let b = monitor("native-b", 1920, 96);
+        let mut coordinator = MonitorCoordinator::default();
+        coordinator.create(&a).unwrap();
+        coordinator.create(&b).unwrap();
+
+        let reordered = [b.clone(), a.clone()];
+        assert_eq!(reordered[0].id, b.id);
+        assert_eq!(reordered[1].id, a.id);
+        coordinator
+            .update_geometry(
+                &a.id,
+                LogicalBounds {
+                    x: -1920,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                120,
+            )
+            .unwrap();
+
+        assert_eq!(coordinator.surface(&a.id).unwrap().monitor_id, a.id);
+        assert_eq!(coordinator.surface(&a.id).unwrap().bounds.x, -1920);
+        assert_eq!(coordinator.surface(&a.id).unwrap().dpi, 120);
+        assert_eq!(coordinator.surface(&b.id).unwrap().bounds.x, 1920);
+        assert_eq!(coordinator.surface(&b.id).unwrap().dpi, 96);
+    }
+
+    #[test]
     fn accepts_negative_coordinates_but_rejects_invalid_or_overflowing_bounds() {
         assert!(LogicalBounds {
             x: -1920,

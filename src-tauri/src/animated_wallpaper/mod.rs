@@ -5,10 +5,12 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use crate::models::monitor_assignment::WallpaperBackend;
 use crate::models::monitor_assignment::{
     resolve_monitor_identities, MonitorGeometry, MonitorIdentity, MonitorResolution,
     UiMonitorDescriptor,
 };
+use crate::models::wallpaper_coordinator::{self, AssignmentOperation};
 use image::{
     codecs::gif::{GifDecoder, GifEncoder, Repeat},
     AnimationDecoder, Delay, Frame, ImageDecoder, Rgba, RgbaImage,
@@ -192,6 +194,7 @@ pub(crate) fn validate_animated_gif(
 struct PrototypeSurfaceRecord {
     lifecycle: AnimatedSurfaceLifecycle,
     activation_id: String,
+    assignment: AssignmentOperation,
 }
 
 fn activation_matches(record: &PrototypeSurfaceRecord, activation_id: &str) -> bool {
@@ -215,7 +218,11 @@ fn prototype_surfaces() -> &'static Mutex<BTreeMap<String, PrototypeSurfaceRecor
     PROTOTYPE_SURFACES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn register_prototype_surface(label: &str, activation_id: &str) -> Result<(), String> {
+fn register_prototype_surface(
+    label: &str,
+    activation_id: &str,
+    assignment: AssignmentOperation,
+) -> Result<(), String> {
     let mut lifecycle = AnimatedSurfaceLifecycle::new();
     lifecycle.begin_create().map_err(str::to_string)?;
     lifecycle.webview_ready().map_err(str::to_string)?;
@@ -240,6 +247,7 @@ fn register_prototype_surface(label: &str, activation_id: &str) -> Result<(), St
         PrototypeSurfaceRecord {
             lifecycle,
             activation_id: activation_id.to_string(),
+            assignment,
         },
     );
     Ok(())
@@ -254,13 +262,22 @@ fn begin_explicit_prototype_close(label: &str) {
 }
 
 fn finish_prototype_close(label: &str, activation_id: Option<&str>) {
-    if let Ok(mut surfaces) = prototype_surfaces().lock() {
-        if let Some(record) = surfaces.get_mut(label) {
-            if activation_id.is_some_and(|id| id != record.activation_id) {
-                eprintln!("ANIMATED_SURFACE_CLOSE_IGNORED surface={label} reason=stale_activation");
-                return;
-            }
-            record.lifecycle.finish_close();
+    let assignment = if let Ok(mut surfaces) = prototype_surfaces().lock() {
+        let Some(record) = surfaces.get_mut(label) else {
+            return;
+        };
+        if activation_id.is_some_and(|id| id != record.activation_id) {
+            eprintln!("ANIMATED_SURFACE_CLOSE_IGNORED surface={label} reason=stale_activation");
+            return;
+        }
+        record.lifecycle.finish_close();
+        Some(record.assignment.clone())
+    } else {
+        None
+    };
+    if let Some(assignment) = assignment {
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.release(&assignment);
         }
     }
 }
@@ -677,6 +694,11 @@ pub async fn open_animated_prototype(
         smoke_variant_options(5)?
     };
     eprintln!("Animated prototype options: {options:?}");
+    let assignment = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?
+        .reserve(monitor_identity.clone(), WallpaperBackend::Animated)
+        .map_err(|error| error.to_string())?;
     let mut builder = WebviewWindowBuilder::new(&app, &label, url)
         .title("Lumina animated wallpaper prototype")
         .decorations(options.decorations)
@@ -697,12 +719,21 @@ pub async fn open_animated_prototype(
     builder = builder
         .skip_taskbar(options.skip_taskbar)
         .always_on_bottom(options.always_on_bottom);
-    let window = builder.build().map_err(|e| {
-        let _ = fs::remove_file(&cleanup_path);
-        format!("No se pudo crear la superficie WebView2: {e}")
-    })?;
+    let window = match builder.build() {
+        Ok(window) => window,
+        Err(error) => {
+            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                coordinator.abort(&assignment);
+            }
+            let _ = fs::remove_file(&cleanup_path);
+            return Err(format!("No se pudo crear la superficie WebView2: {error}"));
+        }
+    };
 
-    if let Err(error) = register_prototype_surface(&label, &activation_id) {
+    if let Err(error) = register_prototype_surface(&label, &activation_id, assignment.clone()) {
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&assignment);
+        }
         let _ = window.close();
         let _ = fs::remove_file(&cleanup_path);
         return Err(error);
@@ -711,6 +742,9 @@ pub async fn open_animated_prototype(
     if workerw_mode {
         #[cfg(target_os = "windows")]
         if let Err(error) = desktop_host::attach_to_worker_w(&window, bounds) {
+            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                coordinator.abort(&assignment);
+            }
             let _ = window.close();
             let _ = fs::remove_file(&cleanup_path);
             return Err(format!(
@@ -719,6 +753,9 @@ pub async fn open_animated_prototype(
         }
         #[cfg(not(target_os = "windows"))]
         {
+            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                coordinator.abort(&assignment);
+            }
             let _ = window.close();
             let _ = fs::remove_file(&cleanup_path);
             return Err("El host WorkerW experimental solo está disponible en Windows".into());
@@ -726,6 +763,9 @@ pub async fn open_animated_prototype(
     }
 
     if let Err(error) = window.set_ignore_cursor_events(options.ignore_cursor_events) {
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&assignment);
+        }
         let _ = window.close();
         let _ = fs::remove_file(&cleanup_path);
         return Err(format!(
@@ -748,11 +788,47 @@ pub async fn open_animated_prototype(
     });
     if let Err(error) = window.show() {
         begin_explicit_prototype_close(&label);
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&assignment);
+        }
         let _ = window.close();
         let _ = fs::remove_file(&cleanup_path);
         return Err(format!(
             "No se pudo mostrar la superficie WebView2: {error}"
         ));
+    }
+    if let Err(error) = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?
+        .confirm_previous_deactivated(&assignment)
+    {
+        begin_explicit_prototype_close(&label);
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&assignment);
+        }
+        let _ = window.close();
+        let _ = fs::remove_file(&cleanup_path);
+        return Err(error.to_string());
+    }
+    let commit_result = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())
+        .and_then(|mut coordinator| {
+            coordinator
+                .confirm_activated(&assignment)
+                .map_err(|error| error.to_string())?;
+            coordinator
+                .commit(&assignment)
+                .map_err(|error| error.to_string())
+        });
+    if let Err(error) = commit_result {
+        begin_explicit_prototype_close(&label);
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&assignment);
+        }
+        let _ = window.close();
+        let _ = fs::remove_file(&cleanup_path);
+        return Err(error.to_string());
     }
     eprintln!("Animated prototype window shown: {label}");
     Ok(())
@@ -1523,6 +1599,8 @@ mod tests {
         PrototypeSurfaceRecord, MAX_ANIMATED_DIMENSION, MAX_ANIMATED_FILE_BYTES,
     };
     use crate::models::monitor_assignment::MonitorIdentity;
+    use crate::models::monitor_assignment::WallpaperBackend;
+    use crate::models::wallpaper_coordinator::WallpaperCoordinator;
     use image::GenericImageView;
     use uuid::Uuid;
 
@@ -1565,9 +1643,14 @@ mod tests {
 
     #[test]
     fn stale_activation_cannot_target_a_new_surface_on_the_same_monitor() {
+        let mut coordinator = WallpaperCoordinator::default();
+        let assignment = coordinator
+            .reserve("test-monitor".into(), WallpaperBackend::Animated)
+            .unwrap();
         let old = PrototypeSurfaceRecord {
             lifecycle: AnimatedSurfaceLifecycle::new(),
             activation_id: "activation-old".into(),
+            assignment,
         };
         assert!(activation_matches(&old, "activation-old"));
         assert!(!activation_matches(&old, "activation-new"));

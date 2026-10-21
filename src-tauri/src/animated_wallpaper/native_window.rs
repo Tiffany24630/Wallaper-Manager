@@ -18,6 +18,8 @@ use std::{
 };
 
 use crate::models::monitor_assignment::MonitorIdentity;
+use crate::models::monitor_assignment::WallpaperBackend;
+use crate::models::wallpaper_coordinator::{self, AssignmentOperation};
 use tauri::AppHandle;
 use webview2_com::{
     CoTaskMemPWSTR, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
@@ -1233,6 +1235,7 @@ fn run_native_surface(
                 .expect("multi surface mutex poisoned")
                 .remove(key);
             eprintln!("[MultiMonitorPOC] SURFACE_DESTROYED monitor_id={key}");
+            release_animated_assignment_if_current(key);
         } else {
             *native_surface()
                 .lock()
@@ -1424,12 +1427,31 @@ fn open_physical_surface_internal(
         );
     }
 
-    let path = prototype_directory(app)?.join(format!(
-        "native-multimonitor-{}-{}.gif",
-        sanitize_monitor_id(&monitor_id),
-        uuid::Uuid::new_v4()
-    ));
-    create_diagnostic_gif(&path)?;
+    let assignment = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?
+        .reserve(monitor_id.clone(), WallpaperBackend::Animated)
+        .map_err(|error| error.to_string())?;
+
+    let path = match prototype_directory(app) {
+        Ok(directory) => directory.join(format!(
+            "native-multimonitor-{}-{}.gif",
+            sanitize_monitor_id(&monitor_id),
+            uuid::Uuid::new_v4()
+        )),
+        Err(error) => {
+            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                coordinator.abort(&assignment);
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = create_diagnostic_gif(&path) {
+        if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+            coordinator.abort(&assignment);
+        }
+        return Err(error);
+    }
     active_multi_temporaries()
         .lock()
         .expect("active temporary mutex poisoned")
@@ -1467,6 +1489,27 @@ fn open_physical_surface_internal(
         .insert(monitor_id.clone(), handle);
     match ready_rx.recv_timeout(Duration::from_secs(15)) {
         Ok(Ok(hwnd)) => {
+            let commit_result = wallpaper_coordinator::global()
+                .lock()
+                .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())
+                .and_then(|mut coordinator| {
+                    coordinator
+                        .confirm_previous_deactivated(&assignment)
+                        .map_err(|error| error.to_string())?;
+                    coordinator
+                        .confirm_activated(&assignment)
+                        .map_err(|error| error.to_string())?;
+                    coordinator
+                        .commit(&assignment)
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = commit_result {
+                if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                    coordinator.abort(&assignment);
+                }
+                let _ = close_physical_surface(&monitor_id);
+                return Err(error.to_string());
+            }
             eprintln!(
                 "[MultiMonitorPOC] RENDERER_CREATED monitor_id={} hwnd=0x{:x} host=0x{:x}",
                 monitor_id, hwnd, desktop_host.1
@@ -1475,6 +1518,9 @@ fn open_physical_surface_internal(
             Ok(())
         }
         Ok(Err(error)) => {
+            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                coordinator.abort(&assignment);
+            }
             if remember_desired {
                 desired_surfaces()
                     .lock()
@@ -1496,6 +1542,9 @@ fn open_physical_surface_internal(
             Err(error)
         }
         Err(_) => {
+            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                coordinator.abort(&assignment);
+            }
             if remember_desired {
                 desired_surfaces()
                     .lock()
@@ -1510,6 +1559,19 @@ fn open_physical_surface_internal(
             Err(format!(
                 "La superficie del monitor {monitor_id} no confirmó su inicialización"
             ))
+        }
+    }
+}
+
+fn release_animated_assignment_if_current(monitor_id: &MonitorIdentity) {
+    if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+        let operation = coordinator.current(monitor_id).and_then(|assignment| {
+            (assignment.backend == WallpaperBackend::Animated).then(|| AssignmentOperation {
+                assignment: assignment.clone(),
+            })
+        });
+        if let Some(operation) = operation {
+            coordinator.release(&operation);
         }
     }
 }
