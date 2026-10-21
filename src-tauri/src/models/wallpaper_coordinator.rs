@@ -56,6 +56,7 @@ pub(crate) enum CoordinatorError {
     Ambiguous,
     AlreadyPending,
     BackendNotCreated,
+    EvidenceIncompatible,
     PreviousBackendStillActive,
     Obsolete,
     GenerationExhausted,
@@ -75,6 +76,7 @@ impl std::fmt::Display for CoordinatorError {
             Self::Ambiguous => "la identidad del monitor es ambigua",
             Self::AlreadyPending => "ya existe una operaciÃ³n pendiente para el monitor",
             Self::BackendNotCreated => "el backend fÃ­sico no fue creado",
+            Self::EvidenceIncompatible => "la evidencia no es compatible con el backend solicitado",
             Self::PreviousBackendStillActive => {
                 "el backend animado anterior sigue activo fÃ­sicamente"
             }
@@ -351,6 +353,17 @@ impl WallpaperCoordinator {
         if pending.operation != *operation || pending.phase != PendingPhase::Activated {
             return Err(CoordinatorError::Obsolete);
         }
+        let evidence_allowed = match operation.assignment.backend {
+            WallpaperBackend::Static | WallpaperBackend::Unassigned => {
+                evidence == AssignmentEvidence::Confirmed
+            }
+            WallpaperBackend::Animated => {
+                evidence == AssignmentEvidence::ResourceReadyVisibilityUnverified
+            }
+        };
+        if !evidence_allowed {
+            return Err(CoordinatorError::EvidenceIncompatible);
+        }
         self.pending.remove(&operation.assignment.monitor);
         self.registry
             .activate(operation.assignment.clone())
@@ -542,13 +555,6 @@ mod tests {
 
     #[test]
     fn resource_ready_does_not_claim_physical_visibility() {
-        let mut coordinator = WallpaperCoordinator::default();
-        let operation = coordinator
-            .reserve(monitor("native-a"), WallpaperBackend::Animated)
-            .unwrap();
-        activate(&mut coordinator, &operation);
-        // The normal helper represents a backend whose physical effect was
-        // confirmed. Animated media readiness uses the explicit weaker path.
         let mut unverified = WallpaperCoordinator::default();
         let animated = unverified
             .reserve(monitor("native-a"), WallpaperBackend::Animated)
@@ -569,7 +575,24 @@ mod tests {
             Some(AssignmentEvidence::ResourceReadyVisibilityUnverified)
         );
         assert!(!unverified.is_physically_confirmed(&monitor("native-a")));
-        assert!(coordinator.is_physically_confirmed(&monitor("native-a")));
+    }
+
+    #[test]
+    fn animated_cannot_commit_as_physically_confirmed() {
+        let mut coordinator = WallpaperCoordinator::default();
+        let operation = coordinator
+            .reserve(monitor("native-a"), WallpaperBackend::Animated)
+            .unwrap();
+        coordinator
+            .confirm_previous_deactivated(&operation)
+            .unwrap();
+        coordinator.confirm_activated(&operation).unwrap();
+        assert_eq!(
+            coordinator.commit(&operation),
+            Err(CoordinatorError::EvidenceIncompatible)
+        );
+        assert!(coordinator.pending(&monitor("native-a")).is_some());
+        assert!(coordinator.current(&monitor("native-a")).is_none());
     }
 
     #[test]
@@ -617,7 +640,17 @@ mod tests {
     fn activate(coordinator: &mut WallpaperCoordinator, operation: &super::AssignmentOperation) {
         coordinator.confirm_previous_deactivated(operation).unwrap();
         coordinator.confirm_activated(operation).unwrap();
-        coordinator.commit(operation).unwrap();
+        let evidence = match operation.assignment.backend {
+            super::WallpaperBackend::Animated => {
+                AssignmentEvidence::ResourceReadyVisibilityUnverified
+            }
+            super::WallpaperBackend::Static | super::WallpaperBackend::Unassigned => {
+                AssignmentEvidence::Confirmed
+            }
+        };
+        coordinator
+            .commit_with_evidence(operation, evidence)
+            .unwrap();
     }
 
     #[test]

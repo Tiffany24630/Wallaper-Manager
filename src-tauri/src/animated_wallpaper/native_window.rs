@@ -2205,7 +2205,7 @@ mod tests {
         validate_native_media, NotificationRegistration, TemporaryClassification,
     };
     use crate::models::monitor_assignment::{MonitorIdentity, WallpaperBackend};
-    use crate::models::wallpaper_coordinator::WallpaperCoordinator;
+    use crate::models::wallpaper_coordinator::{AssignmentEvidence, WallpaperCoordinator};
     use std::{
         collections::BTreeSet,
         fs,
@@ -2273,7 +2273,12 @@ mod tests {
             .reserve(monitor.clone(), WallpaperBackend::Animated)
             .unwrap();
         coordinator.confirm_activated(&first).unwrap();
-        coordinator.commit(&first).unwrap();
+        coordinator
+            .commit_with_evidence(
+                &first,
+                AssignmentEvidence::ResourceReadyVisibilityUnverified,
+            )
+            .unwrap();
         assert!(desired_assignment_is_recoverable(
             Some(&first.assignment),
             &first,
