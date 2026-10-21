@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { useSystemStore } from "../../store/systemStore";
 import { formatBytes, formatPercent, formatUptime } from "../../utils/format";
 import { animatedPrototypeService } from "../../services/animatedPrototypeService";
+import { monitorService } from "../../services/monitorService";
 import { useState } from "react";
 
 function safePercent(used: number, total: number) { return total > 0 ? Math.min(100, (used / total) * 100) : 0; }
@@ -11,7 +12,7 @@ export default function Dashboard() {
   const { systemInfo, loading, error, refresh, startPolling, stopPolling } = useSystemStore();
   const [prototypeBusy, setPrototypeBusy] = useState(false);
   const [prototypeMessage, setPrototypeMessage] = useState<string | null>(null);
-  const runPrototypeTest = () => { setPrototypeBusy(true); setPrototypeMessage(null); void animatedPrototypeService.openGeneratedTest(0).then(() => setPrototypeMessage("GIF generado y ventana WebView2 abierta.")).catch(error => setPrototypeMessage(String(error))).finally(() => setPrototypeBusy(false)); };
+  const runPrototypeTest = () => { setPrototypeBusy(true); setPrototypeMessage(null); void monitorService.getAll().then(monitors => { const monitor = monitors.find(item => item.primary) ?? monitors[0]; if (!monitor) throw new Error("No se detectaron monitores"); return animatedPrototypeService.openGeneratedTest(monitor.id); }).then(() => setPrototypeMessage("GIF generado y ventana WebView2 abierta.")).catch(error => setPrototypeMessage(String(error))).finally(() => setPrototypeBusy(false)); };
   useEffect(() => { startPolling(); return stopPolling; }, [startPolling, stopPolling]);
   const memory = systemInfo ? safePercent(systemInfo.usedMemory, systemInfo.totalMemory) : 0;
   const storage = systemInfo ? safePercent(systemInfo.usedStorage, systemInfo.totalStorage) : 0;

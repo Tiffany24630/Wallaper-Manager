@@ -10,24 +10,24 @@ export const animatedPrototypeService = {
     return typeof selected === "string" ? selected : null;
   },
 
-  open(mediaPath: string, monitorIndex = 0, diagnostic = true): Promise<void> {
-    return tauriInvoke("open_animated_prototype", { mediaPath, monitorIndex, diagnostic });
+  open(mediaPath: string, monitorId: string, diagnostic = true): Promise<void> {
+    return tauriInvoke("open_animated_prototype", { mediaPath, monitorId, diagnostic });
   },
 
-  openGeneratedTest(monitorIndex = 0): Promise<void> {
-    return tauriInvoke("open_animated_prototype_test", { monitorIndex });
+  openGeneratedTest(monitorId: string): Promise<void> {
+    return tauriInvoke("open_animated_prototype_test", { monitorId });
   },
 
-  openNativeGeneratedTest(monitorIndex = 0): Promise<void> {
-    return tauriInvoke("open_native_animated_prototype_test", { monitorIndex });
+  openNativeGeneratedTest(monitorId: string): Promise<void> {
+    return tauriInvoke("open_native_animated_prototype_test", { monitorId });
   },
 
   closeNative(): Promise<void> {
     return tauriInvoke("close_native_animated_prototype");
   },
 
-  close(monitorIndex = 0): Promise<void> {
-    return tauriInvoke("close_animated_prototype", { monitorIndex });
+  close(monitorId: string): Promise<void> {
+    return tauriInvoke("close_animated_prototype", { monitorId });
   },
 
   reportMediaError(

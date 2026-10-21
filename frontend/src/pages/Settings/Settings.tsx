@@ -41,7 +41,7 @@ export default function Settings() {
   const [prototypeMediaPath, setPrototypeMediaPath] = useState<string | null>(null);
   const [prototypeStatus, setPrototypeStatus] = useState("Selecciona un archivo MP4 o GIF para comenzar.");
   const [prototypeMonitors, setPrototypeMonitors] = useState<Monitor[]>([]);
-  const [prototypeMonitorIndex, setPrototypeMonitorIndex] = useState(0);
+  const [prototypeMonitorId, setPrototypeMonitorId] = useState("");
   const [playlists, setPlaylists] = useState<{ id: string; name: string }[]>([]);
   const [playlistMembers, setPlaylistMembers] = useState<string[]>([]);
   const [playlistMembersLoading, setPlaylistMembersLoading] = useState(false);
@@ -52,8 +52,8 @@ export default function Settings() {
   useEffect(() => {
     void monitorService.getAll().then(monitors => {
       setPrototypeMonitors(monitors);
-      const primaryIndex = monitors.findIndex(monitor => monitor.primary);
-      setPrototypeMonitorIndex(primaryIndex >= 0 ? primaryIndex : 0);
+      const primary = monitors.find(monitor => monitor.primary) ?? monitors[0];
+      setPrototypeMonitorId(primary?.id ?? "");
     }).catch(() => setPrototypeMonitors([]));
   }, []);
   useEffect(() => { const timer = window.setInterval(() => void loadSettings(), 5000); return () => window.clearInterval(timer); }, [loadSettings]);
@@ -112,7 +112,7 @@ export default function Settings() {
     setPrototypeBusy(true);
     setPrototypeStatus("Creando ventana diagnóstica y cargando WebView2…");
     try {
-      await animatedPrototypeService.open(prototypeMediaPath, prototypeMonitorIndex, true);
+      await animatedPrototypeService.open(prototypeMediaPath, prototypeMonitorId, true);
       setPrototypeStatus("Ventana creada; revisa la superficie para confirmar carga y reproducción.");
     } catch (error) {
       setPrototypeStatus("No se pudo crear la superficie diagnóstica.");
@@ -127,7 +127,7 @@ export default function Settings() {
     setPrototypeBusy(true);
     setPrototypeStatus("Generando GIF de diagnóstico y creando la ventana WebView2…");
     try {
-      await animatedPrototypeService.openGeneratedTest(prototypeMonitorIndex);
+      await animatedPrototypeService.openGeneratedTest(prototypeMonitorId);
       setPrototypeStatus("GIF generado y ventana creada; confirma que cambian sus dos fotogramas.");
     } catch (error) {
       setPrototypeStatus("No se pudo iniciar la prueba autónoma.");
@@ -142,7 +142,7 @@ export default function Settings() {
     setPrototypeBusy(true);
     setPrototypeStatus("Generando GIF y creando un HWND nativo con WebView2…");
     try {
-      await animatedPrototypeService.openNativeGeneratedTest(prototypeMonitorIndex);
+      await animatedPrototypeService.openNativeGeneratedTest(prototypeMonitorId);
       setPrototypeStatus("HWND nativo creado; confirma WebView2, carga del GIF y animación visual.");
     } catch (error) {
       setPrototypeStatus("No se pudo iniciar el renderer HWND nativo.");
@@ -168,7 +168,7 @@ export default function Settings() {
   async function closeAnimatedPrototype() {
     setPrototypeBusy(true);
     try {
-      await animatedPrototypeService.close(prototypeMonitorIndex);
+      await animatedPrototypeService.close(prototypeMonitorId);
       setPrototypeStatus("Superficie cerrada.");
       setMessage("Superficie del prototipo cerrada.");
     } catch (error) {
@@ -219,8 +219,8 @@ export default function Settings() {
         <div className="mb-2 flex items-center gap-2"><MonitorPlay size={18} className="text-amber-300"/><h2 className="font-semibold">Prototipo técnico WebView2</h2></div>
         <p className="text-sm leading-6 muted">Prueba aislada de una superficie Win32/WebView2 para medios locales. No modifica playlists ni activa fondos animados de producción.</p>
         <label className="mt-4 block text-sm font-medium">Monitor de prueba</label>
-        <select className="input mt-2 max-w-xl" value={prototypeMonitorIndex} onChange={event => setPrototypeMonitorIndex(Number(event.target.value))} disabled={prototypeMonitors.length === 0}>
-          {prototypeMonitors.length === 0 ? <option value={0}>No se detectaron monitores</option> : prototypeMonitors.map((monitor, index) => <option key={monitor.id} value={index}>{monitor.name || `Monitor ${index + 1}`} · {monitor.width} × {monitor.height}{monitor.primary ? " · Principal" : ""}</option>)}
+        <select className="input mt-2 max-w-xl" value={prototypeMonitorId} onChange={event => setPrototypeMonitorId(event.target.value)} disabled={prototypeMonitors.length === 0}>
+          {prototypeMonitors.length === 0 ? <option value="">No se detectaron monitores</option> : prototypeMonitors.map((monitor, index) => <option key={monitor.id} value={monitor.id}>{monitor.name || `Monitor ${index + 1}`} · {monitor.width} × {monitor.height}{monitor.primary ? " · Principal" : ""}</option>)}
         </select>
         <div className="mt-4 rounded-xl border border-white/10 bg-white/[.03] p-3 text-sm muted">
           <div>{prototypeStatus}</div>
