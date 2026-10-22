@@ -9,6 +9,7 @@ export default function Library() {
   const store = useWallpaperStore();
   const [query, setQuery] = useState("");
   const [favorites, setFavorites] = useState(false);
+  const [filter, setFilter] = useState<"all" | "available" | "missing" | "static" | "derived">("all");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [renameId, setRenameId] = useState<string | null>(null);
@@ -24,7 +25,18 @@ export default function Library() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [deleteTarget, busy]);
-  const visible = useMemo(() => store.wallpapers.filter(w => (!favorites || w.favorite) && w.name.toLowerCase().includes(query.toLowerCase())), [store.wallpapers, query, favorites]);
+  const visible = useMemo(() => {
+    const normalizedQuery = query.normalize("NFKC").toLocaleLowerCase();
+    return store.wallpapers.filter(w => {
+      const matchesFilter = filter === "all"
+        || (filter === "available" && w.asset?.available)
+        || (filter === "missing" && !w.asset?.available)
+        || (filter === "static" && w.resourceType === "static")
+        || (filter === "derived" && Boolean(w.parentWallpaperId));
+      return matchesFilter && (!favorites || w.favorite)
+        && w.name.normalize("NFKC").toLocaleLowerCase().includes(normalizedQuery);
+    });
+  }, [store.wallpapers, query, favorites, filter]);
 
   async function run(action: () => Promise<unknown>, success?: string) {
     setBusy(true); setMessage(null);
@@ -125,10 +137,13 @@ export default function Library() {
     <div className="panel flex flex-wrap items-center gap-3 p-3">
       <label className="relative min-w-[220px] flex-1"><Search size={16} className="absolute left-3 top-3.5 text-slate-500"/><input className="input pl-10" value={query} onChange={e => setQuery(e.target.value)} placeholder="Buscar por nombre…" /></label>
       <button className={`btn ${favorites ? "bg-rose-500/15 text-rose-200" : ""}`} onClick={() => setFavorites(v => !v)}>Favoritos {favorites ? "activados" : ""}</button>
+      <select className="input max-w-[190px]" value={filter} onChange={event => setFilter(event.target.value as typeof filter)} aria-label="Filtrar biblioteca">
+        <option value="all">Todos</option><option value="available">Disponibles localmente</option><option value="missing">Archivos faltantes</option><option value="static">Estáticos</option><option value="derived">Derivados</option>
+      </select>
       <span className="px-2 text-sm muted">{visible.length} de {store.wallpapers.length}</span>
     </div>
     {store.loading ? <div className="empty">Cargando biblioteca…</div> : visible.length === 0 ? <div className="empty"><ImagePlus className="mx-auto mb-3"/> {store.wallpapers.length ? "No hay coincidencias." : "Todavía no hay fondos. Importa tu primera imagen para comenzar."}</div> :
-      <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{visible.map(w => <WallpaperCard key={w.id} wallpaper={w} busy={busy} onActivate={id => void run(() => store.setActive(id), "Fondo aplicado.")} onFavorite={id => void run(() => store.toggleFavorite(id))} onDelete={remove} onRename={beginRename} onRotate={rotate}/>)}</section>}
+      <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{visible.map(w => <WallpaperCard key={w.id} wallpaper={w} busy={busy} onActivate={id => void run(() => store.setActive(id), "Fondo aplicado.")} onFavorite={id => void run(() => store.toggleFavorite(id))} onDelete={remove} onRename={beginRename} onRotate={rotate} onRegenerateThumbnail={id => void run(() => store.regenerateThumbnail(id), "Miniatura regenerada.")}/>)}</section>}
     {renameId && <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="rename-title"><div className="modal-card max-w-lg"><h2 id="rename-title" className="text-xl font-semibold">Renombrar fondo</h2><p className="mt-1 text-sm muted">El nombre visible cambiará en toda la biblioteca, sin mover el archivo.</p><input className="input mt-5" autoFocus value={renameValue} onChange={event => setRenameValue(event.target.value)} maxLength={200} onKeyDown={event => { if (event.key === "Enter") void confirmRename(); if (event.key === "Escape") setRenameId(null); }}/><div className="mt-5 flex justify-end gap-2"><button className="btn" onClick={() => setRenameId(null)} disabled={busy}>Cancelar</button><button className="btn btn-primary" onClick={() => void confirmRename()} disabled={busy}>Guardar</button></div></div></div>}
     {deleteTarget && <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-title" onClick={event => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}><div className="modal-card max-w-lg"><h2 id="delete-title" className="text-xl font-semibold">Eliminar wallpaper</h2><p className="mt-2 text-sm muted">¿Quieres eliminar <strong className="text-slate-200">{deleteTarget.name}</strong> de la biblioteca?</p><p className="mt-2 text-sm muted">Se eliminarán el registro y los archivos administrados por Lumina. Esta acción no se puede deshacer.</p><div className="mt-5 flex justify-end gap-2"><button className="btn" onClick={() => setDeleteTarget(null)} disabled={busy}>Cancelar</button><button className="btn btn-danger" onClick={() => void confirmDelete()} disabled={busy}>{busy ? "Eliminando…" : "Eliminar"}</button></div></div></div>}
     {original && enhanced && <UpscaleComparisonDialog original={original} enhanced={enhanced} busy={busy} onChoose={choice => void chooseVersion(choice)}/>}

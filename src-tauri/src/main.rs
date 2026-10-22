@@ -258,6 +258,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             list_wallpapers,
+            list_wallpaper_derivative_ids,
             regenerate_wallpaper_thumbnail,
             import_wallpaper,
             import_synced_wallpaper,

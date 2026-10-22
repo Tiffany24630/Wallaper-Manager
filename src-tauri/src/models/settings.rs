@@ -10,13 +10,19 @@ pub enum SettingClass {
 
 pub fn classify_setting(name: &str) -> Option<SettingClass> {
     match name {
-        "dynamic_enabled" | "dynamic_playlist_id" | "dynamic_interval_minutes" | "scaling_mode"
+        "dynamic_enabled"
+        | "dynamic_playlist_id"
+        | "dynamic_interval_minutes"
+        | "scaling_mode"
         | "accent_color" => Some(SettingClass::Portable),
         "hardware_acceleration" | "pause_on_battery" | "ui_scale" => {
             Some(SettingClass::DeviceSpecific)
         }
-        "launch_at_startup" | "minimize_to_tray" | "pause_when_maximized"
-        | "cursor_enabled" | "active_cursor_id" => Some(SettingClass::WindowsSpecific),
+        "launch_at_startup"
+        | "minimize_to_tray"
+        | "pause_when_maximized"
+        | "cursor_enabled"
+        | "active_cursor_id" => Some(SettingClass::WindowsSpecific),
         "dynamic_current_wallpaper_id" | "dynamic_last_error" => Some(SettingClass::Derived),
         _ => None,
     }
@@ -47,9 +53,18 @@ mod tests {
 
     #[test]
     fn settings_contract_classifies_configuration_and_derived_state() {
-        assert_eq!(classify_setting("dynamic_interval_minutes"), Some(SettingClass::Portable));
-        assert_eq!(classify_setting("launch_at_startup"), Some(SettingClass::WindowsSpecific));
-        assert_eq!(classify_setting("dynamic_last_error"), Some(SettingClass::Derived));
+        assert_eq!(
+            classify_setting("dynamic_interval_minutes"),
+            Some(SettingClass::Portable)
+        );
+        assert_eq!(
+            classify_setting("launch_at_startup"),
+            Some(SettingClass::WindowsSpecific)
+        );
+        assert_eq!(
+            classify_setting("dynamic_last_error"),
+            Some(SettingClass::Derived)
+        );
         assert_eq!(classify_setting("unknown"), None);
     }
 }

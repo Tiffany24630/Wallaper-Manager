@@ -15,6 +15,15 @@ export const wallpaperService = {
     return tauriInvoke<Wallpaper[]>("list_wallpapers");
   },
 
+  async listDerivativeIds(parentWallpaperId: string): Promise<string[]> {
+    return tauriInvoke<string[]>("list_wallpaper_derivative_ids", { parentWallpaperId });
+  },
+
+  async regenerateThumbnail(id: string): Promise<void> {
+    await tauriInvoke("regenerate_wallpaper_thumbnail", { wallpaperId: id });
+    await notifyLocalChange("wallpaper_update", id);
+  },
+
   async setActive(id: string): Promise<void> {
     return tauriInvoke("set_active_wallpaper", {
       wallpaperId: id,
