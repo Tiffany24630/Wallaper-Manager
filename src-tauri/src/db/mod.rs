@@ -3,6 +3,8 @@ use sha2::{Digest, Sha256};
 use std::{fs::File, io::Read, path::PathBuf, sync::OnceLock};
 use tauri::Manager;
 
+mod migrations;
+
 static DATABASE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn initialize(app: &tauri::AppHandle) -> Result<(), String> {
@@ -49,6 +51,8 @@ pub fn get_connection() -> Result<Connection> {
             file_type TEXT,
             hash TEXT UNIQUE,
             original_path TEXT,
+            resource_type TEXT NOT NULL DEFAULT 'static',
+            parent_wallpaper_id TEXT,
             created_at TEXT
         );
 
@@ -117,6 +121,7 @@ pub fn get_connection() -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS playlist_wallpapers(
             playlist_id TEXT NOT NULL,
             wallpaper_id TEXT NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(playlist_id, wallpaper_id),
             FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
             FOREIGN KEY(wallpaper_id) REFERENCES wallpapers(id) ON DELETE CASCADE
@@ -166,47 +171,7 @@ pub fn get_connection() -> Result<Connection> {
         );
         ",
     )?;
-    // Keep existing installations compatible when new preference columns are added.
-    let _ = conn.execute(
-        "ALTER TABLE settings ADD COLUMN accent_color TEXT DEFAULT 'violet'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE settings ADD COLUMN ui_scale INTEGER DEFAULT 100",
-        [],
-    );
-    // Keep the original source when a managed wallpaper is transformed.
-    let _ = conn.execute("ALTER TABLE wallpapers ADD COLUMN original_path TEXT", []);
-    let _ = conn.execute(
-        "ALTER TABLE settings ADD COLUMN dynamic_enabled INTEGER DEFAULT 0",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE settings ADD COLUMN dynamic_playlist_id TEXT",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE settings ADD COLUMN dynamic_interval_minutes INTEGER DEFAULT 5",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE settings ADD COLUMN dynamic_current_wallpaper_id TEXT",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE settings ADD COLUMN dynamic_last_error TEXT",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE settings ADD COLUMN cursor_enabled INTEGER DEFAULT 0",
-        [],
-    );
-    let _ = conn.execute("ALTER TABLE settings ADD COLUMN active_cursor_id TEXT", []);
-    let _ = conn.execute("ALTER TABLE cursor_resources ADD COLUMN hash TEXT", []);
-    let _ = conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS cursor_resources_hash_unique ON cursor_resources(hash) WHERE hash IS NOT NULL",
-        [],
-    );
+    migrations::run(&conn)?;
     backfill_cursor_hashes(&conn)?;
     conn.execute("INSERT OR IGNORE INTO settings(id) VALUES (1)", [])?;
     Ok(conn)

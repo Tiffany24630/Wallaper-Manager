@@ -4,4 +4,5 @@ use serde::{Deserialize, Serialize};
 pub struct PlaylistWallpaper {
     pub playlist_id: String,
     pub wallpaper_id: String,
+    pub position: i64,
 }

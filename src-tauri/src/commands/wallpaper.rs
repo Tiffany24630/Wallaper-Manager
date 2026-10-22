@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     db::{app_data_dir, get_connection},
-    models::wallpaper::Wallpaper,
+    models::wallpaper::{Wallpaper, WallpaperAsset, WallpaperResourceType, WallpaperThumbnail},
     utils::{hash::file_hash, thumbnail::generate_thumbnail},
 };
 
@@ -28,16 +28,27 @@ use crate::{
 pub fn list_wallpapers() -> Result<Vec<Wallpaper>, String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare(
-        "SELECT id, name, path, thumbnail, favorite, active, size_bytes, width, height, file_type, hash, created_at
+        "SELECT id, name, path, thumbnail, favorite, active, size_bytes, width, height, file_type, hash, created_at, resource_type, parent_wallpaper_id, original_path
          FROM wallpapers ORDER BY active DESC, created_at DESC",
     ).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
+            let path: String = row.get(2)?;
+            let thumbnail: Option<String> = row.get(3)?;
+            let original_path: Option<String> = row.get(14)?;
+            let resource_type = WallpaperResourceType::from_db(
+                &row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "static".into()),
+            )
+            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                12,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+            ))?;
             Ok(Wallpaper {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                path: row.get(2)?,
-                thumbnail: row.get(3)?,
+                path: path.clone(),
+                thumbnail: thumbnail.clone(),
                 favorite: row.get::<_, i32>(4)? == 1,
                 active: row.get::<_, i32>(5)? == 1,
                 size_bytes: row.get(6)?,
@@ -46,6 +57,20 @@ pub fn list_wallpapers() -> Result<Vec<Wallpaper>, String> {
                 file_type: row.get(9)?,
                 hash: row.get(10)?,
                 created_at: row.get(11)?,
+                resource_type,
+                parent_wallpaper_id: row.get(13)?,
+                asset: WallpaperAsset {
+                    path: path.clone(),
+                    original_path: original_path.clone(),
+                    hash: row.get(10)?,
+                    size_bytes: row.get(6)?,
+                    file_type: row.get(9)?,
+                    available: Path::new(&path).is_file(),
+                },
+                thumbnail_asset: WallpaperThumbnail {
+                    path: thumbnail.clone(),
+                    available: thumbnail.as_deref().is_some_and(|value| Path::new(value).is_file()),
+                },
             })
         })
         .map_err(|e| e.to_string())?;
@@ -55,6 +80,14 @@ pub fn list_wallpapers() -> Result<Vec<Wallpaper>, String> {
 pub(crate) fn import_file(
     source_path: &Path,
     display_name: Option<String>,
+) -> Result<String, String> {
+    import_file_with_parent(source_path, display_name, None)
+}
+
+pub(crate) fn import_file_with_parent(
+    source_path: &Path,
+    display_name: Option<String>,
+    parent_wallpaper_id: Option<&str>,
 ) -> Result<String, String> {
     if !source_path.is_file() {
         return Err("No se encontró el archivo seleccionado".into());
@@ -109,10 +142,10 @@ pub(crate) fn import_file(
             .into_owned()
     });
     if let Err(error) = conn.execute(
-        "INSERT INTO wallpapers(id, name, path, thumbnail, size_bytes, width, height, file_type, hash, created_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO wallpapers(id, name, path, thumbnail, size_bytes, width, height, file_type, hash, resource_type, parent_wallpaper_id, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'static', ?10, ?11)",
         rusqlite::params![id, name, original_path.to_string_lossy(), thumbnail_path.to_string_lossy(),
-            size, width, height, extension, hash, Utc::now().to_rfc3339()],
+            size, width, height, extension, hash, parent_wallpaper_id, Utc::now().to_rfc3339()],
     ) {
         let _ = fs::remove_file(&original_path);
         let _ = fs::remove_file(&thumbnail_path);
@@ -166,7 +199,14 @@ pub fn import_synced_wallpaper(
         return Err(error);
     }
     conn.execute("INSERT INTO wallpapers(id,name,path,thumbnail,size_bytes,width,height,file_type,hash,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", rusqlite::params![id, name.trim(), path.to_string_lossy(), thumbnail.to_string_lossy(), bytes.len() as u64, width, height, extension, expected_hash.to_ascii_lowercase(), Utc::now().to_rfc3339()]).map_err(|e| { let _ = fs::remove_file(&path); let _ = fs::remove_file(&thumbnail); e.to_string() })?;
-    conn.execute("INSERT OR IGNORE INTO playlist_wallpapers(playlist_id, wallpaper_id) SELECT playlist_id, ?1 FROM sync_pending_playlist_items WHERE wallpaper_id = ?1", [&id]).ok();
+    conn.execute(
+        "INSERT OR IGNORE INTO playlist_wallpapers(playlist_id, wallpaper_id, position)
+         SELECT pending.playlist_id, ?1,
+           COALESCE((SELECT MAX(existing.position) + 1 FROM playlist_wallpapers AS existing WHERE existing.playlist_id = pending.playlist_id), 0)
+         FROM sync_pending_playlist_items AS pending WHERE pending.wallpaper_id = ?1",
+        [&id],
+    )
+    .map_err(|e| e.to_string())?;
     conn.execute(
         "DELETE FROM sync_pending_playlist_items WHERE wallpaper_id=?1",
         [&id],
@@ -336,14 +376,43 @@ pub fn delete_wallpaper(wallpaper_id: String) -> Result<(), String> {
         .map_err(|_| "El fondo ya no existe".to_string())?;
     conn.execute("DELETE FROM wallpapers WHERE id = ?1", [&wallpaper_id])
         .map_err(|e| e.to_string())?;
-    let _ = fs::remove_file(path);
-    if let Some(thumbnail) = thumbnail {
-        let _ = fs::remove_file(thumbnail);
+    let mut cleanup_errors = Vec::new();
+    for candidate in [Some(path), thumbnail, original_path].into_iter().flatten() {
+        if let Err(error) = remove_owned_file(&candidate) {
+            cleanup_errors.push(format!("{candidate}: {error}"));
+        }
     }
-    if let Some(original_path) = original_path {
-        let _ = fs::remove_file(original_path);
+    if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "El registro del wallpaper fue eliminado, pero la limpieza física quedó incompleta: {}",
+            cleanup_errors.join("; ")
+        ))
     }
-    Ok(())
+}
+
+fn remove_owned_file(path: &str) -> Result<(), String> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => fs::remove_file(path).map_err(|e| e.to_string()),
+        Ok(_) => Err("la ruta no es un archivo".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn regenerate_wallpaper_thumbnail(wallpaper_id: String) -> Result<(), String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    let (path, thumbnail): (String, Option<String>) = conn
+        .query_row(
+            "SELECT path, thumbnail FROM wallpapers WHERE id = ?1",
+            [&wallpaper_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| "El wallpaper ya no existe".to_string())?;
+    let thumbnail = thumbnail.ok_or("El wallpaper no tiene una ruta de miniatura")?;
+    generate_thumbnail(&path, &thumbnail)
 }
 
 #[tauri::command]
@@ -660,11 +729,11 @@ pub fn upscale_wallpaper(
         _ => return Err("La escala debe ser 3x o 4x".into()),
     };
     let conn = get_connection().map_err(|e| e.to_string())?;
-    let (source_path, original_name): (String, String) = conn
+    let (source_path, original_name, source_id): (String, String, String) = conn
         .query_row(
-            "SELECT path, name FROM wallpapers WHERE id = ?1",
-            [wallpaper_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT path, name, id FROM wallpapers WHERE id = ?1",
+            [&wallpaper_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| "No se encontró el fondo".to_string())?;
     let hardware_acceleration = conn
@@ -758,9 +827,10 @@ pub fn upscale_wallpaper(
         .unwrap_or_default()
         .to_string_lossy();
     let method = if used_ai { "IA" } else { "Lanczos" };
-    let new_id = match import_file(
+    let new_id = match import_file_with_parent(
         &output_path,
         Some(format!("{stem} · mejorado {scale}x ({method})")),
+        Some(&source_id),
     ) {
         Ok(id) => id,
         Err(error) => {
@@ -779,10 +849,11 @@ pub fn upscale_wallpaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        persist_active_wallpaper, rename_wallpaper_in_connection, replace_validated_image,
-        rotate_image, target_dimensions, validate_ai_pixels, validate_generated_image,
-        validate_wallpaper_name,
+        persist_active_wallpaper, remove_owned_file, rename_wallpaper_in_connection,
+        replace_validated_image, rotate_image, target_dimensions, validate_ai_pixels,
+        validate_generated_image, validate_wallpaper_name,
     };
+    use crate::models::wallpaper::WallpaperResourceType;
     use crate::utils::thumbnail::generate_thumbnail;
     use image::{GenericImageView, RgbImage};
     use rusqlite::Connection;
@@ -968,5 +1039,29 @@ mod tests {
         assert!(image::open(&thumbnail).is_ok());
         assert!(replace_validated_image(&dir.join("missing.png"), &destination, 90).is_err());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_owned_file_is_already_clean_but_cleanup_errors_are_reported() {
+        let missing = std::env::temp_dir().join("lumina-missing-owned-file.png");
+        assert!(remove_owned_file(&missing.to_string_lossy()).is_ok());
+
+        let directory = std::env::temp_dir().join(format!(
+            "lumina-owned-directory-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        assert!(remove_owned_file(&directory.to_string_lossy()).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn resource_type_contract_uses_stable_serializable_values() {
+        assert_eq!(WallpaperResourceType::Static.as_str(), "static");
+        assert_eq!(WallpaperResourceType::from_db("animated").unwrap(), WallpaperResourceType::Animated);
+        assert!(WallpaperResourceType::from_db("video").is_err());
     }
 }
