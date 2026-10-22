@@ -23,6 +23,7 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::{
+    animated_wallpaper,
     db::{app_data_dir, get_connection},
     models::wallpaper::{Wallpaper, WallpaperAsset, WallpaperResourceType, WallpaperThumbnail},
     utils::{hash::file_hash, thumbnail::generate_thumbnail},
@@ -118,17 +119,27 @@ pub(crate) fn import_file_with_parent(
     if !source_path.is_file() {
         return Err("No se encontró el archivo seleccionado".into());
     }
-    let decoded = image::open(source_path)
-        .map_err(|_| "El archivo no es una imagen compatible".to_string())?;
-    let (width, height) = decoded.dimensions();
     let extension = source_path
         .extension()
         .and_then(|value| value.to_str())
         .map(str::to_lowercase)
         .ok_or("La imagen no tiene una extensión válida")?;
-    if !["png", "jpg", "jpeg", "webp", "bmp"].contains(&extension.as_str()) {
-        return Err("Formato no compatible. Usa PNG, JPG, WEBP o BMP".into());
-    }
+    let (width, height, resource_type) = if extension == "gif" {
+        let resource = animated_wallpaper::validate_animated_gif(source_path, 0, 0)?;
+        (
+            resource.width,
+            resource.height,
+            WallpaperResourceType::Animated,
+        )
+    } else {
+        if !["png", "jpg", "jpeg", "webp", "bmp"].contains(&extension.as_str()) {
+            return Err("Formato no compatible. Usa PNG, JPG, WEBP o BMP".into());
+        }
+        let decoded = image::open(source_path)
+            .map_err(|_| "El archivo no es una imagen compatible".to_string())?;
+        let (width, height) = decoded.dimensions();
+        (width, height, WallpaperResourceType::Static)
+    };
 
     let hash = file_hash(&source_path.to_string_lossy())?;
     let conn = get_connection().map_err(|e| e.to_string())?;
@@ -177,9 +188,9 @@ pub(crate) fn import_file_with_parent(
         .len();
     if let Err(error) = conn.execute(
         "INSERT INTO wallpapers(id, name, path, thumbnail, size_bytes, width, height, file_type, hash, resource_type, parent_wallpaper_id, created_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'static', ?10, ?11)",
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![id, name, original_path.to_string_lossy(), thumbnail_path.to_string_lossy(),
-            size, width, height, extension, hash, parent_wallpaper_id, Utc::now().to_rfc3339()],
+            size, width, height, extension, hash, resource_type.as_str(), parent_wallpaper_id, Utc::now().to_rfc3339()],
     ) {
         return Err(compensate_import_failure(
             error.to_string(),
@@ -288,11 +299,49 @@ pub fn import_synced_wallpaper(
     Ok(id)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WallpaperApplyResult {
+    pub state: String,
+    pub wallpaper_id: String,
+    pub monitor_id: Option<String>,
+    pub generation: Option<u64>,
+    pub activation_id: Option<String>,
+}
+
 #[tauri::command]
-pub fn set_active_wallpaper(
+pub async fn set_active_wallpaper(
+    app: tauri::AppHandle,
     wallpaper_id: String,
+    monitor_id: Option<String>,
     scheduler: State<'_, DynamicScheduler>,
-) -> Result<(), String> {
+) -> Result<WallpaperApplyResult, String> {
+    let (resource_type, path): (String, String) = get_connection()
+        .map_err(|e| e.to_string())?
+        .query_row(
+            "SELECT COALESCE(resource_type, 'static'), path FROM wallpapers WHERE id = ?1",
+            [&wallpaper_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| "El fondo ya no existe en la biblioteca".to_string())?;
+    if WallpaperResourceType::from_db(&resource_type)? == WallpaperResourceType::Animated {
+        let monitor_id = monitor_id
+            .ok_or("Animated requiere seleccionar explícitamente un monitor de destino")?;
+        let known_monitors = available_monitor_ids().map_err(|error| error.to_string())?;
+        if !known_monitors.iter().any(|known| known == &monitor_id) {
+            return Err("El monitor de destino ya no está disponible".into());
+        }
+        let activation =
+            animated_wallpaper::open_library_animated(app, monitor_id, wallpaper_id.clone(), path)
+                .await?;
+        return Ok(WallpaperApplyResult {
+            state: "pending".into(),
+            wallpaper_id,
+            monitor_id: Some(activation.monitor_id.as_str().to_string()),
+            generation: Some(activation.generation),
+            activation_id: Some(activation.activation_id),
+        });
+    }
     let mut manual_operation = scheduler.begin_manual_operation();
     set_active_wallpaper_internal(wallpaper_id.clone())?;
     let conn = get_connection().map_err(|e| e.to_string())?;
@@ -304,7 +353,13 @@ pub fn set_active_wallpaper(
     conn.execute("DELETE FROM monitor_playlists", [])
         .map_err(|e| e.to_string())?;
     manual_operation.complete();
-    Ok(())
+    Ok(WallpaperApplyResult {
+        state: "confirmed".into(),
+        wallpaper_id,
+        monitor_id: None,
+        generation: None,
+        activation_id: None,
+    })
 }
 
 pub(crate) fn set_active_wallpaper_internal(wallpaper_id: String) -> Result<(), String> {
@@ -373,7 +428,7 @@ pub(crate) fn set_active_wallpaper_internal(wallpaper_id: String) -> Result<(), 
     })
 }
 
-fn persist_active_wallpaper(
+pub(crate) fn persist_active_wallpaper(
     conn: &mut rusqlite::Connection,
     wallpaper_id: &str,
 ) -> Result<(), String> {

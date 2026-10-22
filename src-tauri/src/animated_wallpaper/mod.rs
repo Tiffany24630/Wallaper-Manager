@@ -1,8 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Condvar, Mutex, OnceLock},
+    thread,
+    time::Duration,
 };
 
 use crate::models::monitor_assignment::WallpaperBackend;
@@ -15,7 +17,8 @@ use image::{
     codecs::gif::{GifDecoder, GifEncoder, Repeat},
     AnimationDecoder, Delay, Frame, ImageDecoder, Rgba, RgbaImage,
 };
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use uuid::Uuid;
 
 #[cfg(target_os = "windows")]
@@ -208,7 +211,99 @@ struct PrototypeSurfaceRecord {
     lifecycle: AnimatedSurfaceLifecycle,
     activation_id: String,
     assignment: AssignmentOperation,
+    wallpaper_id: Option<String>,
     destroyed_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnimatedActivationOutcome {
+    Pending,
+    Ready,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AnimatedActivationHandle {
+    pub(crate) monitor_id: MonitorIdentity,
+    pub(crate) generation: u64,
+    pub(crate) activation_id: String,
+}
+
+static ACTIVATION_OUTCOMES: OnceLock<(Mutex<HashMap<String, AnimatedActivationOutcome>>, Condvar)> =
+    OnceLock::new();
+
+fn activation_outcomes() -> &'static (Mutex<HashMap<String, AnimatedActivationOutcome>>, Condvar) {
+    ACTIVATION_OUTCOMES.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()))
+}
+
+fn register_activation(activation_id: &str) {
+    activation_outcomes()
+        .0
+        .lock()
+        .expect("activation outcomes mutex poisoned")
+        .insert(
+            activation_id.to_string(),
+            AnimatedActivationOutcome::Pending,
+        );
+}
+
+fn signal_activation(activation_id: &str, outcome: AnimatedActivationOutcome) {
+    if let Ok(mut outcomes) = activation_outcomes().0.lock() {
+        if outcomes.get(activation_id) == Some(&AnimatedActivationOutcome::Pending) {
+            outcomes.insert(activation_id.to_string(), outcome);
+            activation_outcomes().1.notify_all();
+        }
+    }
+}
+
+pub(crate) fn wait_for_activation(
+    handle: &AnimatedActivationHandle,
+    timeout: Duration,
+) -> AnimatedActivationOutcome {
+    let deadline = std::time::Instant::now() + timeout;
+    let (lock, condition) = activation_outcomes();
+    let mut outcomes = lock.lock().expect("activation outcomes mutex poisoned");
+    loop {
+        let outcome = outcomes
+            .get(&handle.activation_id)
+            .copied()
+            .unwrap_or(AnimatedActivationOutcome::Cancelled);
+        if outcome != AnimatedActivationOutcome::Pending {
+            outcomes.remove(&handle.activation_id);
+            return outcome;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            outcomes.remove(&handle.activation_id);
+            return AnimatedActivationOutcome::Failed;
+        }
+        let (next, timed_out) = condition
+            .wait_timeout(outcomes, remaining)
+            .expect("activation outcomes condition variable poisoned");
+        outcomes = next;
+        if timed_out.timed_out() {
+            outcomes.remove(&handle.activation_id);
+            return AnimatedActivationOutcome::Failed;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimatedActivationEvent {
+    state: &'static str,
+    monitor_id: String,
+    generation: u64,
+    activation_id: String,
+    wallpaper_id: Option<String>,
+    error: Option<String>,
+}
+
+fn emit_activation_event(app: &AppHandle, event: AnimatedActivationEvent) {
+    if let Err(error) = app.emit("animated-activation", event) {
+        eprintln!("ANIMATED_EVENT_EMIT_FAILED error={error}");
+    }
 }
 
 fn activation_matches(record: &PrototypeSurfaceRecord, activation_id: &str) -> bool {
@@ -263,6 +358,7 @@ fn register_prototype_surface(
     label: &str,
     activation_id: &str,
     assignment: AssignmentOperation,
+    wallpaper_id: Option<String>,
 ) -> Result<(), String> {
     let mut lifecycle = AnimatedSurfaceLifecycle::new();
     lifecycle.begin_create().map_err(str::to_string)?;
@@ -288,9 +384,11 @@ fn register_prototype_surface(
             lifecycle,
             activation_id: activation_id.to_string(),
             assignment,
+            wallpaper_id,
             destroyed_confirmed: false,
         },
     );
+    register_activation(activation_id);
     Ok(())
 }
 
@@ -321,6 +419,7 @@ fn finish_prototype_close(label: &str, activation_id: Option<&str>) {
         record.destroyed_confirmed = true;
         record.lifecycle.finish_close();
         let assignment = record.assignment.clone();
+        signal_activation(&record.activation_id, AnimatedActivationOutcome::Cancelled);
         eprintln!(
             "ANIMATED_DESTROYED_CONFIRMED surface={label} activation={} monitor={} generation={}",
             record.activation_id,
@@ -705,6 +804,27 @@ pub async fn open_animated_prototype(
     media_path: String,
     diagnostic: bool,
 ) -> Result<(), String> {
+    open_animated_surface(app, monitor_id, media_path, diagnostic, None)
+        .await
+        .map(|_| ())
+}
+
+pub async fn open_library_animated(
+    app: AppHandle,
+    monitor_id: String,
+    wallpaper_id: String,
+    media_path: String,
+) -> Result<AnimatedActivationHandle, String> {
+    open_animated_surface(app, monitor_id, media_path, false, Some(wallpaper_id)).await
+}
+
+async fn open_animated_surface(
+    app: AppHandle,
+    monitor_id: String,
+    media_path: String,
+    diagnostic: bool,
+    wallpaper_id: Option<String>,
+) -> Result<AnimatedActivationHandle, String> {
     let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
     let source = PathBuf::from(media_path);
     let format = validate_media_source(&source)?;
@@ -731,6 +851,32 @@ pub async fn open_animated_prototype(
     let label = prototype_surface_label(&monitor_identity);
     let activation_id = Uuid::new_v4().to_string();
 
+    if let Some(existing) = app.get_webview_window(&label) {
+        begin_explicit_prototype_close(&label);
+        existing
+            .close()
+            .map_err(|error| format!("No se pudo iniciar el reemplazo de Animated: {error}"))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let surface_gone = prototype_surfaces()
+                .lock()
+                .map(|surfaces| !surfaces.contains_key(&label))
+                .unwrap_or(false);
+            if app.get_webview_window(&label).is_none() && surface_gone {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if app.get_webview_window(&label).is_some()
+            || prototype_surfaces()
+                .lock()
+                .map(|surfaces| surfaces.contains_key(&label))
+                .unwrap_or(true)
+        {
+            return Err("La superficie Animated anterior no confirmó su cierre".into());
+        }
+    }
+
     if app.get_webview_window(&label).is_some() {
         return Err(
             "Ya existe una superficie de prototipo para ese monitor; ciérrala antes de abrir otra"
@@ -745,9 +891,14 @@ pub async fn open_animated_prototype(
     } else {
         ""
     };
+    let route = if wallpaper_id.is_some() {
+        "animated-surface"
+    } else {
+        "animated-prototype"
+    };
     let url = WebviewUrl::App(
         format!(
-            "index.html#/animated-prototype?media={media_query}&surface={label}&activation={activation_id}{error_test_query}"
+            "index.html#/{route}?media={media_query}&surface={label}&activation={activation_id}{error_test_query}"
         )
         .into(),
     );
@@ -773,7 +924,11 @@ pub async fn open_animated_prototype(
         .reserve(monitor_identity.clone(), WallpaperBackend::Animated)
         .map_err(|error| error.to_string())?;
     let mut builder = WebviewWindowBuilder::new(&app, &label, url)
-        .title("Lumina animated wallpaper prototype")
+        .title(if wallpaper_id.is_some() {
+            "Lumina Animated"
+        } else {
+            "Lumina animated wallpaper prototype"
+        })
         .decorations(options.decorations)
         .resizable(false)
         .focused(options.focused)
@@ -824,7 +979,9 @@ pub async fn open_animated_prototype(
         }
     });
 
-    if let Err(error) = register_prototype_surface(&label, &activation_id, assignment.clone()) {
+    if let Err(error) =
+        register_prototype_surface(&label, &activation_id, assignment.clone(), wallpaper_id)
+    {
         if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
             coordinator.abort(&assignment);
         }
@@ -887,7 +1044,11 @@ pub async fn open_animated_prototype(
         ));
     }
     eprintln!("Animated prototype window shown; awaiting media-ready confirmation: {label}");
-    Ok(())
+    Ok(AnimatedActivationHandle {
+        monitor_id: assignment.assignment.monitor.clone(),
+        generation: assignment.assignment.generation.value(),
+        activation_id,
+    })
 }
 
 #[tauri::command]
@@ -1575,7 +1736,7 @@ pub fn report_animated_ready(
     surface_id: String,
     activation_id: String,
 ) -> Result<(), String> {
-    let assignment = {
+    let (assignment, wallpaper_id) = {
         let mut surfaces = prototype_surfaces()
             .lock()
             .map_err(|_| "No se pudo bloquear el registro de superficies".to_string())?;
@@ -1601,7 +1762,7 @@ pub fn report_animated_ready(
             return Ok(());
         }
         record.lifecycle.playing().map_err(str::to_string)?;
-        record.assignment.clone()
+        (record.assignment.clone(), record.wallpaper_id.clone())
     };
 
     let activation_result = wallpaper_coordinator::global()
@@ -1622,6 +1783,18 @@ pub fn report_animated_ready(
                 .map_err(|error| error.to_string())
         });
     if let Err(error) = activation_result {
+        signal_activation(&activation_id, AnimatedActivationOutcome::Failed);
+        emit_activation_event(
+            &app,
+            AnimatedActivationEvent {
+                state: "failed",
+                monitor_id: assignment.assignment.monitor.to_string(),
+                generation: assignment.assignment.generation.value(),
+                activation_id: activation_id.clone(),
+                wallpaper_id: wallpaper_id.clone(),
+                error: Some(error.clone()),
+            },
+        );
         begin_explicit_prototype_close(&surface_id);
         if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
             coordinator.abort(&assignment);
@@ -1631,6 +1804,47 @@ pub fn report_animated_ready(
         }
         return Err(error);
     }
+    if let Some(wallpaper_id) = wallpaper_id.clone() {
+        let mut conn = crate::db::get_connection().map_err(|error| error.to_string())?;
+        if let Err(error) =
+            crate::commands::wallpaper::persist_active_wallpaper(&mut conn, &wallpaper_id)
+        {
+            signal_activation(&activation_id, AnimatedActivationOutcome::Failed);
+            emit_activation_event(
+                &app,
+                AnimatedActivationEvent {
+                    state: "failed",
+                    monitor_id: assignment.assignment.monitor.to_string(),
+                    generation: assignment.assignment.generation.value(),
+                    activation_id: activation_id.clone(),
+                    wallpaper_id: Some(wallpaper_id.clone()),
+                    error: Some(error.to_string()),
+                },
+            );
+            begin_explicit_prototype_close(&surface_id);
+            if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
+                coordinator.abort(&assignment);
+            }
+            if let Some(window) = app.get_webview_window(&surface_id) {
+                let _ = window.close();
+            }
+            return Err(format!(
+                "Animated está listo como recurso, pero no se pudo persistir el estado activo: {error}"
+            ));
+        }
+    }
+    signal_activation(&activation_id, AnimatedActivationOutcome::Ready);
+    emit_activation_event(
+        &app,
+        AnimatedActivationEvent {
+            state: "ready",
+            monitor_id: assignment.assignment.monitor.to_string(),
+            generation: assignment.assignment.generation.value(),
+            activation_id: activation_id.clone(),
+            wallpaper_id,
+            error: None,
+        },
+    );
     eprintln!(
         "ANIMATED_READY surface={surface_id} activation={activation_id} backend=animated resource_ready=true visibility=unverified effective=false"
     );
@@ -1688,6 +1902,8 @@ pub fn report_animated_media_error(
         decision
     };
 
+    signal_activation(&activation_id, AnimatedActivationOutcome::Failed);
+
     if let Some(window) = app.get_webview_window(&surface_id) {
         if let Err(error) = window.close() {
             eprintln!("ANIMATED_MEDIA_ERROR_CLOSE_FAILED surface={surface_id} error={error}");
@@ -1699,6 +1915,22 @@ pub fn report_animated_media_error(
         eprintln!(
             "ANIMATED_CLOSE_CONFIRMATION_PENDING surface={surface_id} activation={activation_id} reason=window_not_found"
         );
+    }
+
+    if let Ok(surfaces) = prototype_surfaces().lock() {
+        if let Some(record) = surfaces.get(&surface_id) {
+            emit_activation_event(
+                &app,
+                AnimatedActivationEvent {
+                    state: "failed",
+                    monitor_id: record.assignment.assignment.monitor.to_string(),
+                    generation: record.assignment.assignment.generation.value(),
+                    activation_id: record.activation_id.clone(),
+                    wallpaper_id: record.wallpaper_id.clone(),
+                    error: reason.clone(),
+                },
+            );
+        }
     }
 
     if decision == FailureDecision::FallbackRequired {
@@ -1747,14 +1979,17 @@ mod tests {
     use super::{
         activation_matches, bounds_from_geometry, create_diagnostic_gif,
         diagnostic_surface_conflicts, encode_query_component, prototype_surface_label,
-        resource_limit_reason, smoke_variant_options, validate_animated_gif, validate_media_source,
-        AnimatedMediaFormat, AnimatedSurfaceLifecycle, PrototypeSurfaceRecord,
-        MAX_ANIMATED_DIMENSION, MAX_ANIMATED_FILE_BYTES,
+        register_activation, resource_limit_reason, signal_activation, smoke_variant_options,
+        validate_animated_gif, validate_media_source, wait_for_activation, AnimatedActivationEvent,
+        AnimatedActivationHandle, AnimatedActivationOutcome, AnimatedMediaFormat,
+        AnimatedSurfaceLifecycle, PrototypeSurfaceRecord, MAX_ANIMATED_DIMENSION,
+        MAX_ANIMATED_FILE_BYTES,
     };
     use crate::models::monitor_assignment::MonitorIdentity;
     use crate::models::monitor_assignment::WallpaperBackend;
     use crate::models::wallpaper_coordinator::WallpaperCoordinator;
     use image::GenericImageView;
+    use std::{thread, time::Duration};
     use uuid::Uuid;
 
     #[test]
@@ -1795,6 +2030,48 @@ mod tests {
     }
 
     #[test]
+    fn activation_event_preserves_identity_and_unverified_state() {
+        let event = AnimatedActivationEvent {
+            state: "ready",
+            monitor_id: "DISPLAY-A".into(),
+            generation: 7,
+            activation_id: "activation-7".into(),
+            wallpaper_id: Some("wallpaper-7".into()),
+            error: None,
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["state"], "ready");
+        assert_eq!(value["monitorId"], "DISPLAY-A");
+        assert_eq!(value["generation"], 7);
+        assert_eq!(value["activationId"], "activation-7");
+        assert_eq!(value["wallpaperId"], "wallpaper-7");
+    }
+
+    #[test]
+    fn activation_wait_is_correlated_and_reaches_ready() {
+        let activation_id = Uuid::new_v4().to_string();
+        let handle = AnimatedActivationHandle {
+            monitor_id: "DISPLAY-A".into(),
+            generation: 11,
+            activation_id: activation_id.clone(),
+        };
+        register_activation(&activation_id);
+        let signal_id = activation_id.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            signal_activation(&signal_id, AnimatedActivationOutcome::Ready);
+        });
+        assert_eq!(
+            wait_for_activation(&handle, Duration::from_secs(1)),
+            AnimatedActivationOutcome::Ready
+        );
+        assert_eq!(
+            wait_for_activation(&handle, Duration::from_millis(1)),
+            AnimatedActivationOutcome::Cancelled
+        );
+    }
+
+    #[test]
     fn diagnostic_surface_is_rejected_when_coordinator_state_exists() {
         assert!(!diagnostic_surface_conflicts(false, false));
         assert!(diagnostic_surface_conflicts(true, false));
@@ -1811,6 +2088,7 @@ mod tests {
             lifecycle: AnimatedSurfaceLifecycle::new(),
             activation_id: "activation-old".into(),
             assignment,
+            wallpaper_id: None,
             destroyed_confirmed: false,
         };
         assert!(activation_matches(&old, "activation-old"));

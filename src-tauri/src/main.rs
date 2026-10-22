@@ -68,6 +68,7 @@ fn main() {
     let result = tauri::Builder::default()
         .manage(scheduler)
         .setup(move |app| {
+            scheduler_for_setup.set_app_handle(app.handle().clone());
             db::initialize(app.handle()).map_err(std::io::Error::other)?;
             wallpaper_coordinator::global()
                 .lock()

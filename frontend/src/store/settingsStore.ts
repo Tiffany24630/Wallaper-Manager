@@ -41,8 +41,9 @@ export const useSettingsStore = create<SettingsState>((set) => ({
     set({ loading: true, error: null });
     try {
       await settingsService.save(settings);
+      const persistedSettings = await settingsService.get();
 
-      if (version === requestVersion) set({ settings, loading: false, error: null });
+      if (version === requestVersion) set({ settings: persistedSettings, loading: false, error: null });
     } catch (error) {
       if (version === requestVersion) set({ loading: false, error: String(error) });
       throw error;

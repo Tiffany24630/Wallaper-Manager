@@ -1,7 +1,12 @@
 import { create } from "zustand";
 import type { Wallpaper } from "../types/wallpaper";
 import { wallpaperService } from "../services/wallpaperService";
-import type { UpscaleResult } from "../services/wallpaperService";
+import type { AnimatedActivationEvent, UpscaleResult, WallpaperApplyResult, WallpaperApplyState } from "../services/wallpaperService";
+
+export type AnimatedActivationState = AnimatedActivationEvent & { state: "pending" | "ready" | "failed" | "cancelled" };
+
+let activationListener: Promise<() => void> | null = null;
+let activationListenerUsers = 0;
 
 interface WallpaperState {
   wallpapers: Wallpaper[];
@@ -10,7 +15,9 @@ interface WallpaperState {
 
   loadWallpapers: () => Promise<void>;
   refresh: () => Promise<void>;
-  setActive: (id: string) => Promise<void>;
+  setActive: (id: string, monitorId?: string) => Promise<WallpaperApplyState>;
+  animatedActivations: Record<string, AnimatedActivationState>;
+  initializeActivationEvents: () => Promise<() => void>;
   toggleFavorite: (id: string) => Promise<void>;
   importWallpaper: (path: string) => Promise<string>;
   selectAndImportWallpaper: () => Promise<string | null>;
@@ -41,6 +48,35 @@ export const useWallpaperStore =
     wallpapers: [],
     loading: false,
     error: null,
+    animatedActivations: {},
+
+    initializeActivationEvents: async () => {
+      activationListenerUsers += 1;
+      if (!activationListener) {
+        activationListener = wallpaperService.listenAnimatedActivation(event => {
+          set(state => {
+            const previous = event.monitorId ? Object.values(state.animatedActivations)
+              .filter(item => item.monitorId === event.monitorId)
+              .sort((a, b) => b.generation - a.generation)[0] : undefined;
+            if (previous && previous.generation > event.generation) return state;
+            return {
+              animatedActivations: {
+                ...state.animatedActivations,
+                [event.activationId]: event,
+              },
+            };
+          });
+        });
+      }
+      const stop = await activationListener;
+      return () => {
+        activationListenerUsers = Math.max(0, activationListenerUsers - 1);
+        if (activationListenerUsers === 0 && activationListener) {
+          void stop();
+          activationListener = null;
+        }
+      };
+    },
 
     refresh: async () => {
       try {
@@ -81,9 +117,24 @@ export const useWallpaperStore =
       }
     },
 
-    setActive: async (id) => {
-      await wallpaperService.setActive(id);
+    setActive: async (id, monitorId) => {
+      const result = await wallpaperService.setActive(id, monitorId ?? localStorage.getItem("lumina.library.monitor") ?? undefined) as WallpaperApplyResult;
+      if (result.state === "pending" && result.activationId && result.monitorId !== undefined && result.generation !== undefined) {
+        set(state => ({
+          animatedActivations: {
+            ...state.animatedActivations,
+            [result.activationId!]: {
+              state: "pending",
+              monitorId: result.monitorId!,
+              generation: result.generation!,
+              activationId: result.activationId!,
+              wallpaperId: result.wallpaperId,
+            } as unknown as AnimatedActivationState,
+          },
+        }));
+      }
       await fetchLatest();
+      return result;
     },
 
     toggleFavorite: async (id) => {

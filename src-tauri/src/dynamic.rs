@@ -1,4 +1,5 @@
 use crate::{
+    animated_wallpaper::{self, AnimatedActivationOutcome},
     commands::settings::DYNAMIC_INTERVALS,
     commands::wallpaper::set_active_wallpaper_internal,
     db::get_connection,
@@ -12,11 +13,23 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use tauri::AppHandle;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DynamicScheduler {
     worker: Arc<Mutex<Option<Worker>>>,
     apply_lock: Arc<Mutex<()>>,
+    app_handle: Arc<Mutex<Option<AppHandle>>>,
+}
+
+impl Default for DynamicScheduler {
+    fn default() -> Self {
+        Self {
+            worker: Arc::new(Mutex::new(None)),
+            apply_lock: Arc::new(Mutex::new(())),
+            app_handle: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 pub struct ManualOperation<'a> {
@@ -56,6 +69,10 @@ struct Worker {
 }
 
 impl DynamicScheduler {
+    pub fn set_app_handle(&self, app: AppHandle) {
+        *self.app_handle.lock().expect("dynamic scheduler app lock") = Some(app);
+    }
+
     pub fn begin_manual_operation(&self) -> ManualOperation<'_> {
         let restart_on_drop = self
             .worker
@@ -85,7 +102,13 @@ impl DynamicScheduler {
         let thread_stop = Arc::clone(&stop);
         let thread_wake = Arc::clone(&wake);
         let apply_lock = Arc::clone(&self.apply_lock);
-        let handle = thread::spawn(move || run_worker(thread_stop, thread_wake, apply_lock));
+        let app_handle = self
+            .app_handle
+            .lock()
+            .expect("dynamic scheduler app lock")
+            .clone();
+        let handle =
+            thread::spawn(move || run_worker(thread_stop, thread_wake, apply_lock, app_handle));
         *slot = Some(Worker { stop, wake, handle });
     }
 
@@ -113,12 +136,13 @@ fn run_worker(
     stop: Arc<AtomicBool>,
     wake: Arc<(Mutex<bool>, Condvar)>,
     apply_lock: Arc<Mutex<()>>,
+    app_handle: Option<AppHandle>,
 ) {
     loop {
         if stop.load(Ordering::Acquire) {
             return;
         }
-        let interval = match apply_next(&apply_lock) {
+        let interval = match apply_next(&apply_lock, app_handle.as_ref()) {
             Ok(Some(minutes)) => minutes,
             Ok(None) => return,
             Err(error) => {
@@ -133,7 +157,10 @@ fn run_worker(
     }
 }
 
-fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
+fn apply_next(
+    apply_lock: &Mutex<()>,
+    app_handle: Option<&AppHandle>,
+) -> Result<Option<u32>, String> {
     let _guard = apply_lock
         .lock()
         .map_err(|_| "No se pudo bloquear el cambio dinámico".to_string())?;
@@ -186,6 +213,55 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
                 );
                 continue;
             };
+            if wallpaper_is_animated(&conn, &next_id)? {
+                let Some(app) = app_handle else {
+                    set_monitor_playlist_error(
+                        &conn,
+                        &monitor_id,
+                        "No hay contexto de aplicaciÃ³n para activar Animated",
+                    );
+                    continue;
+                };
+                let handle =
+                    match tauri::async_runtime::block_on(animated_wallpaper::open_library_animated(
+                        app.clone(),
+                        monitor_id.clone(),
+                        next_id.clone(),
+                        path.to_string(),
+                    )) {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            set_monitor_playlist_error(&conn, &monitor_id, &error);
+                            continue;
+                        }
+                    };
+                match animated_wallpaper::wait_for_activation(&handle, Duration::from_secs(30)) {
+                    AnimatedActivationOutcome::Ready => {
+                        conn.execute(
+                            "UPDATE monitor_playlists SET current_wallpaper_id = ?1, last_error = NULL WHERE monitor_id = ?2",
+                            (&next_id, &monitor_id),
+                        ).map_err(|e| e.to_string())?;
+                    }
+                    AnimatedActivationOutcome::Pending => {
+                        set_monitor_playlist_error(&conn, &monitor_id, "Animated sigue pendiente");
+                    }
+                    AnimatedActivationOutcome::Failed => {
+                        set_monitor_playlist_error(
+                            &conn,
+                            &monitor_id,
+                            "No se pudo activar Animated",
+                        );
+                    }
+                    AnimatedActivationOutcome::Cancelled => {
+                        set_monitor_playlist_error(
+                            &conn,
+                            &monitor_id,
+                            "La activaciÃ³n Animated fue cancelada",
+                        );
+                    }
+                }
+                continue;
+            }
             let identity = match MonitorIdentity::new(monitor_id.clone()) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -309,6 +385,14 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
             return Ok(Some(interval));
         }
     };
+    if wallpaper_is_animated(&conn, &next_id)? {
+        conn.execute(
+            "UPDATE settings SET dynamic_last_error = ?1 WHERE id = (SELECT id FROM settings LIMIT 1)",
+            ["El scheduler seleccionÃ³ un Animated, pero su activaciÃ³n de superficie requiere un monitor explÃ­cito"],
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(Some(interval));
+    }
     set_active_wallpaper_internal(next_id.clone())?;
     conn.execute(
         "UPDATE settings SET dynamic_current_wallpaper_id = ?1, dynamic_last_error = NULL WHERE id = (SELECT id FROM settings LIMIT 1)",
@@ -316,6 +400,17 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
     )
     .map_err(|e| e.to_string())?;
     Ok(Some(interval))
+}
+
+fn wallpaper_is_animated(conn: &rusqlite::Connection, wallpaper_id: &str) -> Result<bool, String> {
+    let resource_type: String = conn
+        .query_row(
+            "SELECT COALESCE(resource_type, 'static') FROM wallpapers WHERE id = ?1",
+            [wallpaper_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(resource_type == "animated")
 }
 
 fn scaling_mode(conn: &rusqlite::Connection) -> wallpaper::Mode {
