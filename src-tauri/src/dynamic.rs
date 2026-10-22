@@ -271,7 +271,7 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
         playlist_id.ok_or("El fondo dinámico no tiene una lista seleccionada".to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT w.id, w.path FROM playlist_wallpapers pw JOIN wallpapers w ON w.id = pw.wallpaper_id WHERE pw.playlist_id = ?1 ORDER BY pw.rowid",
+            "SELECT w.id, w.path FROM playlist_wallpapers pw JOIN wallpapers w ON w.id = pw.wallpaper_id WHERE pw.playlist_id = ?1 ORDER BY pw.position ASC, pw.wallpaper_id ASC",
         )
         .map_err(|e| e.to_string())?;
     let valid: Vec<(String, String)> = stmt
@@ -344,7 +344,7 @@ fn playlist_wallpapers(
 ) -> Result<Vec<(String, String)>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT w.id, w.path FROM playlist_wallpapers pw JOIN wallpapers w ON w.id = pw.wallpaper_id WHERE pw.playlist_id = ?1 ORDER BY pw.rowid",
+            "SELECT w.id, w.path FROM playlist_wallpapers pw JOIN wallpapers w ON w.id = pw.wallpaper_id WHERE pw.playlist_id = ?1 ORDER BY pw.position ASC, pw.wallpaper_id ASC",
         )
         .map_err(|e| e.to_string())?;
     let rows = statement

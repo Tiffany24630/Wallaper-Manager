@@ -10,18 +10,38 @@ pub fn run(conn: &Connection) -> Result<()> {
 
     ensure_column(conn, "settings", "accent_color", "TEXT DEFAULT 'violet'")?;
     ensure_column(conn, "settings", "ui_scale", "INTEGER DEFAULT 100")?;
+    ensure_column(conn, "wallpapers", "hash", "TEXT")?;
+    ensure_column(conn, "wallpapers", "width", "INTEGER")?;
+    ensure_column(conn, "wallpapers", "height", "INTEGER")?;
+    ensure_column(conn, "wallpapers", "size_bytes", "INTEGER")?;
+    ensure_column(conn, "wallpapers", "file_type", "TEXT")?;
     ensure_column(conn, "wallpapers", "original_path", "TEXT")?;
-    ensure_column(conn, "wallpapers", "resource_type", "TEXT NOT NULL DEFAULT 'static'")?;
+    ensure_column(
+        conn,
+        "wallpapers",
+        "resource_type",
+        "TEXT NOT NULL DEFAULT 'static'",
+    )?;
     ensure_column(conn, "wallpapers", "parent_wallpaper_id", "TEXT")?;
     ensure_column(conn, "settings", "dynamic_enabled", "INTEGER DEFAULT 0")?;
     ensure_column(conn, "settings", "dynamic_playlist_id", "TEXT")?;
-    ensure_column(conn, "settings", "dynamic_interval_minutes", "INTEGER DEFAULT 5")?;
+    ensure_column(
+        conn,
+        "settings",
+        "dynamic_interval_minutes",
+        "INTEGER DEFAULT 5",
+    )?;
     ensure_column(conn, "settings", "dynamic_current_wallpaper_id", "TEXT")?;
     ensure_column(conn, "settings", "dynamic_last_error", "TEXT")?;
     ensure_column(conn, "settings", "cursor_enabled", "INTEGER DEFAULT 0")?;
     ensure_column(conn, "settings", "active_cursor_id", "TEXT")?;
     ensure_column(conn, "cursor_resources", "hash", "TEXT")?;
-    ensure_column(conn, "playlist_wallpapers", "position", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(
+        conn,
+        "playlist_wallpapers",
+        "position",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     conn.execute(
         "UPDATE wallpapers SET resource_type = 'static' WHERE resource_type IS NULL OR resource_type = ''",
@@ -39,12 +59,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn ensure_column(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<()> {
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
     let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let exists = statement
         .query_map([], |row| row.get::<_, String>(1))?
@@ -93,7 +108,9 @@ mod tests {
         assert_eq!(resource_type, "static");
 
         let positions: Vec<i64> = conn
-            .prepare("SELECT position FROM playlist_wallpapers WHERE playlist_id='p' ORDER BY position")
+            .prepare(
+                "SELECT position FROM playlist_wallpapers WHERE playlist_id='p' ORDER BY position",
+            )
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
@@ -101,7 +118,9 @@ mod tests {
             .unwrap();
         assert_eq!(positions, vec![0, 1]);
 
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(version, 1);
     }
 }

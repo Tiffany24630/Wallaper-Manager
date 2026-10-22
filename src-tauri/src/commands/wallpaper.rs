@@ -37,13 +37,16 @@ pub fn list_wallpapers() -> Result<Vec<Wallpaper>, String> {
             let thumbnail: Option<String> = row.get(3)?;
             let original_path: Option<String> = row.get(14)?;
             let resource_type = WallpaperResourceType::from_db(
-                &row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "static".into()),
+                &row.get::<_, Option<String>>(12)?
+                    .unwrap_or_else(|| "static".into()),
             )
-            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
-                12,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-            ))?;
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    12,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                )
+            })?;
             Ok(Wallpaper {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -69,12 +72,31 @@ pub fn list_wallpapers() -> Result<Vec<Wallpaper>, String> {
                 },
                 thumbnail_asset: WallpaperThumbnail {
                     path: thumbnail.clone(),
-                    available: thumbnail.as_deref().is_some_and(|value| Path::new(value).is_file()),
+                    available: thumbnail
+                        .as_deref()
+                        .is_some_and(|value| Path::new(value).is_file()),
                 },
             })
         })
         .map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(Result::ok).collect())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("No se pudo leer la biblioteca: {error}"))
+}
+
+#[tauri::command]
+pub fn list_wallpaper_derivative_ids(parent_wallpaper_id: String) -> Result<Vec<String>, String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id FROM wallpapers WHERE parent_wallpaper_id = ?1 ORDER BY created_at ASC, id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let result = statement
+        .query_map([parent_wallpaper_id], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|e| e.to_string());
+    result
 }
 
 pub(crate) fn import_file(
@@ -112,11 +134,18 @@ pub(crate) fn import_file_with_parent(
             [&hash],
             |row| row.get(0),
         )
-        .unwrap_or(0);
+        .map_err(|error| format!("No se pudo comprobar si la imagen ya existe: {error}"))?;
     if exists > 0 {
         return Err("Esta imagen ya está en la biblioteca".into());
     }
 
+    let name = validate_wallpaper_name(&display_name.unwrap_or_else(|| {
+        source_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }))?;
     let id = Uuid::new_v4().to_string();
     let root = app_data_dir().map_err(|e| e.to_string())?;
     let original_path = root
@@ -124,34 +153,74 @@ pub(crate) fn import_file_with_parent(
         .join(format!("{id}.{extension}"));
     let thumbnail_path = root.join("wallpapers/thumbnails").join(format!("{id}.jpg"));
     fs::copy(source_path, &original_path).map_err(|e| e.to_string())?;
+    if let Err(error) = validate_imported_copy(&original_path, &hash, (width, height)) {
+        return Err(compensate_import_failure(
+            error,
+            [&original_path, &thumbnail_path],
+        ));
+    }
     if let Err(error) = generate_thumbnail(
         &original_path.to_string_lossy(),
         &thumbnail_path.to_string_lossy(),
     ) {
-        let _ = fs::remove_file(&original_path);
-        return Err(error);
+        return Err(compensate_import_failure(
+            error,
+            [&original_path, &thumbnail_path],
+        ));
     }
     let size = fs::metadata(&original_path)
         .map_err(|e| e.to_string())?
         .len();
-    let name = display_name.unwrap_or_else(|| {
-        source_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
-    });
     if let Err(error) = conn.execute(
         "INSERT INTO wallpapers(id, name, path, thumbnail, size_bytes, width, height, file_type, hash, resource_type, parent_wallpaper_id, created_at)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'static', ?10, ?11)",
         rusqlite::params![id, name, original_path.to_string_lossy(), thumbnail_path.to_string_lossy(),
             size, width, height, extension, hash, parent_wallpaper_id, Utc::now().to_rfc3339()],
     ) {
-        let _ = fs::remove_file(&original_path);
-        let _ = fs::remove_file(&thumbnail_path);
-        return Err(error.to_string());
+        return Err(compensate_import_failure(
+            error.to_string(),
+            [&original_path, &thumbnail_path],
+        ));
     }
     Ok(id)
+}
+
+fn validate_imported_copy(
+    path: &Path,
+    expected_hash: &str,
+    expected_dimensions: (u32, u32),
+) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("La copia administrada no está disponible".into());
+    }
+    let image = image::open(path)
+        .map_err(|error| format!("La copia administrada no se puede abrir: {error}"))?;
+    if image.dimensions() != expected_dimensions {
+        return Err("La copia administrada no coincide con las dimensiones originales".into());
+    }
+    let actual_hash = file_hash(&path.to_string_lossy())?;
+    if actual_hash != expected_hash {
+        return Err("La copia administrada no coincide con el hash original".into());
+    }
+    Ok(())
+}
+
+fn compensate_import_failure<E: ToString, const N: usize>(error: E, paths: [&Path; N]) -> String {
+    let mut cleanup_errors = Vec::new();
+    for path in paths {
+        if let Err(cleanup_error) = remove_owned_file(&path.to_string_lossy()) {
+            cleanup_errors.push(format!("{}: {cleanup_error}", path.display()));
+        }
+    }
+    if cleanup_errors.is_empty() {
+        error.to_string()
+    } else {
+        format!(
+            "{}; la compensación física quedó incompleta: {}",
+            error.to_string(),
+            cleanup_errors.join("; ")
+        )
+    }
 }
 
 #[tauri::command]
@@ -243,6 +312,7 @@ pub(crate) fn set_active_wallpaper_internal(wallpaper_id: String) -> Result<(), 
             |row| row.get(0),
         )
         .map_err(|_| "El fondo ya no existe en la biblioteca".to_string())?;
+    ensure_asset_available(&path)?;
     let scaling_mode: String = conn
         .query_row("SELECT scaling_mode FROM settings LIMIT 1", [], |row| {
             row.get(0)
@@ -367,15 +437,27 @@ pub fn toggle_favorite(wallpaper_id: String) -> Result<(), String> {
 #[tauri::command]
 pub fn delete_wallpaper(wallpaper_id: String) -> Result<(), String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
-    let (path, thumbnail, original_path): (String, Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT path, thumbnail, original_path FROM wallpapers WHERE id = ?1",
+    let (path, thumbnail, original_path, active): (String, Option<String>, Option<String>, i32) =
+        conn.query_row(
+            "SELECT path, thumbnail, original_path, active FROM wallpapers WHERE id = ?1",
             [&wallpaper_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(|_| "El fondo ya no existe".to_string())?;
-    conn.execute("DELETE FROM wallpapers WHERE id = ?1", [&wallpaper_id])
+    if active == 1 {
+        return Err(
+            "No se puede eliminar el wallpaper activo sin coordinar primero su reemplazo".into(),
+        );
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM wallpapers WHERE id = ?1", [&wallpaper_id])
         .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE settings SET dynamic_current_wallpaper_id = NULL WHERE dynamic_current_wallpaper_id = ?1",
+        [&wallpaper_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     let mut cleanup_errors = Vec::new();
     for candidate in [Some(path), thumbnail, original_path].into_iter().flatten() {
         if let Err(error) = remove_owned_file(&candidate) {
@@ -401,6 +483,14 @@ fn remove_owned_file(path: &str) -> Result<(), String> {
     }
 }
 
+fn ensure_asset_available(path: &str) -> Result<(), String> {
+    if Path::new(path).is_file() {
+        Ok(())
+    } else {
+        Err("El recurso local del wallpaper no está disponible".into())
+    }
+}
+
 #[tauri::command]
 pub fn regenerate_wallpaper_thumbnail(wallpaper_id: String) -> Result<(), String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
@@ -411,8 +501,31 @@ pub fn regenerate_wallpaper_thumbnail(wallpaper_id: String) -> Result<(), String
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| "El wallpaper ya no existe".to_string())?;
-    let thumbnail = thumbnail.ok_or("El wallpaper no tiene una ruta de miniatura")?;
-    generate_thumbnail(&path, &thumbnail)
+    ensure_asset_available(&path)?;
+    let thumbnail_was_missing = thumbnail.is_none();
+    let thumbnail = thumbnail.unwrap_or_else(|| {
+        app_data_dir()
+            .map(|root| {
+                root.join("wallpapers/thumbnails")
+                    .join(format!("{wallpaper_id}.jpg"))
+            })
+            .unwrap_or_else(|_| PathBuf::from(format!("{wallpaper_id}.jpg")))
+            .to_string_lossy()
+            .into_owned()
+    });
+    generate_thumbnail(&path, &thumbnail)?;
+    if let Err(error) = conn.execute(
+        "UPDATE wallpapers SET thumbnail = ?1 WHERE id = ?2",
+        [&thumbnail, &wallpaper_id],
+    ) {
+        if thumbnail_was_missing {
+            let _ = remove_owned_file(&thumbnail);
+        }
+        return Err(format!(
+            "La miniatura fue regenerada pero no se pudo registrar: {error}"
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -421,15 +534,25 @@ pub fn scan_wallpaper_folder() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .join("wallpapers/import");
     fs::create_dir_all(&import_dir).map_err(|e| e.to_string())?;
+    let mut failures = Vec::new();
     for entry in walkdir::WalkDir::new(import_dir)
         .into_iter()
         .filter_map(Result::ok)
     {
         if entry.path().is_file() {
-            let _ = import_file(entry.path(), None);
+            if let Err(error) = import_file(entry.path(), None) {
+                failures.push(format!("{}: {error}", entry.path().display()));
+            }
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "No se pudieron importar algunos archivos: {}",
+            failures.join("; ")
+        ))
+    }
 }
 
 #[tauri::command]
@@ -563,7 +686,8 @@ pub fn rotate_wallpaper_version(
         )
         .map_err(|_| "El fondo ya no existe en la biblioteca".to_string())?;
     let path = PathBuf::from(path);
-    let source_path = if let Some(original_path) = original_path {
+    ensure_asset_available(&path.to_string_lossy())?;
+    let source_path = if let Some(ref original_path) = original_path {
         PathBuf::from(original_path)
     } else {
         let backup = path.with_file_name(format!(
@@ -577,26 +701,91 @@ pub fn rotate_wallpaper_version(
             fs::copy(&path, &backup)
                 .map_err(|e| format!("No se pudo conservar el original antes de rotar: {e}"))?;
         }
-        conn.execute(
-            "UPDATE wallpapers SET original_path = ?1 WHERE id = ?2",
-            (&backup.to_string_lossy(), &wallpaper_id),
-        )
-        .map_err(|e| e.to_string())?;
         backup
     };
-    let (width, height) = replace_validated_image(&source_path, &path, degrees)?;
-    let thumbnail_path =
-        thumbnail.ok_or("El fondo no tiene una miniatura registrada".to_string())?;
-    generate_thumbnail(&path.to_string_lossy(), &thumbnail_path)?;
-    let hash = file_hash(&path.to_string_lossy())?;
-    let size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    tx.execute(
-        "UPDATE wallpapers SET width = ?1, height = ?2, size_bytes = ?3, hash = ?4 WHERE id = ?5",
-        rusqlite::params![width, height, size, hash, wallpaper_id],
-    )
-    .map_err(|e| format!("No se pudo actualizar los datos del fondo rotado: {e}"))?;
-    tx.commit().map_err(|e| e.to_string())?;
+    ensure_asset_available(&source_path.to_string_lossy())?;
+    let created_original = original_path.is_none();
+    let rollback_path = path.with_file_name(format!(
+        ".{}.lumina-rotation-rollback{}",
+        wallpaper_id,
+        path.extension()
+            .map(|extension| format!(".{}", extension.to_string_lossy()))
+            .unwrap_or_default()
+    ));
+    fs::copy(&path, &rollback_path)
+        .map_err(|e| format!("No se pudo preparar el rollback de la rotación: {e}"))?;
+    let thumbnail_path = thumbnail.unwrap_or_else(|| {
+        app_data_dir()
+            .map(|root| {
+                root.join("wallpapers/thumbnails")
+                    .join(format!("{wallpaper_id}.jpg"))
+            })
+            .unwrap_or_else(|_| PathBuf::from(format!("{wallpaper_id}.jpg")))
+            .to_string_lossy()
+            .into_owned()
+    });
+    let thumbnail_path_ref = Path::new(&thumbnail_path);
+    let thumbnail_rollback = thumbnail_path_ref
+        .with_file_name(format!(".{}.lumina-thumbnail-rollback.jpg", wallpaper_id));
+    let had_thumbnail = thumbnail_path_ref.is_file();
+    if had_thumbnail {
+        fs::copy(thumbnail_path_ref, &thumbnail_rollback)
+            .map_err(|e| format!("No se pudo preparar el rollback de la miniatura: {e}"))?;
+    }
+    let operation = (|| {
+        let (width, height) = replace_validated_image(&source_path, &path, degrees)?;
+        generate_thumbnail(&path.to_string_lossy(), &thumbnail_path)?;
+        let hash = file_hash(&path.to_string_lossy())?;
+        let size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE wallpapers SET original_path = ?1, thumbnail = ?2, width = ?3, height = ?4, size_bytes = ?5, hash = ?6 WHERE id = ?7",
+            rusqlite::params![
+                Some(source_path.to_string_lossy().to_string()),
+                thumbnail_path,
+                width,
+                height,
+                size,
+                hash,
+                wallpaper_id
+            ],
+        )
+        .map_err(|e| format!("No se pudo actualizar los datos del fondo rotado: {e}"))?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = operation {
+        let mut rollback_errors = Vec::new();
+        if let Err(restore_error) = fs::copy(&rollback_path, &path) {
+            rollback_errors.push(format!("no se pudo restaurar el asset: {restore_error}"));
+        }
+        if had_thumbnail {
+            if let Err(restore_error) = fs::copy(&thumbnail_rollback, thumbnail_path_ref) {
+                rollback_errors.push(format!(
+                    "no se pudo restaurar la miniatura: {restore_error}"
+                ));
+            }
+        } else if let Err(remove_error) = remove_owned_file(&thumbnail_path) {
+            rollback_errors.push(format!(
+                "no se pudo retirar la miniatura nueva: {remove_error}"
+            ));
+        }
+        let _ = remove_owned_file(&rollback_path.to_string_lossy());
+        let _ = remove_owned_file(&thumbnail_rollback.to_string_lossy());
+        if created_original {
+            let _ = remove_owned_file(&source_path.to_string_lossy());
+        }
+        return Err(if rollback_errors.is_empty() {
+            format!("La rotación no se completó: {error}")
+        } else {
+            format!(
+                "La rotación falló y el rollback quedó incompleto: {error}; {}",
+                rollback_errors.join("; ")
+            )
+        });
+    }
+    let _ = remove_owned_file(&rollback_path.to_string_lossy());
+    let _ = remove_owned_file(&thumbnail_rollback.to_string_lossy());
     if active == 1 {
         set_active_wallpaper_internal(wallpaper_id)?;
     }
@@ -746,6 +935,8 @@ pub fn upscale_wallpaper(
         == 1;
     drop(conn);
 
+    ensure_asset_available(&source_path)?;
+
     let output_path = app_data_dir()
         .map_err(|e| e.to_string())?
         .join("wallpapers/enhanced")
@@ -849,9 +1040,10 @@ pub fn upscale_wallpaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        persist_active_wallpaper, remove_owned_file, rename_wallpaper_in_connection,
-        replace_validated_image, rotate_image, target_dimensions, validate_ai_pixels,
-        validate_generated_image, validate_wallpaper_name,
+        compensate_import_failure, ensure_asset_available, persist_active_wallpaper,
+        remove_owned_file, rename_wallpaper_in_connection, replace_validated_image, rotate_image,
+        target_dimensions, validate_ai_pixels, validate_generated_image, validate_imported_copy,
+        validate_wallpaper_name,
     };
     use crate::models::wallpaper::WallpaperResourceType;
     use crate::utils::thumbnail::generate_thumbnail;
@@ -1059,9 +1251,61 @@ mod tests {
     }
 
     #[test]
+    fn missing_asset_has_a_distinguishable_availability_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "lumina-missing-asset-{}.png",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let error = ensure_asset_available(&missing.to_string_lossy()).unwrap_err();
+        assert!(error.contains("no está disponible"));
+    }
+
+    #[test]
+    fn imported_copy_is_validated_by_hash_and_dimensions() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumina-import-copy-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("copy.png");
+        RgbImage::new(8, 6).save(&path).unwrap();
+        let hash = crate::utils::hash::file_hash(&path.to_string_lossy()).unwrap();
+        assert!(validate_imported_copy(&path, &hash, (8, 6)).is_ok());
+        assert!(validate_imported_copy(&path, &hash, (6, 8)).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn import_compensation_reports_cleanup_failures() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumina-import-compensation-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let directory = dir.join("not-a-file");
+        fs::create_dir_all(&directory).unwrap();
+        let error = compensate_import_failure("metadata failed", [&directory]);
+        assert!(error.contains("metadata failed"));
+        assert!(error.contains("compensación física"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn resource_type_contract_uses_stable_serializable_values() {
         assert_eq!(WallpaperResourceType::Static.as_str(), "static");
-        assert_eq!(WallpaperResourceType::from_db("animated").unwrap(), WallpaperResourceType::Animated);
+        assert_eq!(
+            WallpaperResourceType::from_db("animated").unwrap(),
+            WallpaperResourceType::Animated
+        );
         assert!(WallpaperResourceType::from_db("video").is_err());
     }
 }

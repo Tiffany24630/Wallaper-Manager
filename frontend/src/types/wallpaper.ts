@@ -1,3 +1,19 @@
+export type WallpaperResourceType = "static" | "animated";
+
+export interface WallpaperAsset {
+  path: string;
+  originalPath?: string;
+  hash?: string;
+  sizeBytes?: number;
+  fileType?: string;
+  available: boolean;
+}
+
+export interface WallpaperThumbnail {
+  path?: string;
+  available: boolean;
+}
+
 export interface Wallpaper {
   id: string;
   name: string;
@@ -11,4 +27,8 @@ export interface Wallpaper {
   fileType?: string;
   hash?: string;
   createdAt?: string;
+  resourceType: WallpaperResourceType;
+  parentWallpaperId?: string;
+  asset: WallpaperAsset;
+  thumbnailAsset: WallpaperThumbnail;
 }

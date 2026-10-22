@@ -35,20 +35,29 @@ pub fn get_playlists() -> Result<Vec<Playlist>, String> {
 #[tauri::command]
 pub fn add_wallpaper_to_playlist(playlist_id: String, wallpaper_id: String) -> Result<(), String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
+    let position: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM playlist_wallpapers WHERE playlist_id = ?1",
+            [&playlist_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
 
     conn.execute(
         "
         INSERT OR IGNORE INTO
         playlist_wallpapers(
             playlist_id,
-            wallpaper_id
+            wallpaper_id,
+            position
         )
         VALUES(
             ?1,
-            ?2
+            ?2,
+            ?3
         )
         ",
-        (playlist_id, wallpaper_id),
+        (playlist_id, wallpaper_id, position),
     )
     .map_err(|e| e.to_string())?;
 
@@ -65,6 +74,7 @@ pub fn get_playlist_wallpapers(playlist_id: String) -> Result<Vec<String>, Strin
             SELECT wallpaper_id
             FROM playlist_wallpapers
             WHERE playlist_id = ?1
+            ORDER BY position ASC, wallpaper_id ASC
             ",
         )
         .map_err(|e| e.to_string())?;
@@ -110,11 +120,7 @@ pub fn import_synced_playlist(
             )
             .map_err(|e| e.to_string())?;
         if present {
-            conn.execute(
-                "INSERT OR IGNORE INTO playlist_wallpapers(playlist_id,wallpaper_id) VALUES(?1,?2)",
-                (&playlist_id, &wallpaper_id),
-            )
-            .map_err(|e| e.to_string())?;
+            insert_playlist_wallpaper(&conn, &playlist_id, &wallpaper_id)?;
         } else {
             conn.execute("INSERT OR IGNORE INTO sync_pending_playlist_items(playlist_id,wallpaper_id) VALUES(?1,?2)", (&playlist_id, &wallpaper_id)).map_err(|e| e.to_string())?;
         }
@@ -153,11 +159,7 @@ pub fn apply_synced_playlist(
             )
             .map_err(|e| e.to_string())?;
         if present {
-            conn.execute(
-                "INSERT OR IGNORE INTO playlist_wallpapers(playlist_id,wallpaper_id) VALUES(?1,?2)",
-                (&playlist_id, &wallpaper_id),
-            )
-            .map_err(|e| e.to_string())?;
+            insert_playlist_wallpaper(&conn, &playlist_id, &wallpaper_id)?;
         } else {
             conn.execute("INSERT OR IGNORE INTO sync_pending_playlist_items(playlist_id,wallpaper_id) VALUES(?1,?2)", (&playlist_id, &wallpaper_id)).map_err(|e| e.to_string())?;
         }
@@ -228,8 +230,87 @@ pub fn remove_wallpaper_from_playlist(
     let conn = get_connection().map_err(|e| e.to_string())?;
     conn.execute(
         "DELETE FROM playlist_wallpapers WHERE playlist_id = ?1 AND wallpaper_id = ?2",
-        (playlist_id, wallpaper_id),
+        (&playlist_id, wallpaper_id),
+    )
+    .map_err(|e| e.to_string())?;
+    normalize_playlist_positions(&conn, &playlist_id)?;
+    Ok(())
+}
+
+fn insert_playlist_wallpaper(
+    conn: &rusqlite::Connection,
+    playlist_id: &str,
+    wallpaper_id: &str,
+) -> Result<(), String> {
+    let position: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM playlist_wallpapers WHERE playlist_id = ?1",
+            [playlist_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR IGNORE INTO playlist_wallpapers(playlist_id, wallpaper_id, position) VALUES(?1, ?2, ?3)",
+        (playlist_id, wallpaper_id, position),
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn normalize_playlist_positions(
+    conn: &rusqlite::Connection,
+    playlist_id: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE playlist_wallpapers
+         SET position = (
+             SELECT COUNT(*) - 1
+             FROM playlist_wallpapers AS prior
+             WHERE prior.playlist_id = playlist_wallpapers.playlist_id
+               AND prior.rowid <= playlist_wallpapers.rowid
+         )
+         WHERE playlist_id = ?1",
+        [playlist_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{insert_playlist_wallpaper, normalize_playlist_positions};
+    use rusqlite::Connection;
+
+    #[test]
+    fn playlist_positions_are_explicit_and_stable_after_removal() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE playlist_wallpapers(
+                playlist_id TEXT NOT NULL,
+                wallpaper_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY(playlist_id, wallpaper_id)
+            );",
+        )
+        .unwrap();
+
+        insert_playlist_wallpaper(&conn, "p", "one").unwrap();
+        insert_playlist_wallpaper(&conn, "p", "two").unwrap();
+        insert_playlist_wallpaper(&conn, "p", "three").unwrap();
+        conn.execute(
+            "DELETE FROM playlist_wallpapers WHERE playlist_id='p' AND wallpaper_id='two'",
+            [],
+        )
+        .unwrap();
+        normalize_playlist_positions(&conn, "p").unwrap();
+
+        let rows: Vec<(String, i64)> = conn
+            .prepare("SELECT wallpaper_id, position FROM playlist_wallpapers WHERE playlist_id='p' ORDER BY position")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![("one".into(), 0), ("three".into(), 1)]);
+    }
 }
