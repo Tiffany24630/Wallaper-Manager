@@ -10,9 +10,13 @@ use rand::seq::SliceRandom;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
+    sync::{Mutex, OnceLock},
+    thread,
+    time::{Duration, Instant},
 };
 use tauri::Manager;
 use tauri::State;
@@ -837,6 +841,9 @@ fn validate_generated_image(path: &Path, expected: (u32, u32)) -> Result<(), Str
     if size == 0 {
         return Err("Real-ESRGAN generó un archivo vacío".into());
     }
+    if size > 512 * 1024 * 1024 {
+        return Err("La salida mejorada supera el límite local de 512 MB".into());
+    }
     let image = image::open(path)
         .map_err(|e| format!("La salida de Real-ESRGAN no es una imagen válida: {e}"))?;
     if image.dimensions() != expected {
@@ -900,9 +907,129 @@ fn validate_ai_pixels(
 
 #[derive(Debug, Serialize)]
 pub struct UpscaleResult {
+    pub job_id: String,
+    pub state: EnhancementJobState,
     pub id: String,
     pub method: String,
     pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EnhancementJobState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+static ACTIVE_ENHANCEMENTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn active_enhancements() -> &'static Mutex<HashSet<String>> {
+    ACTIVE_ENHANCEMENTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct EnhancementJobGuard {
+    source_id: String,
+    job_id: String,
+    state: EnhancementJobState,
+}
+
+impl EnhancementJobGuard {
+    fn begin(source_id: &str) -> Result<Self, String> {
+        let jobs = active_enhancements();
+        let mut active = jobs
+            .lock()
+            .map_err(|_| "No se pudo registrar el trabajo de mejora".to_string())?;
+        if !active.insert(source_id.to_owned()) {
+            return Err("Ya hay una mejora en curso para este wallpaper".into());
+        }
+        Ok(Self {
+            source_id: source_id.to_owned(),
+            job_id: Uuid::new_v4().to_string(),
+            state: EnhancementJobState::Pending,
+        })
+    }
+
+    fn running(&mut self) {
+        self.state = EnhancementJobState::Running;
+    }
+
+    fn complete(&mut self) {
+        self.state = EnhancementJobState::Completed;
+    }
+}
+
+impl Drop for EnhancementJobGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = active_enhancements().lock() {
+            active.remove(&self.source_id);
+        }
+    }
+}
+
+struct TemporaryOutput {
+    path: PathBuf,
+}
+
+impl TemporaryOutput {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryOutput {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+const REAL_ESRGAN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+fn run_realesrgan(
+    executable: &Path,
+    tool_dir: &Path,
+    source_path: &str,
+    output_path: &str,
+    model: &str,
+    scale: &str,
+) -> Result<Output, String> {
+    let mut child = Command::new(executable)
+        .current_dir(tool_dir)
+        .args([
+            "-i",
+            source_path,
+            "-o",
+            output_path,
+            "-n",
+            model,
+            "-s",
+            scale,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("No se pudo iniciar Real-ESRGAN: {e}"))?;
+    let deadline = Instant::now() + REAL_ESRGAN_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .map_err(|e| format!("No se pudo consultar Real-ESRGAN: {e}"))?
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Real-ESRGAN superó el tiempo máximo de 30 minutos".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    child
+        .wait_with_output()
+        .map_err(|e| format!("No se pudo recoger la salida de Real-ESRGAN: {e}"))
 }
 
 #[tauri::command]
@@ -925,6 +1052,7 @@ pub fn upscale_wallpaper(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| "No se encontró el fondo".to_string())?;
+    let mut job = EnhancementJobGuard::begin(&source_id)?;
     let hardware_acceleration = conn
         .query_row(
             "SELECT hardware_acceleration FROM settings LIMIT 1",
@@ -936,16 +1064,19 @@ pub fn upscale_wallpaper(
     drop(conn);
 
     ensure_asset_available(&source_path)?;
+    let source_hash = file_hash(&source_path)?;
 
     let output_path = app_data_dir()
         .map_err(|e| e.to_string())?
         .join("wallpapers/enhanced")
         .join(format!("{}-{scale}x.png", Uuid::new_v4()));
+    let _temporary_output = TemporaryOutput::new(output_path.clone());
     let output_string = output_path.to_string_lossy().into_owned();
     let scale_string = scale.to_string();
     let source = image::open(&source_path)
         .map_err(|e| format!("No se pudo abrir la imagen para mejorarla: {e}"))?;
     let expected_dimensions = target_dimensions(source.width(), source.height(), scale)?;
+    job.running();
     let mut used_ai = false;
     let mut warning = None;
 
@@ -953,20 +1084,14 @@ pub fn upscale_wallpaper(
         if let Ok(tool_dir) = realesrgan_dir(&app) {
             let executable = tool_dir.join("realesrgan-ncnn-vulkan.exe");
             if executable.is_file() {
-                let result = Command::new(&executable)
-                    .current_dir(&tool_dir)
-                    .args([
-                        "-i",
-                        &source_path,
-                        "-o",
-                        &output_string,
-                        "-n",
-                        model,
-                        "-s",
-                        &scale_string,
-                    ])
-                    .output()
-                    .map_err(|e| format!("No se pudo iniciar Real-ESRGAN: {e}"))?;
+                let result = run_realesrgan(
+                    &executable,
+                    &tool_dir,
+                    &source_path,
+                    &output_string,
+                    model,
+                    &scale_string,
+                )?;
                 if result.status.success() {
                     let valid_output = validate_generated_image(&output_path, expected_dimensions)
                         .is_ok()
@@ -1013,6 +1138,13 @@ pub fn upscale_wallpaper(
         validate_generated_image(&output_path, expected_dimensions)?;
     }
 
+    let current_hash = file_hash(&source_path)?;
+    if current_hash != source_hash {
+        return Err(
+            "El wallpaper de origen cambió durante la mejora; no se registró el resultado".into(),
+        );
+    }
+
     let stem = Path::new(&original_name)
         .file_stem()
         .unwrap_or_default()
@@ -1024,13 +1156,13 @@ pub fn upscale_wallpaper(
         Some(&source_id),
     ) {
         Ok(id) => id,
-        Err(error) => {
-            let _ = fs::remove_file(&output_path);
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
-    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(&output_path);
+    job.complete();
     Ok(UpscaleResult {
+        job_id: job.job_id.clone(),
+        state: job.state.clone(),
         id: new_id,
         method: method.into(),
         warning,
@@ -1043,7 +1175,7 @@ mod tests {
         compensate_import_failure, ensure_asset_available, persist_active_wallpaper,
         remove_owned_file, rename_wallpaper_in_connection, replace_validated_image, rotate_image,
         target_dimensions, validate_ai_pixels, validate_generated_image, validate_imported_copy,
-        validate_wallpaper_name,
+        validate_wallpaper_name, EnhancementJobGuard, EnhancementJobState, TemporaryOutput,
     };
     use crate::models::wallpaper::WallpaperResourceType;
     use crate::utils::thumbnail::generate_thumbnail;
@@ -1307,5 +1439,32 @@ mod tests {
             WallpaperResourceType::Animated
         );
         assert!(WallpaperResourceType::from_db("video").is_err());
+    }
+
+    #[test]
+    fn enhancement_jobs_reject_duplicate_sources_and_release_after_drop() {
+        let first = EnhancementJobGuard::begin("source").unwrap();
+        assert!(EnhancementJobGuard::begin("source").is_err());
+        drop(first);
+        let mut next = EnhancementJobGuard::begin("source").unwrap();
+        assert!(matches!(next.state, EnhancementJobState::Pending));
+        next.running();
+        assert!(matches!(next.state, EnhancementJobState::Running));
+    }
+
+    #[test]
+    fn enhancement_temporary_is_removed_when_scope_ends() {
+        let path = std::env::temp_dir().join(format!(
+            "lumina-enhancement-temp-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"temporary").unwrap();
+        {
+            let _temporary = TemporaryOutput::new(path.clone());
+        }
+        assert!(!path.exists());
     }
 }

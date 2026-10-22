@@ -126,10 +126,18 @@ pub fn save_settings(
             dynamic_enabled = ?9,
             dynamic_playlist_id = ?10,
             dynamic_interval_minutes = ?11,
-            dynamic_current_wallpaper_id = ?12,
-            dynamic_last_error = ?13,
-            cursor_enabled = ?14,
-            active_cursor_id = ?15
+            dynamic_current_wallpaper_id = CASE
+                WHEN dynamic_enabled != ?9
+                  OR dynamic_playlist_id IS NOT ?10
+                  OR dynamic_interval_minutes != ?11
+                THEN NULL ELSE dynamic_current_wallpaper_id END,
+            dynamic_last_error = CASE
+                WHEN dynamic_enabled != ?9
+                  OR dynamic_playlist_id IS NOT ?10
+                  OR dynamic_interval_minutes != ?11
+                THEN NULL ELSE dynamic_last_error END,
+            cursor_enabled = ?12,
+            active_cursor_id = ?13
         WHERE id = (SELECT id FROM settings LIMIT 1)
         ",
         params![
@@ -144,8 +152,6 @@ pub fn save_settings(
             settings.dynamic_enabled as i32,
             settings.dynamic_playlist_id,
             settings.dynamic_interval_minutes,
-            settings.dynamic_current_wallpaper_id,
-            settings.dynamic_last_error,
             settings.cursor_enabled as i32,
             settings.active_cursor_id,
         ],

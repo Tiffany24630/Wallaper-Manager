@@ -174,11 +174,18 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
             let Some(next_id) = select_next_id(&valid, current_id.as_deref()) else {
                 continue;
             };
-            let path = valid
+            let Some(path) = valid
                 .iter()
                 .find(|(id, _)| id == &next_id)
                 .map(|(_, path)| path)
-                .expect("selected playlist wallpaper must exist");
+            else {
+                set_monitor_playlist_error(
+                    &conn,
+                    &monitor_id,
+                    "El wallpaper seleccionado ya no existe",
+                );
+                continue;
+            };
             let identity = match MonitorIdentity::new(monitor_id.clone()) {
                 Ok(identity) => identity,
                 Err(error) => {
@@ -274,10 +281,13 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
             "SELECT w.id, w.path FROM playlist_wallpapers pw JOIN wallpapers w ON w.id = pw.wallpaper_id WHERE pw.playlist_id = ?1 ORDER BY pw.position ASC, pw.wallpaper_id ASC",
         )
         .map_err(|e| e.to_string())?;
-    let valid: Vec<(String, String)> = stmt
+    let rows: Vec<(String, String)> = stmt
         .query_map([&playlist_id], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let valid: Vec<(String, String)> = rows
+        .into_iter()
         .filter(|(_, path)| std::path::Path::new(path).is_file())
         .collect();
     if valid.is_empty() {
@@ -290,7 +300,14 @@ fn apply_next(apply_lock: &Mutex<()>) -> Result<Option<u32>, String> {
     }
     let next_id = match select_next_id(&valid, current_id.as_deref()) {
         Some(id) => id,
-        None => return Ok(Some(interval)),
+        None => {
+            conn.execute(
+                "UPDATE settings SET dynamic_last_error = NULL WHERE id = (SELECT id FROM settings LIMIT 1)",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(Some(interval));
+        }
     };
     set_active_wallpaper_internal(next_id.clone())?;
     conn.execute(
@@ -350,8 +367,11 @@ fn playlist_wallpapers(
     let rows = statement
         .query_map([playlist_id], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|e| e.to_string())?;
+    let rows = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
     Ok(rows
-        .filter_map(Result::ok)
+        .into_iter()
         .filter(|(_, path)| std::path::Path::new(path).is_file())
         .collect())
 }

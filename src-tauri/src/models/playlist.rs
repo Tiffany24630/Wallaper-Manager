@@ -6,4 +6,5 @@ pub struct Playlist {
     pub id: String,
     pub name: String,
     pub created_at: String,
+    pub wallpaper_count: i64,
 }

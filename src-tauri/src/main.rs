@@ -274,6 +274,8 @@ fn main() {
             remove_playlist_from_monitor,
             get_playlists,
             create_playlist,
+            rename_playlist,
+            reorder_playlist,
             delete_playlist,
             add_wallpaper_to_playlist,
             remove_wallpaper_from_playlist,
