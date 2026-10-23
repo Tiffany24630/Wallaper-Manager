@@ -9,9 +9,11 @@ interface PlaylistState {
 
   loadPlaylists: () => Promise<void>;
   createPlaylist: (name: string) => Promise<void>;
+  renamePlaylist: (id: string, name: string) => Promise<void>;
   deletePlaylist: (id: string) => Promise<void>;
   addWallpaperToPlaylist: (playlistId: string, wallpaperId: string) => Promise<void>;
   getPlaylistWallpapers: (playlistId: string) => Promise<string[]>;
+  reorderPlaylist: (playlistId: string, wallpaperIds: string[]) => Promise<void>;
 }
 
 export const usePlaylistStore =
@@ -66,6 +68,16 @@ export const usePlaylistStore =
       }
     },
 
+    renamePlaylist: async (id, name) => {
+      try {
+        await playlistService.rename(id, name);
+        set({ playlists: await playlistService.getAll(), error: null });
+      } catch (error) {
+        set({ error: String(error) });
+        throw error;
+      }
+    },
+
     deletePlaylist: async (id) => {
       try {
         set({
@@ -94,11 +106,12 @@ export const usePlaylistStore =
       try {
         await playlistService.addWallpaper(playlistId, wallpaperId);
         const playlists = await playlistService.getAll();
-        set({ playlists });
+        set({ playlists, error: null });
       } catch (error) {
         set({
           error: String(error),
         });
+        throw error;
       }
     },
 
@@ -110,6 +123,16 @@ export const usePlaylistStore =
           error: String(error),
         });
         return [];
+      }
+    },
+
+    reorderPlaylist: async (playlistId, wallpaperIds) => {
+      try {
+        await playlistService.reorder(playlistId, wallpaperIds);
+        set({ playlists: await playlistService.getAll(), error: null });
+      } catch (error) {
+        set({ error: String(error) });
+        throw error;
       }
     },
   }));

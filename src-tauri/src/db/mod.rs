@@ -1,14 +1,22 @@
 use rusqlite::{Connection, Result};
 use sha2::{Digest, Sha256};
-use std::{fs::File, io::Read, path::PathBuf, sync::OnceLock};
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 use tauri::Manager;
 
 mod migrations;
 
 static DATABASE_PATH: OnceLock<PathBuf> = OnceLock::new();
+const SMOKE_MARKER: &str = "lumina-smoke-root-v1\n";
 
 pub fn initialize(app: &tauri::AppHandle) -> Result<(), String> {
-    let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let production_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let smoke_token = smoke_test_token_from_args(std::env::args())?;
+    let app_dir = resolve_data_dir(&production_dir, smoke_token.as_deref())?;
     std::fs::create_dir_all(app_dir.join("wallpapers/originals")).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(app_dir.join("wallpapers/thumbnails")).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(app_dir.join("wallpapers/enhanced")).map_err(|e| e.to_string())?;
@@ -16,7 +24,86 @@ pub fn initialize(app: &tauri::AppHandle) -> Result<(), String> {
     std::fs::create_dir_all(app_dir.join("cursors/sources")).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(app_dir.join("cursors/previews")).map_err(|e| e.to_string())?;
     let _ = DATABASE_PATH.set(app_dir.join("lumina.db"));
+    eprintln!(
+        "LUMINA_DATA_ROOT mode={} path={}",
+        if smoke_token.is_some() {
+            "smoke"
+        } else {
+            "production"
+        },
+        app_dir.display()
+    );
     get_connection().map(|_| ()).map_err(|e| e.to_string())
+}
+
+fn smoke_test_token_from_args<I>(args: I) -> Result<Option<String>, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut token = None;
+    for argument in args {
+        if let Some(value) = argument.strip_prefix("--lumina-smoke-test=") {
+            if token.is_some() {
+                return Err("El modo smoke test fue solicitado más de una vez".into());
+            }
+            if value.is_empty()
+                || value.len() > 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err("El identificador smoke test no es válido".into());
+            }
+            token = Some(value.to_string());
+        }
+    }
+    Ok(token)
+}
+
+fn resolve_data_dir(production_dir: &Path, smoke_token: Option<&str>) -> Result<PathBuf, String> {
+    let Some(token) = smoke_token else {
+        return Ok(production_dir.to_path_buf());
+    };
+
+    let smoke_parent = std::env::temp_dir().join("lumina-smoke-tests");
+    let smoke_dir = smoke_parent.join(token);
+    let production_absolute = absolute_for_comparison(production_dir)?;
+    let smoke_absolute = absolute_for_comparison(&smoke_dir)?;
+    if smoke_absolute == production_absolute
+        || smoke_absolute.starts_with(&production_absolute)
+        || production_absolute.starts_with(&smoke_absolute)
+    {
+        return Err("La ruta smoke test coincide con el directorio real de datos".into());
+    }
+
+    std::fs::create_dir_all(&smoke_parent).map_err(|e| e.to_string())?;
+    if smoke_dir.exists() {
+        let marker = smoke_dir.join(".lumina-smoke-owned");
+        let contents = std::fs::read_to_string(&marker)
+            .map_err(|_| "El directorio smoke test existente no está verificado".to_string())?;
+        if contents != SMOKE_MARKER {
+            return Err("El directorio smoke test existente no pertenece a Lumina".into());
+        }
+    } else {
+        std::fs::create_dir(&smoke_dir).map_err(|e| e.to_string())?;
+        let marker = smoke_dir.join(".lumina-smoke-owned");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker)
+            .map_err(|e| e.to_string())?;
+        file.write_all(SMOKE_MARKER.as_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(smoke_dir)
+}
+
+fn absolute_for_comparison(path: &Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        std::fs::canonicalize(path).map_err(|e| e.to_string())
+    } else {
+        std::path::absolute(path).map_err(|e| e.to_string())
+    }
 }
 
 pub fn app_data_dir() -> Result<PathBuf> {
@@ -222,7 +309,7 @@ fn backfill_cursor_hashes(conn: &Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::backfill_cursor_hashes;
+    use super::{backfill_cursor_hashes, resolve_data_dir, smoke_test_token_from_args};
     use rusqlite::Connection;
     use sha2::{Digest, Sha256};
     use std::{
@@ -271,5 +358,56 @@ mod tests {
             "INSERT INTO cursor_resources(id,name,path,hash) VALUES('different','Same name','other',?1)", [&other_hash],
         ).is_ok());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn production_mode_keeps_the_requested_data_directory() {
+        let production = std::env::temp_dir().join("lumina-production-contract");
+        assert_eq!(resolve_data_dir(&production, None).unwrap(), production);
+    }
+
+    #[test]
+    fn smoke_mode_uses_owned_isolated_directory() {
+        let production = std::env::temp_dir().join("lumina-production-contract-real");
+        let token = format!("test-{}", std::process::id());
+        let isolated = resolve_data_dir(&production, Some(&token)).unwrap();
+        assert_ne!(isolated, production);
+        assert!(isolated.join(".lumina-smoke-owned").is_file());
+        assert_eq!(
+            resolve_data_dir(&production, Some(&token)).unwrap(),
+            isolated
+        );
+        let _ = fs::remove_dir_all(isolated);
+    }
+
+    #[test]
+    fn smoke_mode_rejects_paths_and_is_opt_in() {
+        assert_eq!(
+            smoke_test_token_from_args(vec!["lumina.exe".into()]).unwrap(),
+            None
+        );
+        assert!(smoke_test_token_from_args(vec![
+            "lumina.exe".into(),
+            "--lumina-smoke-test=../real".into(),
+        ])
+        .is_err());
+        assert!(smoke_test_token_from_args(vec![
+            "lumina.exe".into(),
+            "--lumina-smoke-test=C:\\real".into(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn smoke_mode_rejects_unowned_existing_directory() {
+        let token = format!("unowned-{}", std::process::id());
+        let directory = std::env::temp_dir().join("lumina-smoke-tests").join(&token);
+        fs::create_dir_all(&directory).unwrap();
+        assert!(resolve_data_dir(
+            &std::env::temp_dir().join("lumina-production-contract-real"),
+            Some(&token)
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(directory);
     }
 }

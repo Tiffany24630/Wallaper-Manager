@@ -731,9 +731,8 @@ fn encode_query_component(value: &str) -> String {
 }
 
 fn prototype_directory(app: &AppHandle) -> Result<PathBuf, String> {
-    let directory = app
-        .path()
-        .app_data_dir()
+    let _ = app;
+    let directory = crate::db::app_data_dir()
         .map_err(|e| format!("No se pudo obtener AppData de Lumina: {e}"))?
         .join("animated-prototype");
     fs::create_dir_all(&directory)
