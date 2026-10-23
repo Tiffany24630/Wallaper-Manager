@@ -19,6 +19,7 @@ export default function Library() {
   const [comparison, setComparison] = useState<{ originalId: string; enhancedId: string } | null>(null);
   const [monitors, setMonitors] = useState<Awaited<ReturnType<typeof monitorService.getAll>>>([]);
   const [monitorId, setMonitorId] = useState("");
+  const [monitorWallpapers, setMonitorWallpapers] = useState<Awaited<ReturnType<typeof monitorService.getWallpapers>>>([]);
   useEffect(() => { void store.loadWallpapers(); }, [store.loadWallpapers]);
   useEffect(() => {
     let active = true;
@@ -41,14 +42,15 @@ export default function Library() {
     else setMessage("La activación de la animación fue cancelada.");
   }, [store.animatedActivations]);
   useEffect(() => {
-    void monitorService.getAll().then(items => {
+    void Promise.all([monitorService.getAll(), monitorService.getWallpapers()]).then(([items, assignments]) => {
       setMonitors(items);
+      setMonitorWallpapers(assignments);
       setMonitorId(current => {
         const selected = current || localStorage.getItem("lumina.library.monitor") || items.find(item => item.primary)?.id || (items.length === 1 ? items[0].id : "");
         if (selected) localStorage.setItem("lumina.library.monitor", selected);
         return selected;
       });
-    }).catch(() => setMonitors([]));
+    }).catch(() => { setMonitors([]); setMonitorWallpapers([]); });
   }, []);
   useEffect(() => {
     if (!deleteTarget) return;
@@ -183,7 +185,7 @@ export default function Library() {
       <span className="px-2 text-sm muted">{visible.length} de {store.wallpapers.length}</span>
     </div>
     {store.loading ? <div className="empty">Cargando biblioteca…</div> : visible.length === 0 ? <div className="empty"><ImagePlus className="mx-auto mb-3"/> {store.wallpapers.length ? "No hay coincidencias." : "Todavía no hay fondos. Importa tu primera imagen para comenzar."}</div> :
-      <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{visible.map(w => <WallpaperCard key={w.id} wallpaper={w} busy={busy} onActivate={id => void run(async () => { if (!monitorId) throw new Error("Selecciona un monitor de destino antes de aplicar el fondo."); const state = await store.setActive(id, monitorId); setMessage(state === "pending" ? "Animated en carga; la aplicación física y su visibilidad aún no están confirmadas." : "Fondo aplicado."); })} onFavorite={id => void run(() => store.toggleFavorite(id))} onDelete={remove} onRename={beginRename} onRotate={rotate} onRegenerateThumbnail={id => void run(() => store.regenerateThumbnail(id), "Miniatura regenerada.")}/>)}</section>}
+      <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{visible.map(w => <WallpaperCard key={w.id} wallpaper={w} isActive={monitorWallpapers.some(item => item.monitorId === monitorId && item.wallpaperId === w.id)} busy={busy} onActivate={id => void run(async () => { if (!monitorId) throw new Error("Selecciona un monitor de destino antes de aplicar el fondo."); const state = await store.setActive(id, monitorId); setMonitorWallpapers(await monitorService.getWallpapers()); setMessage(state === "pending" ? "Animated en carga; la aplicación física y su visibilidad aún no están confirmadas." : "Fondo aplicado."); })} onFavorite={id => void run(() => store.toggleFavorite(id))} onDelete={remove} onRename={beginRename} onRotate={rotate} onRegenerateThumbnail={id => void run(() => store.regenerateThumbnail(id), "Miniatura regenerada.")}/>)}</section>}
     {renameId && <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="rename-title"><div className="modal-card max-w-lg"><h2 id="rename-title" className="text-xl font-semibold">Renombrar fondo</h2><p className="mt-1 text-sm muted">El nombre visible cambiará en toda la biblioteca, sin mover el archivo.</p><input className="input mt-5" autoFocus value={renameValue} onChange={event => setRenameValue(event.target.value)} maxLength={200} onKeyDown={event => { if (event.key === "Enter") void confirmRename(); if (event.key === "Escape") setRenameId(null); }}/><div className="mt-5 flex justify-end gap-2"><button className="btn" onClick={() => setRenameId(null)} disabled={busy}>Cancelar</button><button className="btn btn-primary" onClick={() => void confirmRename()} disabled={busy}>Guardar</button></div></div></div>}
     {deleteTarget && <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-title" onClick={event => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}><div className="modal-card max-w-lg"><h2 id="delete-title" className="text-xl font-semibold">Eliminar wallpaper</h2><p className="mt-2 text-sm muted">¿Quieres eliminar <strong className="text-slate-200">{deleteTarget.name}</strong> de la biblioteca?</p><p className="mt-2 text-sm muted">Se eliminarán el registro y los archivos administrados por Lumina. Esta acción no se puede deshacer.</p><div className="mt-5 flex justify-end gap-2"><button className="btn" onClick={() => setDeleteTarget(null)} disabled={busy}>Cancelar</button><button className="btn btn-danger" onClick={() => void confirmDelete()} disabled={busy}>{busy ? "Eliminando…" : "Eliminar"}</button></div></div></div>}
     {original && enhanced && <UpscaleComparisonDialog original={original} enhanced={enhanced} busy={busy} onChoose={choice => void chooseVersion(choice)}/>}

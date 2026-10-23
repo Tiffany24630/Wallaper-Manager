@@ -2,6 +2,7 @@ pub mod cursor;
 pub mod monitor;
 pub mod monitor_assignment;
 pub mod monitor_playlist;
+pub mod monitor_wallpaper;
 pub mod playlist;
 pub mod settings;
 pub mod sync;

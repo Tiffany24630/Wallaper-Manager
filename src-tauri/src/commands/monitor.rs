@@ -7,6 +7,7 @@ use crate::{
         UiMonitorDescriptor, WallpaperBackend,
     },
     models::monitor_playlist::MonitorPlaylist,
+    models::monitor_wallpaper::MonitorWallpaper,
     models::wallpaper_coordinator,
     utils::windows_wallpaper::{native_monitor_descriptors, set_monitor_wallpaper},
 };
@@ -343,7 +344,7 @@ pub fn assign_wallpaper_to_monitor(
         [],
     )
     .map_err(|e| e.to_string())?;
-    manual_operation.complete();
+    manual_operation.complete_and_resume();
     Ok(())
 }
 
@@ -363,6 +364,24 @@ pub fn get_monitor_playlists() -> Result<Vec<MonitorPlaylist>, String> {
                 playlist_id: row.get(1)?,
                 current_wallpaper_id: row.get(2)?,
                 last_error: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_monitor_wallpapers() -> Result<Vec<MonitorWallpaper>, String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    let mut statement = conn
+        .prepare("SELECT monitor_id, wallpaper_id FROM monitor_wallpapers ORDER BY monitor_id")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(MonitorWallpaper {
+                monitor_id: row.get(0)?,
+                wallpaper_id: row.get(1)?,
             })
         })
         .map_err(|e| e.to_string())?;

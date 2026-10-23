@@ -531,6 +531,7 @@ fn main() {
             get_settings,
             save_settings,
             get_monitors,
+            get_monitor_wallpapers,
             get_monitor_playlists,
             assign_playlist_to_monitor,
             remove_playlist_from_monitor,

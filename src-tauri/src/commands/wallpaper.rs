@@ -349,11 +349,22 @@ pub async fn set_active_wallpaper(
         set_active_wallpaper_internal(wallpaper_id.clone())?;
     }
     let conn = get_connection().map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE settings SET dynamic_enabled = 0, dynamic_current_wallpaper_id = ?1, dynamic_last_error = NULL WHERE id = (SELECT id FROM settings LIMIT 1)",
-        [&wallpaper_id],
-    )
-    .map_err(|e| e.to_string())?;
+    if monitor_id.is_some() {
+        // `active` is the legacy/global selection. A monitor-specific
+        // assignment is authoritative only in monitor_wallpapers and must
+        // not clear the global flag for another monitor's wallpaper.
+        conn.execute(
+            "UPDATE settings SET dynamic_enabled = 0, dynamic_last_error = NULL WHERE id = (SELECT id FROM settings LIMIT 1)",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        conn.execute(
+            "UPDATE settings SET dynamic_enabled = 0, dynamic_current_wallpaper_id = ?1, dynamic_last_error = NULL WHERE id = (SELECT id FROM settings LIMIT 1)",
+            [&wallpaper_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     if let Some(monitor_id) = monitor_id.as_deref() {
         conn.execute(
             "DELETE FROM monitor_playlists WHERE monitor_id = ?1",
@@ -364,7 +375,11 @@ pub async fn set_active_wallpaper(
         conn.execute("DELETE FROM monitor_playlists", [])
             .map_err(|e| e.to_string())?;
     }
-    manual_operation.complete();
+    if monitor_id.is_some() {
+        manual_operation.complete_and_resume();
+    } else {
+        manual_operation.complete();
+    }
     Ok(WallpaperApplyResult {
         state: "confirmed".into(),
         wallpaper_id,

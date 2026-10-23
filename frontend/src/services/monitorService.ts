@@ -2,6 +2,11 @@ import { tauriInvoke } from "./tauri";
 import type {Monitor} from "../types/monitor";
 import type {MonitorPlaylist} from "../types/monitor";
 
+export interface MonitorWallpaper {
+  monitorId: string;
+  wallpaperId: string;
+}
+
 export const monitorService = {
   async getAll(): Promise<Monitor[]> {
     return tauriInvoke<Monitor[]>(
@@ -24,6 +29,10 @@ export const monitorService = {
 
   async getPlaylists(): Promise<MonitorPlaylist[]> {
     return tauriInvoke<MonitorPlaylist[]>("get_monitor_playlists");
+  },
+
+  async getWallpapers(): Promise<MonitorWallpaper[]> {
+    return tauriInvoke<MonitorWallpaper[]>("get_monitor_wallpapers");
   },
 
   async assignPlaylist(monitorId: string, playlistId: string): Promise<void> {
