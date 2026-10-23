@@ -4,13 +4,14 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
 };
 use tauri::Manager;
 
 mod migrations;
 
 static DATABASE_PATH: OnceLock<PathBuf> = OnceLock::new();
+static SMOKE_DIAGNOSTIC_LOCK: Mutex<()> = Mutex::new(());
 const SMOKE_MARKER: &str = "lumina-smoke-root-v1\n";
 
 pub fn initialize(app: &tauri::AppHandle) -> Result<(), String> {
@@ -162,6 +163,9 @@ pub fn record_smoke_diagnostic(stage: &str, detail: Option<&str>) -> Result<bool
         return Err("Detalle de diagnóstico smoke demasiado largo".into());
     }
     let directory = app_data_dir().map_err(|error| error.to_string())?;
+    let _guard = SMOKE_DIAGNOSTIC_LOCK
+        .lock()
+        .map_err(|_| "No se pudo bloquear el diagnóstico smoke".to_string())?;
     let record = serde_json::json!({
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "stage": stage,

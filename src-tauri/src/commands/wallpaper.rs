@@ -2,7 +2,7 @@ use crate::{
     dynamic::DynamicScheduler,
     models::monitor_assignment::{MonitorIdentity, WallpaperBackend},
     models::wallpaper_coordinator,
-    utils::windows_wallpaper::available_monitor_ids,
+    utils::windows_wallpaper::{available_monitor_ids, set_monitor_wallpaper},
 };
 use chrono::Utc;
 use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat};
@@ -343,23 +343,123 @@ pub async fn set_active_wallpaper(
         });
     }
     let mut manual_operation = scheduler.begin_manual_operation();
-    set_active_wallpaper_internal(wallpaper_id.clone())?;
+    if let Some(monitor_id) = monitor_id.as_deref() {
+        set_active_wallpaper_on_monitor(&wallpaper_id, monitor_id, &path)?;
+    } else {
+        set_active_wallpaper_internal(wallpaper_id.clone())?;
+    }
     let conn = get_connection().map_err(|e| e.to_string())?;
     conn.execute(
         "UPDATE settings SET dynamic_enabled = 0, dynamic_current_wallpaper_id = ?1, dynamic_last_error = NULL WHERE id = (SELECT id FROM settings LIMIT 1)",
         [&wallpaper_id],
     )
     .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM monitor_playlists", [])
+    if let Some(monitor_id) = monitor_id.as_deref() {
+        conn.execute(
+            "DELETE FROM monitor_playlists WHERE monitor_id = ?1",
+            [monitor_id],
+        )
         .map_err(|e| e.to_string())?;
+    } else {
+        conn.execute("DELETE FROM monitor_playlists", [])
+            .map_err(|e| e.to_string())?;
+    }
     manual_operation.complete();
     Ok(WallpaperApplyResult {
         state: "confirmed".into(),
         wallpaper_id,
-        monitor_id: None,
+        monitor_id,
         generation: None,
         activation_id: None,
     })
+}
+
+fn set_active_wallpaper_on_monitor(
+    wallpaper_id: &str,
+    monitor_id: &str,
+    path: &str,
+) -> Result<(), String> {
+    if !available_monitor_ids()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|known| known == monitor_id)
+    {
+        return Err("La pantalla seleccionada ya no estÃ¡ disponible".into());
+    }
+    ensure_asset_available(path)?;
+
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    let scaling_mode: String = conn
+        .query_row("SELECT scaling_mode FROM settings LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|_| "fill".into());
+    let mode = match scaling_mode.as_str() {
+        "fit" => wallpaper::Mode::Fit,
+        "stretch" => wallpaper::Mode::Stretch,
+        "center" => wallpaper::Mode::Center,
+        _ => wallpaper::Mode::Crop,
+    };
+    wallpaper::set_mode(mode)
+        .map_err(|e| format!("Windows no pudo cambiar el modo de ajuste: {e}"))?;
+
+    let identity = MonitorIdentity::new(monitor_id.to_owned()).map_err(str::to_string)?;
+    let operation = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?
+        .reserve(identity, WallpaperBackend::Static)
+        .map_err(|error| error.to_string())?;
+
+    if let Err(error) = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())
+        .and_then(|coordinator| {
+            coordinator
+                .validate_previous_deactivated(&operation)
+                .map_err(|error| error.to_string())
+        })
+    {
+        abort_operations(std::slice::from_ref(&operation));
+        return Err(error);
+    }
+
+    if let Err(error) = set_monitor_wallpaper(monitor_id, path) {
+        abort_operations(std::slice::from_ref(&operation));
+        return Err(format!(
+            "Windows no pudo aplicar el fondo al monitor: {error}"
+        ));
+    }
+
+    let mut coordinator = wallpaper_coordinator::global()
+        .lock()
+        .map_err(|_| "No se pudo bloquear el coordinador de wallpapers".to_string())?;
+    let result = (|| {
+        coordinator
+            .confirm_previous_deactivated(&operation)
+            .map_err(|error| error.to_string())?;
+        coordinator
+            .confirm_activated(&operation)
+            .map_err(|error| error.to_string())?;
+        coordinator
+            .commit(&operation)
+            .map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = result {
+        coordinator.abort(&operation);
+        return Err(error);
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO monitor_wallpapers(monitor_id, wallpaper_id) VALUES(?1, ?2)",
+        (monitor_id, wallpaper_id),
+    )
+    .map_err(|error| {
+        format!(
+            "El fondo se aplicÃ³ fÃ­sicamente, pero no se pudo persistir la asignaciÃ³n del monitor: {error}"
+        )
+    })?;
+    Ok(())
 }
 
 pub(crate) fn set_active_wallpaper_internal(wallpaper_id: String) -> Result<(), String> {
