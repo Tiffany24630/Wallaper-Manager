@@ -15,8 +15,140 @@ use models::wallpaper_coordinator;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    Manager, RunEvent, WindowEvent,
+    Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
+
+fn smoke_diagnostic(stage: &str, detail: Option<String>) {
+    if let Err(error) = db::record_smoke_diagnostic(stage, detail.as_deref()) {
+        eprintln!("LUMINA_SMOKE_DIAGNOSTIC_FAILED stage={stage} error={error}");
+    }
+}
+
+fn record_main_window_state(window: &tauri::WebviewWindow, stage: &str) {
+    let inner = window
+        .inner_size()
+        .map(|size| format!("{}x{}", size.width, size.height))
+        .unwrap_or_else(|error| format!("error:{error}"));
+    let outer = window
+        .outer_size()
+        .map(|size| format!("{}x{}", size.width, size.height))
+        .unwrap_or_else(|error| format!("error:{error}"));
+    let visible = window
+        .is_visible()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|error| format!("error:{error}"));
+    let minimized = window
+        .is_minimized()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|error| format!("error:{error}"));
+    let url = window
+        .url()
+        .map(|value| {
+            format!(
+                "{}://{}{}",
+                value.scheme(),
+                value.host_str().unwrap_or(""),
+                value.path()
+            )
+        })
+        .unwrap_or_else(|error| format!("error:{error}"));
+    let detail = serde_json::json!({
+        "label": window.label(),
+        "inner": inner,
+        "outer": outer,
+        "visible": visible,
+        "minimized": minimized,
+        "url": url,
+    })
+    .to_string();
+    smoke_diagnostic(stage, Some(detail));
+}
+
+fn spawn_smoke_differential_windows(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let about_blank_script = r#"
+          (() => {
+            document.documentElement.innerHTML = `
+              <head><title>Lumina WebView smoke A</title></head>
+              <body style="margin:0;background:#f7f7f7;color:#202020;font:24px sans-serif;display:grid;place-items:center;height:100vh">
+                <main><h1>WebView2 navigation A</h1><p>about:blank document initialized</p></main>
+              </body>`;
+          })();
+        "#;
+        let a_url = match "about:blank".parse() {
+            Ok(url) => WebviewUrl::External(url),
+            Err(error) => {
+                smoke_diagnostic("smoke_diff_a_url_invalid", Some(error.to_string()));
+                return;
+            }
+        };
+        let a_result = WebviewWindowBuilder::new(&handle, "smoke-diff-a", a_url)
+            .title("Lumina WebView smoke A")
+            .inner_size(640.0, 360.0)
+            .visible(true)
+            .initialization_script(about_blank_script)
+            .on_navigation(|url| {
+                smoke_diagnostic("smoke_diff_a_navigation", Some(url.to_string()));
+                true
+            })
+            .on_page_load(|webview, payload| {
+                let detail = serde_json::json!({
+                    "label": webview.label(),
+                    "event": format!("{:?}", payload.event()),
+                    "url": payload.url().to_string(),
+                })
+                .to_string();
+                smoke_diagnostic("smoke_diff_a_page_load", Some(detail));
+            })
+            .build();
+        match a_result {
+            Ok(window) => smoke_diagnostic(
+                "smoke_diff_a_created",
+                Some(format!("label={} configured=640x360", window.label())),
+            ),
+            Err(error) => smoke_diagnostic("smoke_diff_a_create_failed", Some(error.to_string())),
+        }
+
+        let b_result = WebviewWindowBuilder::new(
+            &handle,
+            "smoke-diff-b",
+            WebviewUrl::App("smoke-protocol.html".into()),
+        )
+        .title("Lumina WebView smoke B")
+        .inner_size(640.0, 360.0)
+        .visible(true)
+        .on_navigation(|url| {
+            smoke_diagnostic("smoke_diff_b_navigation", Some(url.to_string()));
+            true
+        })
+        .on_page_load(|webview, payload| {
+            let detail = serde_json::json!({
+                "label": webview.label(),
+                "event": format!("{:?}", payload.event()),
+                "url": payload.url().to_string(),
+            })
+            .to_string();
+            smoke_diagnostic("smoke_diff_b_page_load", Some(detail));
+        })
+        .build();
+        match b_result {
+            Ok(window) => smoke_diagnostic(
+                "smoke_diff_b_created",
+                Some(format!(
+                    "label={} app_path=smoke-protocol.html",
+                    window.label()
+                )),
+            ),
+            Err(error) => smoke_diagnostic("smoke_diff_b_create_failed", Some(error.to_string())),
+        }
+    });
+}
+
+#[tauri::command]
+fn record_smoke_diagnostic(stage: String, detail: Option<String>) -> Result<bool, String> {
+    db::record_smoke_diagnostic(&stage, detail.as_deref())
+}
 
 fn should_minimize_to_tray() -> bool {
     db::get_connection()
@@ -62,41 +194,112 @@ fn shutdown_runtime(app: &tauri::AppHandle, scheduler: &DynamicScheduler) {
 }
 
 fn main() {
+    eprintln!("LUMINA_START main_entered");
+    let smoke_mode = match db::smoke_mode_requested() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("LUMINA_SMOKE_ARGUMENTS_INVALID error={error}");
+            return;
+        }
+    };
+    if smoke_mode {
+        match db::prepare_smoke_webview_data_dir() {
+            Ok(Some(webview_dir)) => std::env::set_var("LOCALAPPDATA", webview_dir),
+            Ok(None) => unreachable!("smoke mode requires a smoke WebView directory"),
+            Err(error) => {
+                eprintln!("LUMINA_SMOKE_WEBVIEW_SETUP_FAILED error={error}");
+                return;
+            }
+        }
+    }
+    let mut context = tauri::generate_context!();
+    let smoke_window_config = if smoke_mode {
+        let config = context
+            .config()
+            .app
+            .windows
+            .iter()
+            .find(|window| window.label == "main")
+            .cloned();
+        context.config_mut().app.windows.clear();
+        config
+    } else {
+        None
+    };
     let scheduler = DynamicScheduler::default();
     let scheduler_for_setup = scheduler.clone();
     let scheduler_for_shutdown = scheduler.clone();
     let result = tauri::Builder::default()
         .manage(scheduler)
+        .on_page_load(|webview, payload| {
+            let detail = serde_json::json!({
+                "label": webview.label(),
+                "event": format!("{:?}", payload.event()),
+                "url": format!("{}://{}{}", payload.url().scheme(), payload.url().host_str().unwrap_or(""), payload.url().path()),
+            })
+            .to_string();
+            smoke_diagnostic("webview_page_load", Some(detail));
+        })
         .setup(move |app| {
+            smoke_diagnostic("setup_started", None);
             scheduler_for_setup.set_app_handle(app.handle().clone());
             db::initialize(app.handle()).map_err(std::io::Error::other)?;
+            smoke_diagnostic("sqlite_initialized", None);
             wallpaper_coordinator::global()
                 .lock()
                 .map_err(|_| std::io::Error::other("No se pudo bloquear el coordinador"))?
                 .initialize()
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             eprintln!("WALLPAPER_COORDINATOR_READY");
+            smoke_diagnostic("coordinator_initialized", None);
+            smoke_diagnostic("animated_startup_started", None);
             if let Err(error) = animated_wallpaper::prepare_animated_startup(app.handle()) {
+                smoke_diagnostic("animated_startup_failed", Some(error.to_string()));
                 eprintln!("No se pudo preparar el arranque limpio del POC animado: {error}");
             }
+            smoke_diagnostic("cursor_restore_started", None);
             if let Err(error) = restore_active_cursor() {
+                smoke_diagnostic("cursor_restore_failed", Some(error.clone()));
                 eprintln!("No se pudo restaurar el cursor activo: {error}");
             }
-            if let Err(error) = restore_monitor_wallpapers(app.handle()) {
+            smoke_diagnostic("monitor_restore_started", None);
+            if smoke_window_config.is_none() {
+                if let Err(error) = restore_monitor_wallpapers(app.handle()) {
+                smoke_diagnostic("monitor_restore_failed", Some(error.clone()));
                 eprintln!("No se pudieron restaurar las asignaciones por monitor: {error}");
+                }
+            } else {
+                smoke_diagnostic("monitor_restore_deferred_until_main_window", None);
             }
-            let window = app.get_webview_window("main").ok_or_else(|| {
-                std::io::Error::other("No se encontró la ventana principal de Lumina")
-            })?;
+            smoke_diagnostic("main_window_lookup_started", None);
+            let window = app.get_webview_window("main");
+            let window = window;
+            if let Some(ref window) = window {
+                smoke_diagnostic("main_window_lookup_succeeded", None);
+            record_main_window_state(&window, "main_window_state_before_handlers");
             let window_for_close = window.clone();
             window.on_window_event(move |event| {
+                let stage = match event {
+                    WindowEvent::Resized(_) => "main_window_resized",
+                    WindowEvent::Moved(_) => "main_window_moved",
+                    WindowEvent::Focused(_) => "main_window_focused",
+                    WindowEvent::CloseRequested { .. } => "main_window_close_requested",
+                    WindowEvent::Destroyed => "main_window_destroyed",
+                    _ => "main_window_event",
+                };
+                smoke_diagnostic(stage, None);
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     if should_minimize_to_tray() {
                         api.prevent_close();
                         let _ = window_for_close.hide();
                     }
                 }
-            });
+                });
+            } else if smoke_window_config.is_none() {
+                return Err(std::io::Error::other("No se encontró la ventana principal de Lumina").into());
+            } else {
+                smoke_diagnostic("main_window_lookup_deferred", None);
+            }
 
             let handle = app.handle().clone();
             let show = MenuItemBuilder::with_id("show", "Abrir Lumina").build(app)?;
@@ -137,6 +340,60 @@ fn main() {
                     _ => {}
                 })
                 .build(&handle)?;
+            if let Some(window_config) = smoke_window_config.clone() {
+                let window_handle = handle.clone();
+                let webview_data_dir = db::app_data_dir()
+                    .map_err(|error| std::io::Error::other(error.to_string()))?
+                    .join("webview");
+                std::fs::create_dir_all(&webview_data_dir)?;
+                tauri::async_runtime::spawn(async move {
+                    match WebviewWindowBuilder::from_config(&window_handle, &window_config)
+                        .map(|builder| {
+                            builder
+                                .data_directory(webview_data_dir)
+                                .on_page_load(|webview, payload| {
+                                    let detail = serde_json::json!({
+                                        "label": webview.label(),
+                                        "event": format!("{:?}", payload.event()),
+                                        "url": format!("{}://{}{}", payload.url().scheme(), payload.url().host_str().unwrap_or(""), payload.url().path()),
+                                    })
+                                    .to_string();
+                                    smoke_diagnostic("webview_page_load_dynamic", Some(detail));
+                                })
+                        })
+                        .and_then(|builder| builder.build())
+                    {
+                        Ok(window) => {
+                            smoke_diagnostic("main_window_created_with_smoke_webview_dir", None);
+                            let window_for_close = window.clone();
+                            window.on_window_event(move |event| {
+                                let stage = match event {
+                                    WindowEvent::Resized(_) => "main_window_resized",
+                                    WindowEvent::Moved(_) => "main_window_moved",
+                                    WindowEvent::Focused(_) => "main_window_focused",
+                                    WindowEvent::CloseRequested { .. } => "main_window_close_requested",
+                                    WindowEvent::Destroyed => "main_window_destroyed",
+                                    _ => "main_window_event",
+                                };
+                                smoke_diagnostic(stage, None);
+                                if let WindowEvent::CloseRequested { api, .. } = event {
+                                    if should_minimize_to_tray() {
+                                        api.prevent_close();
+                                        let _ = window_for_close.hide();
+                                    }
+                                }
+                            });
+                        }
+                        Err(error) => smoke_diagnostic(
+                            "main_window_async_create_failed",
+                            Some(error.to_string()),
+                        ),
+                    }
+                });
+            }
+            if smoke_window_config.is_some() {
+                spawn_smoke_differential_windows(app.handle());
+            }
             if std::env::var_os("LUMINA_ANIMATED_SMOKE_TEST").is_some() {
                 let smoke_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -254,7 +511,11 @@ fn main() {
                     Err(error) => eprintln!("Animated host monitor failed: {error}"),
                 }
             }
+            if let Some(window) = window.as_ref() {
+                record_main_window_state(window, "main_window_state_after_tray");
+            }
             scheduler_for_setup.restart();
+            smoke_diagnostic("setup_finished", None);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -327,12 +588,17 @@ fn main() {
             animated_wallpaper::close_animated_prototype,
             animated_wallpaper::report_animated_ready,
             animated_wallpaper::report_animated_media_error,
+            record_smoke_diagnostic,
         ])
         .plugin(tauri_plugin_dialog::init())
-        .build(tauri::generate_context!());
+        .build(context);
     match result {
         Ok(app) => app.run(move |app, event| {
+            if matches!(event, RunEvent::Ready) {
+                smoke_diagnostic("event_loop_ready", None);
+            }
             if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+                smoke_diagnostic("event_loop_exit", None);
                 shutdown_runtime(app, &scheduler_for_shutdown);
             }
         }),

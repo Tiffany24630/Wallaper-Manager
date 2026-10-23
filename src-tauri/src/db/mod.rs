@@ -60,6 +60,40 @@ where
     Ok(token)
 }
 
+pub fn smoke_mode_requested() -> Result<bool, String> {
+    Ok(smoke_test_token_from_args(std::env::args())?.is_some())
+}
+
+pub fn prepare_smoke_webview_data_dir() -> Result<Option<PathBuf>, String> {
+    let Some(token) = smoke_test_token_from_args(std::env::args())? else {
+        return Ok(None);
+    };
+    let smoke_dir = std::env::temp_dir().join("lumina-smoke-tests").join(token);
+    std::fs::create_dir_all(smoke_dir.parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(|error| error.to_string())?;
+    if smoke_dir.exists() {
+        let marker = smoke_dir.join(".lumina-smoke-owned");
+        let contents = std::fs::read_to_string(&marker)
+            .map_err(|_| "El directorio smoke test existente no está verificado".to_string())?;
+        if contents != SMOKE_MARKER {
+            return Err("El directorio smoke test existente no pertenece a Lumina".into());
+        }
+    } else {
+        std::fs::create_dir(&smoke_dir).map_err(|error| error.to_string())?;
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(smoke_dir.join(".lumina-smoke-owned"))
+            .map_err(|error| error.to_string())?;
+        marker
+            .write_all(SMOKE_MARKER.as_bytes())
+            .map_err(|error| error.to_string())?;
+    }
+    let webview_dir = smoke_dir.join("webview");
+    std::fs::create_dir_all(&webview_dir).map_err(|error| error.to_string())?;
+    Ok(Some(webview_dir))
+}
+
 fn resolve_data_dir(production_dir: &Path, smoke_token: Option<&str>) -> Result<PathBuf, String> {
     let Some(token) = smoke_token else {
         return Ok(production_dir.to_path_buf());
@@ -113,6 +147,33 @@ pub fn app_data_dir() -> Result<PathBuf> {
         .ok_or(rusqlite::Error::InvalidPath(PathBuf::from(
             "app data no inicializado",
         )))
+}
+
+/// Writes diagnostics only for an explicitly requested, validated smoke run.
+/// Production never creates or appends to this file.
+pub fn record_smoke_diagnostic(stage: &str, detail: Option<&str>) -> Result<bool, String> {
+    if smoke_test_token_from_args(std::env::args())?.is_none() {
+        return Ok(false);
+    }
+    if stage.is_empty() || stage.len() > 96 || !stage.is_ascii() {
+        return Err("Etapa de diagnóstico smoke inválida".into());
+    }
+    if detail.is_some_and(|value| value.len() > 1024) {
+        return Err("Detalle de diagnóstico smoke demasiado largo".into());
+    }
+    let directory = app_data_dir().map_err(|error| error.to_string())?;
+    let record = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "stage": stage,
+        "detail": detail,
+    });
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("lumina-smoke-diagnostics.jsonl"))
+        .map_err(|error| error.to_string())?;
+    writeln!(file, "{record}").map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 pub fn get_connection() -> Result<Connection> {
