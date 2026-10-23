@@ -18,6 +18,10 @@ export const router =
       element: <AnimatedPrototype />,
     },
     {
+      path: "/animated-surface",
+      element: <AnimatedPrototype />,
+    },
+    {
       path: "/",
       element: <MainLayout />,
 

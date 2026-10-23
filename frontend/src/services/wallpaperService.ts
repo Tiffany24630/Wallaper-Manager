@@ -2,15 +2,40 @@ import { tauriInvoke } from "./tauri";
 import type { Wallpaper } from "../types/wallpaper";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { notifyLocalChange } from "./syncQueueService";
 
 export interface UpscaleResult {
+  jobId: string;
+  state: "pending" | "running" | "completed" | "failed" | "cancelled";
   id: string;
   method: string;
   warning?: string;
 }
 
+export interface WallpaperApplyResult {
+  state: "confirmed" | "pending";
+  wallpaperId: string;
+  monitorId?: string;
+  generation?: number;
+  activationId?: string;
+}
+
+export type WallpaperApplyState = WallpaperApplyResult | "pending";
+
+export interface AnimatedActivationEvent {
+  state: "pending" | "ready" | "failed" | "cancelled";
+  monitorId: string;
+  generation: number;
+  activationId: string;
+  wallpaperId?: string;
+  error?: string;
+}
+
 export const wallpaperService = {
+  listenAnimatedActivation(handler: (event: AnimatedActivationEvent) => void): Promise<() => void> {
+    return listen<AnimatedActivationEvent>("animated-activation", event => handler(event.payload));
+  },
   async getAll(): Promise<Wallpaper[]> {
     return tauriInvoke<Wallpaper[]>("list_wallpapers");
   },
@@ -24,9 +49,10 @@ export const wallpaperService = {
     await notifyLocalChange("wallpaper_update", id);
   },
 
-  async setActive(id: string): Promise<void> {
-    return tauriInvoke("set_active_wallpaper", {
+  async setActive(id: string, monitorId?: string): Promise<WallpaperApplyResult> {
+    return tauriInvoke<WallpaperApplyResult>("set_active_wallpaper", {
       wallpaperId: id,
+      monitorId,
     });
   },
 
@@ -71,7 +97,8 @@ export const wallpaperService = {
             "jpeg",
             "png",
             "webp",
-            "bmp"
+            "bmp",
+            "gif"
           ],
         },
       ],
@@ -82,7 +109,7 @@ export const wallpaperService = {
   async selectWallpaperFiles(): Promise<string[]> {
     const files = await open({
       multiple: true,
-      filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png", "webp", "bmp"] }],
+      filters: [{ name: "Images", extensions: ["jpg", "jpeg", "png", "webp", "bmp", "gif"] }],
     });
     if (!files) return [];
     return Array.isArray(files) ? files : [files];

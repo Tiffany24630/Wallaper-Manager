@@ -16,6 +16,12 @@ export const playlistService = {
     return id;
   },
 
+  async rename(id: string, name: string): Promise<void> {
+    await tauriInvoke("rename_playlist", { playlistId: id, name });
+    await tauriInvoke("mark_playlist_local_change", { playlistId: id, deleted: false });
+    await notifyLocalChange("playlist_update", id);
+  },
+
   async delete(id: string): Promise<void> {
     await tauriInvoke("delete_playlist", {
       playlistId: id,
@@ -41,6 +47,12 @@ export const playlistService = {
 
   async removeWallpaper(playlistId: string, wallpaperId: string): Promise<void> {
     await tauriInvoke("remove_wallpaper_from_playlist", { playlistId, wallpaperId });
+    await tauriInvoke("mark_playlist_local_change", { playlistId, deleted: false });
+    await notifyLocalChange("playlist_item_update", playlistId);
+  },
+
+  async reorder(playlistId: string, wallpaperIds: string[]): Promise<void> {
+    await tauriInvoke("reorder_playlist", { playlistId, wallpaperIds });
     await tauriInvoke("mark_playlist_local_change", { playlistId, deleted: false });
     await notifyLocalChange("playlist_item_update", playlistId);
   },
