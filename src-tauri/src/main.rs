@@ -32,22 +32,90 @@ fn smoke_thread_detail() -> serde_json::Value {
 }
 
 fn record_main_window_state(window: &tauri::WebviewWindow, stage: &str) {
+    smoke_diagnostic(
+        &format!("{stage}_inner_size_started"),
+        Some(smoke_thread_detail().to_string()),
+    );
     let inner = window
         .inner_size()
-        .map(|size| format!("{}x{}", size.width, size.height))
-        .unwrap_or_else(|error| format!("error:{error}"));
+        .map(|size| {
+            smoke_diagnostic(
+                &format!("{stage}_inner_size_finished"),
+                Some(format!("{}x{}", size.width, size.height)),
+            );
+            format!("{}x{}", size.width, size.height)
+        })
+        .unwrap_or_else(|error| {
+            smoke_diagnostic(
+                &format!("{stage}_inner_size_failed"),
+                Some(error.to_string()),
+            );
+            format!("error:{error}")
+        });
+    smoke_diagnostic(
+        &format!("{stage}_outer_size_started"),
+        Some(smoke_thread_detail().to_string()),
+    );
     let outer = window
         .outer_size()
-        .map(|size| format!("{}x{}", size.width, size.height))
-        .unwrap_or_else(|error| format!("error:{error}"));
+        .map(|size| {
+            smoke_diagnostic(
+                &format!("{stage}_outer_size_finished"),
+                Some(format!("{}x{}", size.width, size.height)),
+            );
+            format!("{}x{}", size.width, size.height)
+        })
+        .unwrap_or_else(|error| {
+            smoke_diagnostic(
+                &format!("{stage}_outer_size_failed"),
+                Some(error.to_string()),
+            );
+            format!("error:{error}")
+        });
+    smoke_diagnostic(
+        &format!("{stage}_visibility_started"),
+        Some(smoke_thread_detail().to_string()),
+    );
     let visible = window
         .is_visible()
-        .map(|value| value.to_string())
-        .unwrap_or_else(|error| format!("error:{error}"));
+        .map(|value| {
+            smoke_diagnostic(
+                &format!("{stage}_visibility_finished"),
+                Some(value.to_string()),
+            );
+            value.to_string()
+        })
+        .unwrap_or_else(|error| {
+            smoke_diagnostic(
+                &format!("{stage}_visibility_failed"),
+                Some(error.to_string()),
+            );
+            format!("error:{error}")
+        });
+    smoke_diagnostic(
+        &format!("{stage}_minimized_started"),
+        Some(smoke_thread_detail().to_string()),
+    );
     let minimized = window
         .is_minimized()
-        .map(|value| value.to_string())
-        .unwrap_or_else(|error| format!("error:{error}"));
+        .map(|value| {
+            smoke_diagnostic(
+                &format!("{stage}_minimized_finished"),
+                Some(value.to_string()),
+            );
+            value.to_string()
+        })
+        .unwrap_or_else(|error| {
+            smoke_diagnostic(
+                &format!("{stage}_minimized_failed"),
+                Some(error.to_string()),
+            );
+            format!("error:{error}")
+        });
+    smoke_diagnostic(
+        &format!("{stage}_url_started"),
+        Some(smoke_thread_detail().to_string()),
+    );
     let url = window
         .url()
         .map(|value| {
@@ -58,7 +126,14 @@ fn record_main_window_state(window: &tauri::WebviewWindow, stage: &str) {
                 value.path()
             )
         })
-        .unwrap_or_else(|error| format!("error:{error}"));
+        .map(|value| {
+            smoke_diagnostic(&format!("{stage}_url_finished"), Some(value.clone()));
+            value
+        })
+        .unwrap_or_else(|error| {
+            smoke_diagnostic(&format!("{stage}_url_failed"), Some(error.to_string()));
+            format!("error:{error}")
+        });
     let detail = serde_json::json!({
         "label": window.label(),
         "inner": inner,
@@ -285,25 +360,26 @@ fn main() {
             let window = window;
             if let Some(ref window) = window {
                 smoke_diagnostic("main_window_lookup_succeeded", None);
-            record_main_window_state(&window, "main_window_state_before_handlers");
-            let window_for_close = window.clone();
-            window.on_window_event(move |event| {
-                let stage = match event {
-                    WindowEvent::Resized(_) => "main_window_resized",
-                    WindowEvent::Moved(_) => "main_window_moved",
-                    WindowEvent::Focused(_) => "main_window_focused",
-                    WindowEvent::CloseRequested { .. } => "main_window_close_requested",
-                    WindowEvent::Destroyed => "main_window_destroyed",
-                    _ => "main_window_event",
-                };
-                smoke_diagnostic(stage, None);
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    if should_minimize_to_tray() {
-                        api.prevent_close();
-                        let _ = window_for_close.hide();
+                let window_for_close = window.clone();
+                window.on_window_event(move |event| {
+                    let stage = match event {
+                        WindowEvent::Resized(_) => "main_window_resized",
+                        WindowEvent::Moved(_) => "main_window_moved",
+                        WindowEvent::Focused(_) => "main_window_focused",
+                        WindowEvent::CloseRequested { .. } => "main_window_close_requested",
+                        WindowEvent::Destroyed => "main_window_destroyed",
+                        _ => "main_window_event",
+                    };
+                    smoke_diagnostic(stage, None);
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        if should_minimize_to_tray() {
+                            api.prevent_close();
+                            let _ = window_for_close.hide();
+                        }
                     }
-                }
                 });
+                smoke_diagnostic("main_window_event_listener_registered", None);
+                record_main_window_state(&window, "main_window_state_before_handlers");
             } else if smoke_window_config.is_none() {
                 return Err(std::io::Error::other("No se encontró la ventana principal de Lumina").into());
             } else {
@@ -377,6 +453,7 @@ fn main() {
                             );
                             builder
                                 .data_directory(webview_data_dir)
+                                .initialization_script("window.__LUMINA_SMOKE__ = true;")
                                 .on_navigation(|url| {
                                     smoke_diagnostic(
                                         "webview_navigation_requested",
@@ -416,7 +493,10 @@ fn main() {
                     );
                     match build_result {
                         Ok(window) => {
-                            record_main_window_state(&window, "main_window_build_succeeded");
+                            smoke_diagnostic(
+                                "main_window_build_succeeded",
+                                Some(smoke_thread_detail().to_string()),
+                            );
                             smoke_diagnostic("main_window_created_with_smoke_webview_dir", None);
                             let window_for_close = window.clone();
                             window.on_window_event(move |event| {
@@ -436,6 +516,11 @@ fn main() {
                                     }
                                 }
                             });
+                            smoke_diagnostic(
+                                "main_window_event_listener_registered",
+                                Some(smoke_thread_detail().to_string()),
+                            );
+                            record_main_window_state(&window, "main_window_post_build_state");
                         }
                         Err(error) => {
                             smoke_diagnostic("main_window_build_failed", Some(error.to_string()))

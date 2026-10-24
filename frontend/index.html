@@ -8,6 +8,14 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      if (window.__LUMINA_SMOKE__ && window.__TAURI__?.core?.invoke) {
+        void window.__TAURI__.core.invoke("record_smoke_diagnostic", {
+          stage: "frontend_document_executed",
+          detail: null,
+        }).catch(() => undefined);
+      }
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
