@@ -1,10 +1,220 @@
+use crate::commands::monitor::current_monitor_ids;
 use crate::dynamic::DynamicScheduler;
 use crate::startup;
 use crate::{db::get_connection, models::settings::Settings};
 use rusqlite::params;
-use tauri::State;
+use serde::Serialize;
+use tauri::{AppHandle, State};
 
 pub const DYNAMIC_INTERVALS: [u32; 10] = [1, 5, 10, 15, 30, 60, 120, 360, 720, 1440];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DynamicConfigurationIssue {
+    pub code: String,
+    pub message: String,
+    pub blocking: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DynamicConfigurationDiagnostic {
+    pub consistent: bool,
+    pub requires_decision: bool,
+    pub global_enabled: bool,
+    pub global_playlist_id: Option<String>,
+    pub monitor_assignment_count: u32,
+    pub issues: Vec<DynamicConfigurationIssue>,
+}
+
+#[tauri::command]
+pub fn get_dynamic_configuration_diagnostic(
+    app: AppHandle,
+) -> Result<DynamicConfigurationDiagnostic, String> {
+    let mut conn = get_connection().map_err(|e| e.to_string())?;
+    let monitor_result = current_monitor_ids(&app);
+    let mut diagnostic = diagnose_dynamic_configuration(&mut conn, monitor_result.as_deref().ok())?;
+    if let Err(error) = monitor_result {
+        diagnostic.issues.push(DynamicConfigurationIssue {
+            code: "monitor_presence_unavailable".into(),
+            message: format!("No se pudo comprobar la presencia actual de los monitores: {error}"),
+            blocking: false,
+        });
+    }
+    Ok(diagnostic)
+}
+
+fn diagnose_dynamic_configuration(
+    conn: &mut rusqlite::Connection,
+    current_monitor_ids: Option<&[String]>,
+) -> Result<DynamicConfigurationDiagnostic, String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let (global_enabled, global_playlist_id, current_wallpaper_id, interval): (
+        i32,
+        Option<String>,
+        Option<String>,
+        u32,
+    ) = tx
+        .query_row(
+            "SELECT dynamic_enabled, dynamic_playlist_id, dynamic_current_wallpaper_id, dynamic_interval_minutes FROM settings LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut issues = Vec::new();
+    let global_enabled = global_enabled == 1;
+
+    if !DYNAMIC_INTERVALS.contains(&interval) {
+        issues.push(DynamicConfigurationIssue {
+            code: "invalid_interval".into(),
+            message: "El intervalo global no está soportado".into(),
+            blocking: true,
+        });
+    }
+
+    match global_playlist_id.as_deref() {
+        None if global_enabled => issues.push(DynamicConfigurationIssue {
+            code: "global_playlist_missing".into(),
+            message: "El modo global está activo pero no tiene playlist seleccionada".into(),
+            blocking: true,
+        }),
+        Some(playlist_id) => {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM playlists WHERE id = ?1)",
+                    [playlist_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !exists {
+                issues.push(DynamicConfigurationIssue {
+                    code: "global_playlist_missing".into(),
+                    message: "La playlist global seleccionada ya no existe".into(),
+                    blocking: global_enabled,
+                });
+            } else {
+                let members: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM playlist_wallpapers WHERE playlist_id = ?1",
+                        [playlist_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if members == 0 {
+                    issues.push(DynamicConfigurationIssue {
+                        code: "global_playlist_empty".into(),
+                        message: "La playlist global está vacía".into(),
+                        blocking: false,
+                    });
+                }
+                if let Some(wallpaper_id) = current_wallpaper_id.as_deref() {
+                    let current_is_member: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM playlist_wallpapers pw JOIN wallpapers w ON w.id = pw.wallpaper_id WHERE pw.playlist_id = ?1 AND pw.wallpaper_id = ?2)",
+                            (playlist_id, wallpaper_id),
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if !current_is_member {
+                        issues.push(DynamicConfigurationIssue {
+                            code: "global_current_invalid".into(),
+                            message:
+                                "El wallpaper actual global no pertenece a la playlist seleccionada"
+                                    .into(),
+                            blocking: false,
+                        });
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+
+    let monitor_rows: Vec<(String, String, Option<String>)> = {
+        let mut statement = tx
+            .prepare("SELECT monitor_id, playlist_id, current_wallpaper_id FROM monitor_playlists")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    let monitor_assignment_count = monitor_rows.len() as u32;
+    if global_enabled && monitor_assignment_count > 0 {
+        issues.push(DynamicConfigurationIssue {
+            code: "global_monitor_conflict".into(),
+            message: "El modo global y las playlists por monitor están activos al mismo tiempo; se requiere una decisión explícita".into(),
+            blocking: true,
+        });
+    }
+    for (monitor_id, playlist_id, current_id) in monitor_rows {
+        if current_monitor_ids.is_some_and(|ids| !ids.iter().any(|id| id == &monitor_id)) {
+            issues.push(DynamicConfigurationIssue {
+                code: "monitor_unavailable".into(),
+                message: "La configuración del monitor se conserva, pero el monitor no está disponible ahora".into(),
+                blocking: false,
+            });
+        }
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM playlists WHERE id = ?1)",
+                [&playlist_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !exists {
+            issues.push(DynamicConfigurationIssue {
+                code: "monitor_playlist_missing".into(),
+                message: "Una configuración por monitor apunta a una playlist inexistente".into(),
+                blocking: true,
+            });
+            continue;
+        }
+        let members: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM playlist_wallpapers WHERE playlist_id = ?1",
+                [&playlist_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if members == 0 {
+            issues.push(DynamicConfigurationIssue {
+                code: "monitor_playlist_empty".into(),
+                message: "Una playlist por monitor está vacía".into(),
+                blocking: false,
+            });
+        }
+        if let Some(current_id) = current_id {
+            let valid: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM playlist_wallpapers pw JOIN wallpapers w ON w.id = pw.wallpaper_id WHERE pw.playlist_id = ?1 AND pw.wallpaper_id = ?2)",
+                    (&playlist_id, &current_id),
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !valid {
+                issues.push(DynamicConfigurationIssue {
+                    code: "monitor_current_invalid".into(),
+                    message: "Un wallpaper actual por monitor no pertenece a su playlist".into(),
+                    blocking: false,
+                });
+            }
+        }
+    }
+    drop(tx);
+    let requires_decision = issues
+        .iter()
+        .any(|issue| issue.code == "global_monitor_conflict");
+    let consistent = issues.iter().all(|issue| !issue.blocking);
+    Ok(DynamicConfigurationDiagnostic {
+        consistent,
+        requires_decision,
+        global_enabled,
+        global_playlist_id,
+        monitor_assignment_count,
+        issues,
+    })
+}
 
 #[tauri::command]
 pub fn get_settings() -> Result<Settings, String> {
@@ -202,7 +412,7 @@ fn persist_user_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::persist_user_settings;
+    use super::{diagnose_dynamic_configuration, persist_user_settings};
     use crate::models::settings::Settings;
     use rusqlite::Connection;
 
@@ -329,5 +539,111 @@ mod tests {
             )
             .unwrap();
         assert_eq!(persisted, (0, None, Some("playlist deleted".into())));
+    }
+
+    fn diagnostic_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE settings(dynamic_enabled INTEGER, dynamic_playlist_id TEXT, dynamic_interval_minutes INTEGER, dynamic_current_wallpaper_id TEXT);
+             CREATE TABLE playlists(id TEXT PRIMARY KEY);
+             CREATE TABLE wallpapers(id TEXT PRIMARY KEY);
+             CREATE TABLE playlist_wallpapers(playlist_id TEXT, wallpaper_id TEXT);
+             CREATE TABLE monitor_playlists(monitor_id TEXT PRIMARY KEY, playlist_id TEXT, current_wallpaper_id TEXT);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dynamic_diagnostic_is_read_only_for_consistent_global_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        diagnostic_schema(&conn);
+        conn.execute(
+            "INSERT INTO settings VALUES (1, 'playlist-a', 5, 'wallpaper-a')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO playlists VALUES ('playlist-a')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO playlist_wallpapers VALUES ('playlist-a', 'wallpaper-a')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO wallpapers VALUES ('wallpaper-a')", [])
+            .unwrap();
+
+        let diagnostic =
+            diagnose_dynamic_configuration(&mut conn, Some(&["monitor-a".into()])).unwrap();
+        assert!(diagnostic.consistent);
+        assert!(diagnostic.issues.is_empty());
+        let settings: (i32, Option<String>) = conn
+            .query_row(
+                "SELECT dynamic_enabled, dynamic_playlist_id FROM settings",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(settings, (1, Some("playlist-a".into())));
+    }
+
+    #[test]
+    fn dynamic_diagnostic_reports_global_monitor_conflict_without_mutation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        diagnostic_schema(&conn);
+        conn.execute(
+            "INSERT INTO settings VALUES (1, 'playlist-global', 5, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO playlists VALUES ('playlist-global'), ('playlist-monitor')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO monitor_playlists VALUES ('monitor-a', 'playlist-monitor', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let diagnostic =
+            diagnose_dynamic_configuration(&mut conn, Some(&["monitor-a".into()])).unwrap();
+        assert!(!diagnostic.consistent);
+        assert!(diagnostic.requires_decision);
+        assert_eq!(diagnostic.monitor_assignment_count, 1);
+        assert!(diagnostic
+            .issues
+            .iter()
+            .any(|issue| issue.code == "global_monitor_conflict"));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM monitor_playlists", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn dynamic_diagnostic_distinguishes_missing_playlist_and_absent_monitor() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        diagnostic_schema(&conn);
+        conn.execute("INSERT INTO settings VALUES (0, NULL, 5, NULL)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO monitor_playlists VALUES ('monitor-missing', 'playlist-gone', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let diagnostic =
+            diagnose_dynamic_configuration(&mut conn, Some(&["monitor-present".into()])).unwrap();
+        assert!(diagnostic
+            .issues
+            .iter()
+            .any(|issue| issue.code == "monitor_playlist_missing"));
+        assert!(diagnostic
+            .issues
+            .iter()
+            .any(|issue| issue.code == "monitor_unavailable"));
+        assert_eq!(diagnostic.monitor_assignment_count, 1);
     }
 }

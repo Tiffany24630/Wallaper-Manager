@@ -530,6 +530,7 @@ fn main() {
             get_system_info,
             get_settings,
             save_settings,
+            get_dynamic_configuration_diagnostic,
             get_monitors,
             get_monitor_wallpapers,
             get_monitor_playlists,

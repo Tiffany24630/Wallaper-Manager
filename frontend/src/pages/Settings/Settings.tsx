@@ -8,6 +8,7 @@ import { useWallpaperStore } from "../../store/wallpaperStore";
 import { wallpaperThumbnailSrc } from "../../utils/wallpaperPreview";
 import { animatedPrototypeService } from "../../services/animatedPrototypeService";
 import { monitorService } from "../../services/monitorService";
+import { settingsService, type DynamicConfigurationDiagnostic } from "../../services/settingsService";
 import type { Monitor } from "../../types/monitor";
 
 const defaults: SettingsType = { launch_at_startup: false, minimize_to_tray: true, hardware_acceleration: true, pause_on_battery: false, pause_when_maximized: true, scaling_mode: "fill", accent_color: "violet", ui_scale: 100, dynamic_enabled: false, dynamic_playlist_id: null, dynamic_interval_minutes: 5, dynamic_current_wallpaper_id: null, dynamic_last_error: null, cursor_enabled: false, active_cursor_id: null };
@@ -37,6 +38,7 @@ export default function Settings() {
   const [draft, setDraft] = useState<SettingsType>(defaults);
   const [draftDirty, setDraftDirty] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [dynamicDiagnostic, setDynamicDiagnostic] = useState<DynamicConfigurationDiagnostic | null>(null);
   const [prototypeBusy, setPrototypeBusy] = useState(false);
   const [prototypeMediaPath, setPrototypeMediaPath] = useState<string | null>(null);
   const [prototypeStatus, setPrototypeStatus] = useState("Selecciona un archivo GIF para comenzar.");
@@ -47,7 +49,10 @@ export default function Settings() {
   const [playlistMembersLoading, setPlaylistMembersLoading] = useState(false);
   const playlistMembersCache = useRef(new Map<string, string[]>());
   const { wallpapers, loadWallpapers } = useWallpaperStore();
-  useEffect(() => { void loadSettings(); }, [loadSettings]);
+  useEffect(() => {
+    void loadSettings();
+    void settingsService.diagnostic().then(setDynamicDiagnostic).catch(() => setDynamicDiagnostic(null));
+  }, [loadSettings]);
   useEffect(() => { void playlistService.getAll().then(setPlaylists).catch(() => setPlaylists([])); void loadWallpapers(); }, [loadWallpapers]);
   useEffect(() => {
     void monitorService.getAll().then(monitors => {
@@ -205,6 +210,7 @@ export default function Settings() {
           })}</div>}
         </div>}
         {draft.dynamic_enabled && !draft.dynamic_playlist_id && <div className="status-error mt-4">Selecciona una lista antes de guardar el fondo dinámico.</div>}
+        {dynamicDiagnostic && dynamicDiagnostic.issues.length > 0 && <div className="status-error mt-4">{dynamicDiagnostic.issues.map(issue => issue.message).join(" ")}</div>}
         {draft.dynamic_last_error && <div className="status-error mt-4">{draft.dynamic_last_error}</div>}
         {draft.dynamic_current_wallpaper_id && <div className="mt-3 text-sm muted">Fondo actual: {wallpapers.find(w => w.id === draft.dynamic_current_wallpaper_id)?.name ?? "no disponible"}</div>}
       </section>
