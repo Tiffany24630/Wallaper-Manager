@@ -150,19 +150,18 @@ pub fn app_data_dir() -> Result<PathBuf> {
         )))
 }
 
-/// Writes diagnostics only for an explicitly requested, validated smoke run.
-/// Production never creates or appends to this file.
-pub fn record_smoke_diagnostic(stage: &str, detail: Option<&str>) -> Result<bool, String> {
-    if smoke_test_token_from_args(std::env::args())?.is_none() {
-        return Ok(false);
-    }
+fn write_smoke_diagnostic(
+    directory: &Path,
+    token: &str,
+    stage: &str,
+    detail: Option<&str>,
+) -> Result<bool, String> {
     if stage.is_empty() || stage.len() > 96 || !stage.is_ascii() {
         return Err("Etapa de diagnóstico smoke inválida".into());
     }
     if detail.is_some_and(|value| value.len() > 1024) {
         return Err("Detalle de diagnóstico smoke demasiado largo".into());
     }
-    let directory = app_data_dir().map_err(|error| error.to_string())?;
     let _guard = SMOKE_DIAGNOSTIC_LOCK
         .lock()
         .map_err(|_| "No se pudo bloquear el diagnóstico smoke".to_string())?;
@@ -170,6 +169,8 @@ pub fn record_smoke_diagnostic(stage: &str, detail: Option<&str>) -> Result<bool
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "stage": stage,
         "detail": detail,
+        "token": token,
+        "pid": std::process::id(),
     });
     let mut file = OpenOptions::new()
         .create(true)
@@ -178,6 +179,34 @@ pub fn record_smoke_diagnostic(stage: &str, detail: Option<&str>) -> Result<bool
         .map_err(|error| error.to_string())?;
     writeln!(file, "{record}").map_err(|error| error.to_string())?;
     Ok(true)
+}
+
+/// Records a smoke event before SQLite has initialized DATABASE_PATH.
+/// The directory is derived only from the validated token and must already
+/// carry the ownership marker created by prepare_smoke_webview_data_dir.
+pub fn record_smoke_diagnostic_before_database(
+    stage: &str,
+    detail: Option<&str>,
+) -> Result<bool, String> {
+    let Some(token) = smoke_test_token_from_args(std::env::args())? else {
+        return Ok(false);
+    };
+    let directory = std::env::temp_dir().join("lumina-smoke-tests").join(&token);
+    let marker = directory.join(".lumina-smoke-owned");
+    if std::fs::read_to_string(&marker).map_err(|error| error.to_string())? != SMOKE_MARKER {
+        return Err("El directorio smoke test existente no está verificado".into());
+    }
+    write_smoke_diagnostic(&directory, &token, stage, detail)
+}
+
+/// Writes diagnostics only for an explicitly requested, validated smoke run.
+/// Production never creates or appends to this file.
+pub fn record_smoke_diagnostic(stage: &str, detail: Option<&str>) -> Result<bool, String> {
+    let Some(token) = smoke_test_token_from_args(std::env::args())? else {
+        return Ok(false);
+    };
+    let directory = app_data_dir().map_err(|error| error.to_string())?;
+    write_smoke_diagnostic(&directory, &token, stage, detail)
 }
 
 pub fn get_connection() -> Result<Connection> {

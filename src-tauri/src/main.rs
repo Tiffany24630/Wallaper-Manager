@@ -24,6 +24,13 @@ fn smoke_diagnostic(stage: &str, detail: Option<String>) {
     }
 }
 
+fn smoke_thread_detail() -> serde_json::Value {
+    serde_json::json!({
+        "thread_id": format!("{:?}", std::thread::current().id()),
+        "thread_name": std::thread::current().name(),
+    })
+}
+
 fn record_main_window_state(window: &tauri::WebviewWindow, stage: &str) {
     let inner = window
         .inner_size()
@@ -212,6 +219,9 @@ fn main() {
             }
         }
     }
+    if let Err(error) = db::record_smoke_diagnostic_before_database("setup_started", None) {
+        eprintln!("LUMINA_SMOKE_DIAGNOSTIC_FAILED stage=setup_started error={error}");
+    }
     let mut context = tauri::generate_context!();
     let smoke_window_config = if smoke_mode {
         let config = context
@@ -241,7 +251,6 @@ fn main() {
             smoke_diagnostic("webview_page_load", Some(detail));
         })
         .setup(move |app| {
-            smoke_diagnostic("setup_started", None);
             scheduler_for_setup.set_app_handle(app.handle().clone());
             db::initialize(app.handle()).map_err(std::io::Error::other)?;
             smoke_diagnostic("sqlite_initialized", None);
@@ -347,10 +356,34 @@ fn main() {
                     .join("webview");
                 std::fs::create_dir_all(&webview_data_dir)?;
                 tauri::async_runtime::spawn(async move {
-                    match WebviewWindowBuilder::from_config(&window_handle, &window_config)
-                        .map(|builder| {
+                    let mut configured = serde_json::json!({
+                        "label": window_config.label.clone(),
+                        "url": format!("{:?}", window_config.url),
+                        "width": window_config.width,
+                        "height": window_config.height,
+                        "visible": window_config.visible,
+                        "pid": std::process::id(),
+                    });
+                    if let Some(object) = configured.as_object_mut() {
+                        object.insert("execution".into(), smoke_thread_detail());
+                    }
+                    let configured = configured.to_string();
+                    smoke_diagnostic("main_window_build_started", Some(configured));
+                    let builder = match WebviewWindowBuilder::from_config(&window_handle, &window_config) {
+                        Ok(builder) => {
+                            smoke_diagnostic(
+                                "main_window_builder_configured",
+                                Some(smoke_thread_detail().to_string()),
+                            );
                             builder
                                 .data_directory(webview_data_dir)
+                                .on_navigation(|url| {
+                                    smoke_diagnostic(
+                                        "webview_navigation_requested",
+                                        Some(url.to_string()),
+                                    );
+                                    true
+                                })
                                 .on_page_load(|webview, payload| {
                                     let detail = serde_json::json!({
                                         "label": webview.label(),
@@ -360,10 +393,30 @@ fn main() {
                                     .to_string();
                                     smoke_diagnostic("webview_page_load_dynamic", Some(detail));
                                 })
-                        })
-                        .and_then(|builder| builder.build())
-                    {
+                        }
+                        Err(error) => {
+                            smoke_diagnostic("main_window_build_failed", Some(error.to_string()));
+                            return;
+                        }
+                    };
+                    smoke_diagnostic(
+                        "main_window_native_build_started",
+                        Some(smoke_thread_detail().to_string()),
+                    );
+                    let build_result = builder.build();
+                    smoke_diagnostic(
+                        "main_window_build_returned",
+                        Some(
+                            serde_json::json!({
+                                "result": if build_result.is_ok() { "ok" } else { "error" },
+                                "execution": smoke_thread_detail(),
+                            })
+                            .to_string(),
+                        ),
+                    );
+                    match build_result {
                         Ok(window) => {
+                            record_main_window_state(&window, "main_window_build_succeeded");
                             smoke_diagnostic("main_window_created_with_smoke_webview_dir", None);
                             let window_for_close = window.clone();
                             window.on_window_event(move |event| {
@@ -384,10 +437,9 @@ fn main() {
                                 }
                             });
                         }
-                        Err(error) => smoke_diagnostic(
-                            "main_window_async_create_failed",
-                            Some(error.to_string()),
-                        ),
+                        Err(error) => {
+                            smoke_diagnostic("main_window_build_failed", Some(error.to_string()))
+                        }
                     }
                 });
             }
@@ -515,7 +567,10 @@ fn main() {
                 record_main_window_state(window, "main_window_state_after_tray");
             }
             scheduler_for_setup.restart();
-            smoke_diagnostic("setup_finished", None);
+            smoke_diagnostic(
+                "setup_finished",
+                Some(smoke_thread_detail().to_string()),
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -597,7 +652,7 @@ fn main() {
     match result {
         Ok(app) => app.run(move |app, event| {
             if matches!(event, RunEvent::Ready) {
-                smoke_diagnostic("event_loop_ready", None);
+                smoke_diagnostic("event_loop_ready", Some(smoke_thread_detail().to_string()));
             }
             if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
                 smoke_diagnostic("event_loop_exit", None);
