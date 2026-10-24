@@ -164,7 +164,7 @@ fn apply_next(
     let _guard = apply_lock
         .lock()
         .map_err(|_| "No se pudo bloquear el cambio dinámico".to_string())?;
-    let conn = get_connection().map_err(|e| e.to_string())?;
+    let mut conn = get_connection().map_err(|e| e.to_string())?;
     let (enabled, playlist_id, current_id, interval): (i32, Option<String>, Option<String>, u32) = conn
         .query_row(
             "SELECT dynamic_enabled, dynamic_playlist_id, dynamic_current_wallpaper_id, dynamic_interval_minutes FROM settings LIMIT 1",
@@ -320,11 +320,11 @@ fn apply_next(
                         });
                     match committed {
                         Ok(_) => {
-                            conn.execute(
-                                "UPDATE monitor_playlists SET current_wallpaper_id = ?1, last_error = NULL WHERE monitor_id = ?2",
-                                (&next_id, &monitor_id),
-                            )
-                            .map_err(|e| e.to_string())?;
+                            if let Err(error) =
+                                persist_monitor_rotation(&mut conn, &monitor_id, &next_id)
+                            {
+                                set_monitor_playlist_error(&conn, &monitor_id, &error);
+                            }
                         }
                         Err(error) => {
                             if let Ok(mut coordinator) = wallpaper_coordinator::global().lock() {
@@ -478,6 +478,25 @@ fn set_monitor_playlist_error(conn: &rusqlite::Connection, monitor_id: &str, err
     );
 }
 
+fn persist_monitor_rotation(
+    conn: &mut rusqlite::Connection,
+    monitor_id: &str,
+    wallpaper_id: &str,
+) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE monitor_playlists SET current_wallpaper_id = ?1, last_error = NULL WHERE monitor_id = ?2",
+        (wallpaper_id, monitor_id),
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT OR REPLACE INTO monitor_wallpapers(monitor_id, wallpaper_id) VALUES(?1, ?2)",
+        (monitor_id, wallpaper_id),
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
 fn select_next_id(valid: &[(String, String)], current: Option<&str>) -> Option<String> {
     if valid.is_empty() {
         return None;
@@ -500,7 +519,11 @@ fn set_dynamic_error(error: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_next_id, wait_for_next_cycle, DynamicScheduler, DYNAMIC_INTERVALS};
+    use super::{
+        persist_monitor_rotation, select_next_id, wait_for_next_cycle, DynamicScheduler,
+        DYNAMIC_INTERVALS,
+    };
+    use rusqlite::Connection;
     use std::sync::{atomic::AtomicBool, Arc, Condvar, Mutex};
     use std::time::Duration;
 
@@ -529,6 +552,36 @@ mod tests {
         assert_eq!(select_next_id(&items, Some("three")), Some("one".into()));
         assert_eq!(select_next_id(&items, Some("deleted")), Some("one".into()));
         assert_eq!(select_next_id(&[], Some("deleted")), None);
+    }
+
+    #[test]
+    fn monitor_rotation_persists_playlist_current_and_monitor_assignment_atomically() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE monitor_playlists(monitor_id TEXT PRIMARY KEY, current_wallpaper_id TEXT, last_error TEXT);
+             CREATE TABLE monitor_wallpapers(monitor_id TEXT PRIMARY KEY, wallpaper_id TEXT NOT NULL);
+             INSERT INTO monitor_playlists VALUES ('monitor-a', NULL, 'old error');",
+        )
+        .unwrap();
+
+        persist_monitor_rotation(&mut conn, "monitor-a", "wallpaper-z").unwrap();
+
+        let current: String = conn
+            .query_row(
+                "SELECT current_wallpaper_id FROM monitor_playlists WHERE monitor_id = 'monitor-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let assignment: String = conn
+            .query_row(
+                "SELECT wallpaper_id FROM monitor_wallpapers WHERE monitor_id = 'monitor-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, "wallpaper-z");
+        assert_eq!(assignment, "wallpaper-z");
     }
 
     #[test]

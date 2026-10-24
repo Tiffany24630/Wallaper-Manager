@@ -21,7 +21,21 @@ export default function PlaylistsPage() {
   useEffect(() => { void loadPlaylists(); void loadWallpapers(); void loadSettings(); }, [loadPlaylists, loadWallpapers, loadSettings]);
   useEffect(() => { const timer = window.setInterval(() => void loadSettings(), 5000); return () => window.clearInterval(timer); }, [loadSettings]);
   useEffect(() => { if (!selected && playlists[0]) setSelected(playlists[0].id); }, [playlists, selected]);
-  useEffect(() => { if (!selected) { setMembers([]); return; } void playlistService.getPlaylistWallpapers(selected).then(setMembers).catch(errorValue => setMessage(String(errorValue))); }, [selected]);
+  useEffect(() => {
+    let cancelled = false;
+    setMembers([]);
+    if (!selected) return () => { cancelled = true; };
+
+    void playlistService.getPlaylistWallpapers(selected)
+      .then(nextMembers => {
+        if (!cancelled) setMembers(nextMembers);
+      })
+      .catch(errorValue => {
+        if (!cancelled) setMessage(String(errorValue));
+      });
+
+    return () => { cancelled = true; };
+  }, [selected]);
 
   const selectedPlaylist = playlists.find(item => item.id === selected);
   const memberWallpapers = useMemo(() => members.map(id => wallpapers.find(wallpaper => wallpaper.id === id)), [members, wallpapers]);
