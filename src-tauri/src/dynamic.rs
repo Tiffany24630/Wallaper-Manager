@@ -1,5 +1,6 @@
 use crate::{
     animated_wallpaper::{self, AnimatedActivationOutcome},
+    commands::monitor::current_monitor_ids,
     commands::settings::DYNAMIC_INTERVALS,
     commands::wallpaper::set_active_wallpaper_internal,
     db::get_connection,
@@ -186,9 +187,29 @@ fn apply_next(
         rows
     };
     if !monitor_assignments.is_empty() {
+        let current_monitor_ids = app_handle.map(current_monitor_ids);
         wallpaper::set_mode(scaling_mode(&conn))
             .map_err(|e| format!("No se pudo cambiar el modo de ajuste: {e}"))?;
         for (monitor_id, playlist_id, current_id) in monitor_assignments {
+            match &current_monitor_ids {
+                Some(Ok(ids)) if !ids.iter().any(|id| id == &monitor_id) => {
+                    set_monitor_playlist_error(
+                        &conn,
+                        &monitor_id,
+                        "El monitor no estÃ¡ disponible; se conserva la configuraciÃ³n",
+                    );
+                    continue;
+                }
+                Some(Err(error)) => {
+                    set_monitor_playlist_error(
+                        &conn,
+                        &monitor_id,
+                        &format!("No se pudo resolver la presencia del monitor: {error}"),
+                    );
+                    continue;
+                }
+                _ => {}
+            }
             let valid = playlist_wallpapers(&conn, &playlist_id)?;
             if valid.is_empty() {
                 set_monitor_playlist_error(
@@ -237,26 +258,42 @@ fn apply_next(
                     };
                 match animated_wallpaper::wait_for_activation(&handle, Duration::from_secs(30)) {
                     AnimatedActivationOutcome::Ready => {
-                        conn.execute(
-                            "UPDATE monitor_playlists SET current_wallpaper_id = ?1, last_error = NULL WHERE monitor_id = ?2",
-                            (&next_id, &monitor_id),
-                        ).map_err(|e| e.to_string())?;
+                        persist_monitor_rotation(&mut conn, &monitor_id, &next_id)?;
                     }
                     AnimatedActivationOutcome::Pending => {
-                        set_monitor_playlist_error(&conn, &monitor_id, "Animated sigue pendiente");
-                    }
-                    AnimatedActivationOutcome::Failed => {
+                        let cleanup_error =
+                            animated_wallpaper::close_animated_activation(app, &handle)
+                                .err()
+                                .map(|error| format!("; cleanup: {error}"))
+                                .unwrap_or_default();
                         set_monitor_playlist_error(
                             &conn,
                             &monitor_id,
-                            "No se pudo activar Animated",
+                            &format!("Animated sigue pendiente{cleanup_error}"),
+                        );
+                    }
+                    AnimatedActivationOutcome::Failed => {
+                        let cleanup_error =
+                            animated_wallpaper::close_animated_activation(app, &handle)
+                                .err()
+                                .map(|error| format!("; cleanup: {error}"))
+                                .unwrap_or_default();
+                        set_monitor_playlist_error(
+                            &conn,
+                            &monitor_id,
+                            &format!("No se pudo activar Animated{cleanup_error}"),
                         );
                     }
                     AnimatedActivationOutcome::Cancelled => {
+                        let cleanup_error =
+                            animated_wallpaper::close_animated_activation(app, &handle)
+                                .err()
+                                .map(|error| format!("; cleanup: {error}"))
+                                .unwrap_or_default();
                         set_monitor_playlist_error(
                             &conn,
                             &monitor_id,
-                            "La activaciÃ³n Animated fue cancelada",
+                            &format!("La activaciÃ³n Animated fue cancelada{cleanup_error}"),
                         );
                     }
                 }
@@ -582,6 +619,32 @@ mod tests {
             .unwrap();
         assert_eq!(current, "wallpaper-z");
         assert_eq!(assignment, "wallpaper-z");
+    }
+
+    #[test]
+    fn monitor_rotation_does_not_leave_playlist_current_on_assignment_failure() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE monitor_playlists(monitor_id TEXT PRIMARY KEY, current_wallpaper_id TEXT, last_error TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO monitor_playlists VALUES ('monitor-a', 'wallpaper-old', NULL)",
+            [],
+        )
+        .unwrap();
+
+        assert!(persist_monitor_rotation(&mut conn, "monitor-a", "wallpaper-new").is_err());
+
+        let current: String = conn
+            .query_row(
+                "SELECT current_wallpaper_id FROM monitor_playlists WHERE monitor_id = 'monitor-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, "wallpaper-old");
     }
 
     #[test]

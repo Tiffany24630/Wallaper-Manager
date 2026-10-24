@@ -2,6 +2,8 @@ import { create } from "zustand";
 import type {Monitor} from "../types/monitor";
 import {monitorService} from "../services/monitorService";
 
+let monitorLoadSequence = 0;
+
 interface MonitorState {
   monitors: Monitor[];
   loading: boolean;
@@ -18,12 +20,15 @@ export const useMonitorStore =
     error: null,
 
     loadMonitors: async () => {
+      const requestId = ++monitorLoadSequence;
       try {
         set({
           loading: true,
         });
 
         const monitors = await monitorService.getAll();
+
+        if (requestId !== monitorLoadSequence) return;
 
         set({
           monitors,
@@ -32,6 +37,7 @@ export const useMonitorStore =
         });
 
       } catch (error) {
+        if (requestId !== monitorLoadSequence) return;
         set({
           loading: false,
           error: String(error),
@@ -44,7 +50,8 @@ export const useMonitorStore =
       wallpaperId
     ) => {
       await monitorService.assignWallpaper(monitorId, wallpaperId);
+      const requestId = ++monitorLoadSequence;
       const monitors = await monitorService.getAll();
-      set({monitors,});
+      if (requestId === monitorLoadSequence) set({monitors,});
     },
 }));

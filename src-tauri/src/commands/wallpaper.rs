@@ -403,7 +403,7 @@ fn set_active_wallpaper_on_monitor(
     }
     ensure_asset_available(path)?;
 
-    let conn = get_connection().map_err(|e| e.to_string())?;
+    let mut conn = get_connection().map_err(|e| e.to_string())?;
     let scaling_mode: String = conn
         .query_row("SELECT scaling_mode FROM settings LIMIT 1", [], |row| {
             row.get(0)
@@ -465,11 +465,7 @@ fn set_active_wallpaper_on_monitor(
         return Err(error);
     }
 
-    conn.execute(
-        "INSERT OR REPLACE INTO monitor_wallpapers(monitor_id, wallpaper_id) VALUES(?1, ?2)",
-        (monitor_id, wallpaper_id),
-    )
-    .map_err(|error| {
+    persist_monitor_wallpaper_assignment(&mut conn, monitor_id, wallpaper_id).map_err(|error| {
         format!(
             "El fondo se aplicÃ³ fÃ­sicamente, pero no se pudo persistir la asignaciÃ³n del monitor: {error}"
         )
@@ -556,6 +552,19 @@ pub(crate) fn persist_active_wallpaper(
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
+}
+
+pub(crate) fn persist_monitor_wallpaper_assignment(
+    conn: &mut rusqlite::Connection,
+    monitor_id: &str,
+    wallpaper_id: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO monitor_wallpapers(monitor_id, wallpaper_id) VALUES(?1, ?2)",
+        (monitor_id, wallpaper_id),
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 fn reserve_static_for_all_monitors(
@@ -1456,11 +1465,11 @@ pub fn upscale_wallpaper(
 mod tests {
     use super::{
         clear_wallpaper_references, compensate_import_failure, ensure_asset_available,
-        ensure_rotatable_resource_type, persist_active_wallpaper, remove_owned_file,
-        rename_wallpaper_in_connection, replace_validated_image, rotate_image, target_dimensions,
-        validate_ai_pixels, validate_generated_image, validate_imported_copy,
-        validate_wallpaper_name, wallpaper_assigned_monitors, EnhancementJobGuard,
-        EnhancementJobState, TemporaryOutput,
+        ensure_rotatable_resource_type, persist_active_wallpaper,
+        persist_monitor_wallpaper_assignment, remove_owned_file, rename_wallpaper_in_connection,
+        replace_validated_image, rotate_image, target_dimensions, validate_ai_pixels,
+        validate_generated_image, validate_imported_copy, validate_wallpaper_name,
+        wallpaper_assigned_monitors, EnhancementJobGuard, EnhancementJobState, TemporaryOutput,
     };
     use crate::models::wallpaper::WallpaperResourceType;
     use crate::utils::thumbnail::generate_thumbnail;
@@ -1502,6 +1511,43 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         let error = persist_active_wallpaper(&mut conn, "new").unwrap_err();
         assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn monitor_assignment_persistence_does_not_change_global_active_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE wallpapers(id TEXT PRIMARY KEY, active INTEGER NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE monitor_wallpapers(monitor_id TEXT PRIMARY KEY, wallpaper_id TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO wallpapers(id, active) VALUES ('global', 1), ('animated', 0)",
+            [],
+        )
+        .unwrap();
+
+        persist_monitor_wallpaper_assignment(&mut conn, "DISPLAY-A", "animated").unwrap();
+
+        let active: String = conn
+            .query_row("SELECT id FROM wallpapers WHERE active = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let assigned: String = conn
+            .query_row(
+                "SELECT wallpaper_id FROM monitor_wallpapers WHERE monitor_id = 'DISPLAY-A'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, "global");
+        assert_eq!(assigned, "animated");
     }
     #[test]
     fn calculates_upscaled_resolution() {

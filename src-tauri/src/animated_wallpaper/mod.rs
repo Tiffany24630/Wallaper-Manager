@@ -1741,6 +1741,45 @@ pub fn close_animated_prototype(app: AppHandle, monitor_id: String) -> Result<()
     Ok(())
 }
 
+pub(crate) fn close_animated_activation(
+    app: &AppHandle,
+    handle: &AnimatedActivationHandle,
+) -> Result<(), String> {
+    let label = prototype_surface_label(&handle.monitor_id);
+    {
+        let mut surfaces = prototype_surfaces()
+            .lock()
+            .map_err(|_| "No se pudo bloquear el registro de superficies".to_string())?;
+        let Some(record) = surfaces.get_mut(&label) else {
+            return Ok(());
+        };
+        if record.activation_id != handle.activation_id {
+            eprintln!("ANIMATED_CLOSE_IGNORED surface={label} reason=stale_activation");
+            return Ok(());
+        }
+        if matches!(
+            record.lifecycle.state(),
+            AnimatedSurfaceState::Closing
+                | AnimatedSurfaceState::Closed
+                | AnimatedSurfaceState::FallbackRequired
+        ) {
+            return Ok(());
+        }
+        record.lifecycle.begin_close();
+    }
+    if let Some(window) = app.get_webview_window(&label) {
+        window
+            .close()
+            .map_err(|error| format!("No se pudo cerrar la superficie Animated: {error}"))?;
+    } else {
+        eprintln!(
+            "ANIMATED_CLOSE_CONFIRMATION_PENDING surface={label} activation={} reason=window_not_found",
+            handle.activation_id
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn report_animated_ready(
     app: AppHandle,
@@ -1817,9 +1856,11 @@ pub fn report_animated_ready(
     }
     if let Some(wallpaper_id) = wallpaper_id.clone() {
         let mut conn = crate::db::get_connection().map_err(|error| error.to_string())?;
-        if let Err(error) =
-            crate::commands::wallpaper::persist_active_wallpaper(&mut conn, &wallpaper_id)
-        {
+        if let Err(error) = crate::commands::wallpaper::persist_monitor_wallpaper_assignment(
+            &mut conn,
+            assignment.assignment.monitor.as_str(),
+            &wallpaper_id,
+        ) {
             signal_activation(&activation_id, AnimatedActivationOutcome::Failed);
             emit_activation_event(
                 &app,
@@ -1840,7 +1881,7 @@ pub fn report_animated_ready(
                 let _ = window.close();
             }
             return Err(format!(
-                "Animated está listo como recurso, pero no se pudo persistir el estado activo: {error}"
+                "Animated está listo como recurso, pero no se pudo persistir la asignación del monitor: {error}"
             ));
         }
     }
