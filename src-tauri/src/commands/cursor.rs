@@ -2,12 +2,10 @@ use chrono::Utc;
 use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgba, RgbaImage};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
-use tauri::State;
 use uuid::Uuid;
 
 use crate::{
     db::{app_data_dir, get_connection},
-    dynamic::DynamicScheduler,
     models::cursor::CursorResource,
     utils::thumbnail::generate_thumbnail,
 };
@@ -206,6 +204,40 @@ fn write_cur_preview(source: &Path, output: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn cleanup_import_files(
+    managed: &Path,
+    preview: Option<&Path>,
+    source: Option<&Path>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (kind, path) in [
+        ("recurso", Some(managed)),
+        ("preview", preview),
+        ("fuente", source),
+    ]
+    .into_iter()
+    .filter_map(|(kind, path)| path.map(|path| (kind, path)))
+    {
+        if let Err(error) = fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                errors.push(format!("{kind} {path:?}: {error}"));
+            }
+        }
+    }
+    errors
+}
+
+fn import_error(error: String, cleanup_errors: Vec<String>) -> String {
+    if cleanup_errors.is_empty() {
+        error
+    } else {
+        format!(
+            "{error}; la limpieza de archivos creados fallÃ³: {}",
+            cleanup_errors.join("; ")
+        )
+    }
+}
+
 #[tauri::command]
 pub fn list_cursors() -> Result<Vec<CursorResource>, String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
@@ -226,7 +258,8 @@ pub fn list_cursors() -> Result<Vec<CursorResource>, String> {
             })
         })
         .map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(Result::ok).collect())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("No se pudieron leer los cursores: {error}"))
 }
 
 #[tauri::command]
@@ -277,30 +310,58 @@ pub fn import_cursor(
         let hx = hotspot_x.unwrap_or(0);
         let hy = hotspot_y.unwrap_or(0);
         let bytes = encode_cur(&image, hx, hy)?;
-        fs::write(&managed_path, bytes).map_err(|e| e.to_string())?;
+        if let Err(error) = fs::write(&managed_path, bytes) {
+            let cleanup_errors = cleanup_import_files(&managed_path, None, None);
+            return Err(import_error(error.to_string(), cleanup_errors));
+        }
         let copy = root
             .join("cursors/sources")
             .join(format!("{id}.{source_ext}"));
-        fs::copy(source, &copy).map_err(|e| e.to_string())?;
+        if let Err(error) = fs::copy(source, &copy) {
+            let cleanup_errors = cleanup_import_files(&managed_path, None, Some(&copy));
+            return Err(import_error(error.to_string(), cleanup_errors));
+        }
         Some(copy)
     } else {
         validate_cursor_file(source, detected)?;
-        fs::copy(source, &managed_path).map_err(|e| e.to_string())?;
+        if let Err(error) = fs::copy(source, &managed_path) {
+            let cleanup_errors = cleanup_import_files(&managed_path, None, None);
+            return Err(import_error(error.to_string(), cleanup_errors));
+        }
         None
     };
-    validate_cursor_file(&managed_path, detected)?;
+    if let Err(error) = validate_cursor_file(&managed_path, detected) {
+        let cleanup_errors = cleanup_import_files(&managed_path, None, source_copy.as_deref());
+        return Err(import_error(error, cleanup_errors));
+    }
     let preview_path = if source_ext == "cur" {
         let preview = root.join("cursors/previews").join(format!("{id}.jpg"));
         write_cur_preview(&managed_path, &preview).ok();
         preview.is_file().then_some(preview)
     } else if source_ext != "ani" {
         let preview = root.join("cursors/previews").join(format!("{id}.jpg"));
-        generate_thumbnail(&source.to_string_lossy(), &preview.to_string_lossy())?;
+        if let Err(error) =
+            generate_thumbnail(&source.to_string_lossy(), &preview.to_string_lossy())
+        {
+            let cleanup_errors =
+                cleanup_import_files(&managed_path, Some(&preview), source_copy.as_deref());
+            return Err(import_error(error, cleanup_errors));
+        }
         Some(preview)
     } else {
         None
     };
-    let conn = get_connection().map_err(|e| e.to_string())?;
+    let conn = match get_connection() {
+        Ok(conn) => conn,
+        Err(error) => {
+            let cleanup_errors = cleanup_import_files(
+                &managed_path,
+                preview_path.as_deref(),
+                source_copy.as_deref(),
+            );
+            return Err(import_error(error.to_string(), cleanup_errors));
+        }
+    };
     let duplicate: Option<String> = conn
         .query_row(
             "SELECT id FROM cursor_resources WHERE path = ?1 OR hash = ?2 LIMIT 1",
@@ -309,6 +370,17 @@ pub fn import_cursor(
         )
         .ok();
     if duplicate.is_some() {
+        let cleanup_errors = cleanup_import_files(
+            &managed_path,
+            preview_path.as_deref(),
+            source_copy.as_deref(),
+        );
+        if !cleanup_errors.is_empty() {
+            return Err(import_error(
+                "El cursor duplicado no pudo limpiarse completamente".into(),
+                cleanup_errors,
+            ));
+        }
         let _ = fs::remove_file(&managed_path);
         if let Some(path) = &preview_path {
             let _ = fs::remove_file(path);
@@ -319,6 +391,14 @@ pub fn import_cursor(
         return Err("Este cursor ya está en la biblioteca".into());
     }
     if let Err(error) = conn.execute("INSERT INTO cursor_resources(id, name, path, preview, resource_type, source_path, hash, hotspot_x, hotspot_y, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", rusqlite::params![id, display_name, managed_path.to_string_lossy(), preview_path.as_ref().map(|p| p.to_string_lossy().into_owned()), detected.as_str(), source_copy.as_ref().map(|p| p.to_string_lossy().into_owned()), source_hash, hotspot_x.unwrap_or(0), hotspot_y.unwrap_or(0), Utc::now().to_rfc3339()]) {
+        let cleanup_errors = cleanup_import_files(
+            &managed_path,
+            preview_path.as_deref(),
+            source_copy.as_deref(),
+        );
+        if !cleanup_errors.is_empty() {
+            return Err(import_error(error.to_string(), cleanup_errors));
+        }
         let _ = fs::remove_file(&managed_path);
         if let Some(path) = &preview_path { let _ = fs::remove_file(path); }
         if let Some(path) = &source_copy { let _ = fs::remove_file(path); }
@@ -443,10 +523,7 @@ fn restore_system_cursor() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn activate_cursor(
-    cursor_id: String,
-    scheduler: State<'_, DynamicScheduler>,
-) -> Result<(), String> {
+pub fn activate_cursor(cursor_id: String) -> Result<(), String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
     let path: String = conn
         .query_row(
@@ -457,24 +534,19 @@ pub fn activate_cursor(
         .map_err(|_| "El cursor ya no existe".to_string())?;
     apply_system_cursor(Path::new(&path))?;
     conn.execute("UPDATE settings SET cursor_enabled = 1, active_cursor_id = ?1 WHERE id = (SELECT id FROM settings LIMIT 1)", [&cursor_id]).map_err(|e| e.to_string())?;
-    scheduler.stop();
     Ok(())
 }
 
 #[tauri::command]
-pub fn restore_default_cursor(scheduler: State<'_, DynamicScheduler>) -> Result<(), String> {
+pub fn restore_default_cursor() -> Result<(), String> {
     restore_system_cursor()?;
     let conn = get_connection().map_err(|e| e.to_string())?;
     conn.execute("UPDATE settings SET cursor_enabled = 0, active_cursor_id = NULL WHERE id = (SELECT id FROM settings LIMIT 1)", []).map_err(|e| e.to_string())?;
-    scheduler.stop();
     Ok(())
 }
 
 #[tauri::command]
-pub fn delete_cursor(
-    cursor_id: String,
-    scheduler: State<'_, DynamicScheduler>,
-) -> Result<(), String> {
+pub fn delete_cursor(cursor_id: String) -> Result<(), String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
     let (path, preview, source): (String, Option<String>, Option<String>) = conn
         .query_row(
@@ -493,18 +565,32 @@ pub fn delete_cursor(
     if active {
         restore_system_cursor()?;
         conn.execute("UPDATE settings SET cursor_enabled = 0, active_cursor_id = NULL WHERE id = (SELECT id FROM settings LIMIT 1)", []).map_err(|e| e.to_string())?;
-        scheduler.stop();
     }
     conn.execute("DELETE FROM cursor_resources WHERE id = ?1", [&cursor_id])
         .map_err(|e| e.to_string())?;
-    let _ = fs::remove_file(path);
-    if let Some(path) = preview {
-        let _ = fs::remove_file(path);
+    let mut cleanup_errors = Vec::new();
+    for (kind, path) in [
+        ("recurso", Some(path)),
+        ("preview", preview),
+        ("fuente", source),
+    ]
+    .into_iter()
+    .filter_map(|(kind, path)| path.map(|path| (kind, path)))
+    {
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                cleanup_errors.push(format!("{kind} {path}: {error}"));
+            }
+        }
     }
-    if let Some(path) = source {
-        let _ = fs::remove_file(path);
+    if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Cursor eliminado, pero la limpieza física quedó incompleta: {}",
+            cleanup_errors.join("; ")
+        ))
     }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -400,33 +400,45 @@ fn begin_explicit_prototype_close(label: &str) {
     }
 }
 
+fn take_destroyed_surface(
+    surfaces: &mut BTreeMap<String, PrototypeSurfaceRecord>,
+    label: &str,
+    activation_id: Option<&str>,
+) -> Option<AssignmentOperation> {
+    let Some(mut record) = surfaces.remove(label) else {
+        return None;
+    };
+    if activation_id.is_some_and(|id| id != record.activation_id) {
+        // A stale Destroyed event must not consume the record belonging to a
+        // newer activation that reused the same logical surface label.
+        surfaces.insert(label.to_string(), record);
+        eprintln!("ANIMATED_SURFACE_CLOSE_IGNORED surface={label} reason=stale_activation");
+        return None;
+    }
+    if record.destroyed_confirmed {
+        surfaces.insert(label.to_string(), record);
+        eprintln!(
+            "ANIMATED_DESTROYED_IGNORED surface={label} activation={} reason=duplicate_confirmation",
+            surfaces.get(label).map(|value| value.activation_id.as_str()).unwrap_or("unknown")
+        );
+        return None;
+    }
+    record.destroyed_confirmed = true;
+    record.lifecycle.finish_close();
+    let assignment = record.assignment.clone();
+    signal_activation(&record.activation_id, AnimatedActivationOutcome::Cancelled);
+    eprintln!(
+        "ANIMATED_DESTROYED_CONFIRMED surface={label} activation={} monitor={} generation={}",
+        record.activation_id,
+        assignment.assignment.monitor,
+        assignment.assignment.generation.value()
+    );
+    Some(assignment)
+}
+
 fn finish_prototype_close(label: &str, activation_id: Option<&str>) {
     let assignment = if let Ok(mut surfaces) = prototype_surfaces().lock() {
-        let Some(record) = surfaces.get_mut(label) else {
-            return;
-        };
-        if activation_id.is_some_and(|id| id != record.activation_id) {
-            eprintln!("ANIMATED_SURFACE_CLOSE_IGNORED surface={label} reason=stale_activation");
-            return;
-        }
-        if record.destroyed_confirmed {
-            eprintln!(
-                "ANIMATED_DESTROYED_IGNORED surface={label} activation={} reason=duplicate_confirmation",
-                record.activation_id
-            );
-            return;
-        }
-        record.destroyed_confirmed = true;
-        record.lifecycle.finish_close();
-        let assignment = record.assignment.clone();
-        signal_activation(&record.activation_id, AnimatedActivationOutcome::Cancelled);
-        eprintln!(
-            "ANIMATED_DESTROYED_CONFIRMED surface={label} activation={} monitor={} generation={}",
-            record.activation_id,
-            assignment.assignment.monitor,
-            assignment.assignment.generation.value()
-        );
-        Some(assignment)
+        take_destroyed_surface(&mut surfaces, label, activation_id)
     } else {
         None
     };
@@ -1979,10 +1991,10 @@ mod tests {
         activation_matches, bounds_from_geometry, create_diagnostic_gif,
         diagnostic_surface_conflicts, encode_query_component, prototype_surface_label,
         register_activation, resource_limit_reason, signal_activation, smoke_variant_options,
-        validate_animated_gif, validate_media_source, wait_for_activation, AnimatedActivationEvent,
-        AnimatedActivationHandle, AnimatedActivationOutcome, AnimatedMediaFormat,
-        AnimatedSurfaceLifecycle, PrototypeSurfaceRecord, MAX_ANIMATED_DIMENSION,
-        MAX_ANIMATED_FILE_BYTES,
+        take_destroyed_surface, validate_animated_gif, validate_media_source, wait_for_activation,
+        AnimatedActivationEvent, AnimatedActivationHandle, AnimatedActivationOutcome,
+        AnimatedMediaFormat, AnimatedSurfaceLifecycle, PrototypeSurfaceRecord,
+        MAX_ANIMATED_DIMENSION, MAX_ANIMATED_FILE_BYTES,
     };
     use crate::models::monitor_assignment::MonitorIdentity;
     use crate::models::monitor_assignment::WallpaperBackend;
@@ -2092,6 +2104,56 @@ mod tests {
         };
         assert!(activation_matches(&old, "activation-old"));
         assert!(!activation_matches(&old, "activation-new"));
+    }
+
+    #[test]
+    fn destroyed_surface_is_removed_and_stale_close_keeps_new_record() {
+        let mut coordinator = WallpaperCoordinator::default();
+        let old_assignment = coordinator
+            .reserve("test-monitor".into(), WallpaperBackend::Animated)
+            .unwrap();
+        let mut surfaces = std::collections::BTreeMap::new();
+        surfaces.insert(
+            "animated-surface".into(),
+            PrototypeSurfaceRecord {
+                lifecycle: AnimatedSurfaceLifecycle::new(),
+                activation_id: "activation-old".into(),
+                assignment: old_assignment,
+                wallpaper_id: None,
+                destroyed_confirmed: false,
+            },
+        );
+
+        assert!(
+            take_destroyed_surface(&mut surfaces, "animated-surface", Some("activation-old"))
+                .is_some()
+        );
+        assert!(!surfaces.contains_key("animated-surface"));
+
+        let mut newer_coordinator = WallpaperCoordinator::default();
+        let new_assignment = newer_coordinator
+            .reserve("test-monitor".into(), WallpaperBackend::Animated)
+            .unwrap();
+        surfaces.insert(
+            "animated-surface".into(),
+            PrototypeSurfaceRecord {
+                lifecycle: AnimatedSurfaceLifecycle::new(),
+                activation_id: "activation-new".into(),
+                assignment: new_assignment,
+                wallpaper_id: None,
+                destroyed_confirmed: false,
+            },
+        );
+        assert!(
+            take_destroyed_surface(&mut surfaces, "animated-surface", Some("activation-old"))
+                .is_none()
+        );
+        assert_eq!(
+            surfaces
+                .get("animated-surface")
+                .map(|record| record.activation_id.as_str()),
+            Some("activation-new")
+        );
     }
 
     #[test]

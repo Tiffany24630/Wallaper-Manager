@@ -609,7 +609,11 @@ pub fn toggle_favorite(wallpaper_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn delete_wallpaper(wallpaper_id: String) -> Result<(), String> {
+pub fn delete_wallpaper(
+    wallpaper_id: String,
+    scheduler: State<'_, DynamicScheduler>,
+) -> Result<(), String> {
+    let mut manual_operation = scheduler.begin_manual_operation();
     let conn = get_connection().map_err(|e| e.to_string())?;
     let (path, thumbnail, original_path, active): (String, Option<String>, Option<String>, i32) =
         conn.query_row(
@@ -623,14 +627,17 @@ pub fn delete_wallpaper(wallpaper_id: String) -> Result<(), String> {
             "No se puede eliminar el wallpaper activo sin coordinar primero su reemplazo".into(),
         );
     }
+    let assigned_monitors = wallpaper_assigned_monitors(&conn, &wallpaper_id)?;
+    if !assigned_monitors.is_empty() {
+        return Err(format!(
+            "No se puede eliminar el wallpaper mientras estÃ¡ asignado a los monitores: {}",
+            assigned_monitors.join(", ")
+        ));
+    }
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    clear_wallpaper_references(&tx, &wallpaper_id)?;
     tx.execute("DELETE FROM wallpapers WHERE id = ?1", [&wallpaper_id])
         .map_err(|e| e.to_string())?;
-    tx.execute(
-        "UPDATE settings SET dynamic_current_wallpaper_id = NULL WHERE dynamic_current_wallpaper_id = ?1",
-        [&wallpaper_id],
-    )
-    .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     let mut cleanup_errors = Vec::new();
     for candidate in [Some(path), thumbnail, original_path].into_iter().flatten() {
@@ -638,14 +645,16 @@ pub fn delete_wallpaper(wallpaper_id: String) -> Result<(), String> {
             cleanup_errors.push(format!("{candidate}: {error}"));
         }
     }
-    if cleanup_errors.is_empty() {
+    let result = if cleanup_errors.is_empty() {
         Ok(())
     } else {
         Err(format!(
             "El registro del wallpaper fue eliminado, pero la limpieza física quedó incompleta: {}",
             cleanup_errors.join("; ")
         ))
-    }
+    };
+    manual_operation.complete_and_resume();
+    result
 }
 
 fn remove_owned_file(path: &str) -> Result<(), String> {
@@ -655,6 +664,51 @@ fn remove_owned_file(path: &str) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn wallpaper_assigned_monitors(
+    conn: &rusqlite::Connection,
+    wallpaper_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT monitor_id FROM monitor_wallpapers WHERE wallpaper_id = ?1 ORDER BY monitor_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let result = statement
+        .query_map([wallpaper_id], |row| row.get(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|error| error.to_string());
+    result
+}
+
+fn clear_wallpaper_references(
+    tx: &rusqlite::Transaction<'_>,
+    wallpaper_id: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM playlist_wallpapers WHERE wallpaper_id = ?1",
+        [wallpaper_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE monitor_playlists
+         SET current_wallpaper_id = NULL,
+             last_error = 'El wallpaper actual fue eliminado de la biblioteca'
+         WHERE current_wallpaper_id = ?1",
+        [wallpaper_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE settings
+         SET dynamic_current_wallpaper_id = NULL,
+             dynamic_last_error = 'El wallpaper actual fue eliminado de la biblioteca'
+         WHERE dynamic_current_wallpaper_id = ?1",
+        [wallpaper_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn ensure_asset_available(path: &str) -> Result<(), String> {
@@ -753,6 +807,9 @@ fn validate_wallpaper_name(name: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("El nombre del fondo no puede estar vacío".into());
     }
+    if trimmed.chars().count() > 200 {
+        return Err("El nombre del fondo no puede superar los 200 caracteres".into());
+    }
     if trimmed.chars().any(char::is_control) {
         return Err("El nombre del fondo contiene caracteres de control no válidos".into());
     }
@@ -795,6 +852,14 @@ fn rotation_format(path: &Path) -> Result<ImageFormat, String> {
         Some("webp") => Ok(ImageFormat::WebP),
         Some("bmp") => Ok(ImageFormat::Bmp),
         _ => Err("El formato del fondo no se puede rotar".into()),
+    }
+}
+
+fn ensure_rotatable_resource_type(resource_type: &str) -> Result<(), String> {
+    if resource_type == "static" {
+        Ok(())
+    } else {
+        Err("La rotación local solo admite wallpapers Static; Animated no se transforma como imagen fija".into())
     }
 }
 
@@ -852,15 +917,18 @@ pub fn rotate_wallpaper_version(
         return Err("La rotación debe ser 0°, 90°, 180° o 270°".into());
     }
     let mut conn = get_connection().map_err(|e| e.to_string())?;
-    let (path, thumbnail, original_path, active): (String, Option<String>, Option<String>, i32) =
+    let (path, thumbnail, original_path, active, resource_type):
+        (String, Option<String>, Option<String>, i32, String) =
         conn.query_row(
-            "SELECT path, thumbnail, original_path, active FROM wallpapers WHERE id = ?1",
+            "SELECT path, thumbnail, original_path, active, COALESCE(resource_type, 'static') FROM wallpapers WHERE id = ?1",
             [&wallpaper_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(|_| "El fondo ya no existe en la biblioteca".to_string())?;
+    ensure_rotatable_resource_type(&resource_type)?;
     let path = PathBuf::from(path);
     ensure_asset_available(&path.to_string_lossy())?;
+    let assigned_monitors = wallpaper_assigned_monitors(&conn, &wallpaper_id)?;
     let source_path = if let Some(ref original_path) = original_path {
         PathBuf::from(original_path)
     } else {
@@ -944,10 +1012,22 @@ pub fn rotate_wallpaper_version(
                 "no se pudo retirar la miniatura nueva: {remove_error}"
             ));
         }
-        let _ = remove_owned_file(&rollback_path.to_string_lossy());
-        let _ = remove_owned_file(&thumbnail_rollback.to_string_lossy());
+        if let Err(cleanup_error) = remove_owned_file(&rollback_path.to_string_lossy()) {
+            rollback_errors.push(format!(
+                "no se pudo limpiar el rollback del asset: {cleanup_error}"
+            ));
+        }
+        if let Err(cleanup_error) = remove_owned_file(&thumbnail_rollback.to_string_lossy()) {
+            rollback_errors.push(format!(
+                "no se pudo limpiar el rollback de la miniatura: {cleanup_error}"
+            ));
+        }
         if created_original {
-            let _ = remove_owned_file(&source_path.to_string_lossy());
+            if let Err(cleanup_error) = remove_owned_file(&source_path.to_string_lossy()) {
+                rollback_errors.push(format!(
+                    "no se pudo retirar el backup original creado: {cleanup_error}"
+                ));
+            }
         }
         return Err(if rollback_errors.is_empty() {
             format!("La rotación no se completó: {error}")
@@ -958,10 +1038,40 @@ pub fn rotate_wallpaper_version(
             )
         });
     }
-    let _ = remove_owned_file(&rollback_path.to_string_lossy());
-    let _ = remove_owned_file(&thumbnail_rollback.to_string_lossy());
-    if active == 1 {
-        set_active_wallpaper_internal(wallpaper_id)?;
+    let mut post_transform_errors = Vec::new();
+    if let Err(cleanup_error) = remove_owned_file(&rollback_path.to_string_lossy()) {
+        post_transform_errors.push(format!(
+            "no se pudo limpiar el rollback del asset: {cleanup_error}"
+        ));
+    }
+    if let Err(cleanup_error) = remove_owned_file(&thumbnail_rollback.to_string_lossy()) {
+        post_transform_errors.push(format!(
+            "no se pudo limpiar el rollback de la miniatura: {cleanup_error}"
+        ));
+    }
+
+    if assigned_monitors.is_empty() && active == 1 {
+        if let Err(error) = set_active_wallpaper_internal(wallpaper_id.clone()) {
+            post_transform_errors.push(format!(
+                "el wallpaper fue transformado y persistido, pero no se pudo reaplicar globalmente: {error}"
+            ));
+        }
+    } else {
+        for monitor_id in &assigned_monitors {
+            if let Err(error) =
+                set_active_wallpaper_on_monitor(&wallpaper_id, monitor_id, &path.to_string_lossy())
+            {
+                post_transform_errors.push(format!(
+                    "el wallpaper fue transformado y persistido, pero no se pudo reaplicar en {monitor_id}: {error}"
+                ));
+            }
+        }
+    }
+    if !post_transform_errors.is_empty() {
+        return Err(format!(
+            "La transformación se completó, pero quedaron resultados parciales: {}",
+            post_transform_errors.join("; ")
+        ));
     }
     manual_operation.complete_and_resume();
     Ok(())
@@ -1215,13 +1325,16 @@ pub fn upscale_wallpaper(
         _ => return Err("La escala debe ser 3x o 4x".into()),
     };
     let conn = get_connection().map_err(|e| e.to_string())?;
-    let (source_path, original_name, source_id): (String, String, String) = conn
+    let (source_path, original_name, source_id, resource_type): (String, String, String, String) = conn
         .query_row(
-            "SELECT path, name, id FROM wallpapers WHERE id = ?1",
+            "SELECT path, name, id, COALESCE(resource_type, 'static') FROM wallpapers WHERE id = ?1",
             [&wallpaper_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(|_| "No se encontró el fondo".to_string())?;
+    if resource_type != "static" {
+        return Err("La mejora local solo admite wallpapers Static; Animated no se convierte en una imagen fija".into());
+    }
     let mut job = EnhancementJobGuard::begin(&source_id)?;
     let hardware_acceleration = conn
         .query_row(
@@ -1342,10 +1455,12 @@ pub fn upscale_wallpaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        compensate_import_failure, ensure_asset_available, persist_active_wallpaper,
-        remove_owned_file, rename_wallpaper_in_connection, replace_validated_image, rotate_image,
-        target_dimensions, validate_ai_pixels, validate_generated_image, validate_imported_copy,
-        validate_wallpaper_name, EnhancementJobGuard, EnhancementJobState, TemporaryOutput,
+        clear_wallpaper_references, compensate_import_failure, ensure_asset_available,
+        ensure_rotatable_resource_type, persist_active_wallpaper, remove_owned_file,
+        rename_wallpaper_in_connection, replace_validated_image, rotate_image, target_dimensions,
+        validate_ai_pixels, validate_generated_image, validate_imported_copy,
+        validate_wallpaper_name, wallpaper_assigned_monitors, EnhancementJobGuard,
+        EnhancementJobState, TemporaryOutput,
     };
     use crate::models::wallpaper::WallpaperResourceType;
     use crate::utils::thumbnail::generate_thumbnail;
@@ -1458,6 +1573,76 @@ mod tests {
         );
         assert!(validate_wallpaper_name("   ").is_err());
         assert!(validate_wallpaper_name("nombre\ninválido").is_err());
+        assert!(validate_wallpaper_name(&"x".repeat(201)).is_err());
+    }
+
+    #[test]
+    fn rotation_rejects_animated_resources_explicitly() {
+        assert!(ensure_rotatable_resource_type("static").is_ok());
+        let error = ensure_rotatable_resource_type("animated").unwrap_err();
+        assert!(error.contains("Animated"));
+    }
+
+    #[test]
+    fn reads_all_monitor_assignments_by_stable_monitor_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE monitor_wallpapers(monitor_id TEXT PRIMARY KEY, wallpaper_id TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO monitor_wallpapers(monitor_id, wallpaper_id) VALUES
+             ('DISPLAY\\\\B', 'wallpaper-1'), ('DISPLAY\\\\A', 'wallpaper-1'), ('DISPLAY\\\\C', 'other')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            wallpaper_assigned_monitors(&conn, "wallpaper-1").unwrap(),
+            vec!["DISPLAY\\\\A", "DISPLAY\\\\B"]
+        );
+    }
+
+    #[test]
+    fn clearing_wallpaper_references_is_atomic_and_keeps_playlists() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE playlist_wallpapers(playlist_id TEXT, wallpaper_id TEXT);
+             CREATE TABLE monitor_playlists(monitor_id TEXT PRIMARY KEY, current_wallpaper_id TEXT, last_error TEXT);
+             CREATE TABLE settings(dynamic_current_wallpaper_id TEXT, dynamic_last_error TEXT);
+             INSERT INTO playlist_wallpapers VALUES ('playlist-a', 'wallpaper-1'), ('playlist-b', 'wallpaper-1');
+             INSERT INTO monitor_playlists VALUES ('monitor-a', 'wallpaper-1', NULL);
+             INSERT INTO settings VALUES ('wallpaper-1', NULL);",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        clear_wallpaper_references(&tx, "wallpaper-1").unwrap();
+        tx.commit().unwrap();
+
+        let playlist_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM playlist_wallpapers WHERE wallpaper_id = 'wallpaper-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT current_wallpaper_id FROM monitor_playlists WHERE monitor_id = 'monitor-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dynamic_current: Option<String> = conn
+            .query_row(
+                "SELECT dynamic_current_wallpaper_id FROM settings",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(playlist_count, 0);
+        assert_eq!(current, None);
+        assert_eq!(dynamic_current, None);
     }
 
     #[test]

@@ -8,6 +8,7 @@ use crate::{
     },
     models::monitor_playlist::MonitorPlaylist,
     models::monitor_wallpaper::MonitorWallpaper,
+    models::wallpaper::WallpaperResourceType,
     models::wallpaper_coordinator,
     utils::windows_wallpaper::{native_monitor_descriptors, set_monitor_wallpaper},
 };
@@ -71,6 +72,17 @@ fn restorable_assignments(
         .filter(|(monitor_id, _)| current_ids.iter().any(|id| id == monitor_id))
         .cloned()
         .collect()
+}
+
+fn static_restoration_resource_type(value: &str) -> Result<WallpaperResourceType, String> {
+    let resource_type = WallpaperResourceType::from_db(value)?;
+    if resource_type != WallpaperResourceType::Static {
+        return Err(
+            "La restauraciÃ³n Static no puede confirmar un recurso Animated sin su superficie nativa"
+                .into(),
+        );
+    }
+    Ok(resource_type)
 }
 
 #[cfg(target_os = "windows")]
@@ -182,16 +194,20 @@ pub fn restore_monitor_wallpapers(app: &tauri::AppHandle) -> Result<(), String> 
             .map_err(|e| format!("Windows no pudo restaurar el modo de ajuste: {e}"))?;
     }
     for (monitor_id, wallpaper_id) in assignments {
-        let Ok(path) = conn.query_row(
-            "SELECT path FROM wallpapers WHERE id = ?1",
+        let Ok((path, resource_type)) = conn.query_row(
+            "SELECT path, COALESCE(resource_type, 'static') FROM wallpapers WHERE id = ?1",
             [&wallpaper_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         ) else {
             restore_errors.push(format!(
                 "{monitor_id}: no se encontró el wallpaper persistido {wallpaper_id}"
             ));
             continue;
         };
+        if let Err(error) = static_restoration_resource_type(&resource_type) {
+            restore_errors.push(format!("{monitor_id}: {error}"));
+            continue;
+        }
         if std::path::Path::new(&path).is_file() {
             let identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
             let operation = wallpaper_coordinator::global()
@@ -451,7 +467,8 @@ pub fn remove_playlist_from_monitor(
 
 #[cfg(test)]
 mod tests {
-    use super::restorable_assignments;
+    use super::{restorable_assignments, static_restoration_resource_type};
+    use crate::models::wallpaper::WallpaperResourceType;
 
     #[test]
     fn restores_only_assignments_for_current_monitors() {
@@ -472,5 +489,15 @@ mod tests {
             ("monitor-1".to_string(), "same-name-b".to_string()),
         ];
         assert_eq!(restorable_assignments(&current, &assignments), assignments);
+    }
+
+    #[test]
+    fn static_restore_rejects_animated_without_claiming_success() {
+        assert_eq!(
+            static_restoration_resource_type("static").unwrap(),
+            WallpaperResourceType::Static
+        );
+        assert!(static_restoration_resource_type("animated").is_err());
+        assert!(static_restoration_resource_type("unknown").is_err());
     }
 }
