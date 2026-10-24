@@ -110,7 +110,49 @@ pub fn save_settings(
         return Err("Windows no pudo confirmar el estado del inicio automático de Lumina".into());
     }
     let mut conn = get_connection().map_err(|e| e.to_string())?;
+    persist_user_settings(&mut conn, &settings)?;
+    scheduler.restart();
+    Ok(())
+}
+
+fn persist_user_settings(
+    conn: &mut rusqlite::Connection,
+    settings: &Settings,
+) -> Result<(), String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    // Re-check dynamic configuration inside the write transaction. The
+    // validation performed by `save_settings` happens before opening this
+    // transaction, so a playlist deletion or monitor assignment could race
+    // with a stale settings snapshot and otherwise resurrect invalid global
+    // configuration.
+    if settings.dynamic_enabled {
+        let playlist_id = settings
+            .dynamic_playlist_id
+            .as_deref()
+            .ok_or_else(|| "Selecciona una lista antes de activar el fondo dinámico".to_string())?;
+        let playlist_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM playlists WHERE id = ?1)",
+                [playlist_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !playlist_exists {
+            return Err("La playlist seleccionada ya no existe".into());
+        }
+        let monitor_playlists: i64 = tx
+            .query_row("SELECT COUNT(*) FROM monitor_playlists", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        if monitor_playlists > 0 {
+            return Err(
+                "Desactiva primero las playlists asignadas por monitor para usar el fondo dinámico global"
+                    .into(),
+            );
+        }
+    }
 
     tx.execute(
         "
@@ -135,9 +177,7 @@ pub fn save_settings(
                 WHEN dynamic_enabled != ?9
                   OR dynamic_playlist_id IS NOT ?10
                   OR dynamic_interval_minutes != ?11
-                THEN NULL ELSE dynamic_last_error END,
-            cursor_enabled = ?12,
-            active_cursor_id = ?13
+                THEN NULL ELSE dynamic_last_error END
         WHERE id = (SELECT id FROM settings LIMIT 1)
         ",
         params![
@@ -152,13 +192,142 @@ pub fn save_settings(
             settings.dynamic_enabled as i32,
             settings.dynamic_playlist_id,
             settings.dynamic_interval_minutes,
-            settings.cursor_enabled as i32,
-            settings.active_cursor_id,
         ],
     )
     .map_err(|e| e.to_string())?;
 
     tx.commit().map_err(|e| e.to_string())?;
-    scheduler.restart();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::persist_user_settings;
+    use crate::models::settings::Settings;
+    use rusqlite::Connection;
+
+    fn settings_snapshot() -> Settings {
+        Settings {
+            launch_at_startup: false,
+            minimize_to_tray: true,
+            hardware_acceleration: true,
+            pause_on_battery: false,
+            pause_when_maximized: true,
+            scaling_mode: "fill".into(),
+            accent_color: "violet".into(),
+            ui_scale: 100,
+            dynamic_enabled: false,
+            dynamic_playlist_id: None,
+            dynamic_interval_minutes: 10,
+            dynamic_current_wallpaper_id: None,
+            dynamic_last_error: None,
+            cursor_enabled: false,
+            active_cursor_id: Some("stale-cursor".into()),
+        }
+    }
+
+    #[test]
+    fn stale_settings_snapshot_does_not_overwrite_cursor_writer() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings(
+                id INTEGER PRIMARY KEY,
+                launch_at_startup INTEGER,
+                minimize_to_tray INTEGER,
+                hardware_acceleration INTEGER,
+                pause_on_battery INTEGER,
+                pause_when_maximized INTEGER,
+                scaling_mode TEXT,
+                accent_color TEXT,
+                ui_scale INTEGER,
+                dynamic_enabled INTEGER,
+                dynamic_playlist_id TEXT,
+                dynamic_interval_minutes INTEGER,
+                dynamic_current_wallpaper_id TEXT,
+                dynamic_last_error TEXT,
+                cursor_enabled INTEGER,
+                active_cursor_id TEXT
+            );
+            INSERT INTO settings VALUES
+                (1, 0, 1, 1, 0, 1, 'fill', 'violet', 100, 0, NULL, 5,
+                 'wallpaper-current', 'old error', 0, NULL);",
+        )
+        .unwrap();
+
+        // Another backend writer commits after the UI read its snapshot.
+        conn.execute(
+            "UPDATE settings SET cursor_enabled = 1, active_cursor_id = 'cursor-new' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        persist_user_settings(&mut conn, &settings_snapshot()).unwrap();
+
+        let persisted: (i32, Option<String>, i32) = conn
+            .query_row(
+                "SELECT cursor_enabled, active_cursor_id, dynamic_interval_minutes FROM settings WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, (1, Some("cursor-new".into()), 10));
+    }
+
+    #[test]
+    fn stale_settings_snapshot_cannot_resurrect_deleted_dynamic_playlist() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings(
+                id INTEGER PRIMARY KEY,
+                launch_at_startup INTEGER,
+                minimize_to_tray INTEGER,
+                hardware_acceleration INTEGER,
+                pause_on_battery INTEGER,
+                pause_when_maximized INTEGER,
+                scaling_mode TEXT,
+                accent_color TEXT,
+                ui_scale INTEGER,
+                dynamic_enabled INTEGER,
+                dynamic_playlist_id TEXT,
+                dynamic_interval_minutes INTEGER,
+                dynamic_current_wallpaper_id TEXT,
+                dynamic_last_error TEXT,
+                cursor_enabled INTEGER,
+                active_cursor_id TEXT
+            );
+            CREATE TABLE playlists(id TEXT PRIMARY KEY);
+            CREATE TABLE monitor_playlists(monitor_id TEXT PRIMARY KEY);
+            INSERT INTO settings VALUES
+                (1, 0, 1, 1, 0, 1, 'fill', 'violet', 100, 1, 'playlist-old', 5,
+                 'wallpaper-current', NULL, 0, NULL);
+            INSERT INTO playlists VALUES ('playlist-old');",
+        )
+        .unwrap();
+
+        // The UI read this snapshot before another backend operation removed
+        // the playlist and cleared the global dynamic configuration.
+        let mut stale = settings_snapshot();
+        stale.dynamic_enabled = true;
+        stale.dynamic_playlist_id = Some("playlist-old".into());
+
+        conn.execute("DELETE FROM playlists WHERE id = 'playlist-old'", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE settings SET dynamic_enabled = 0, dynamic_playlist_id = NULL, dynamic_current_wallpaper_id = NULL, dynamic_last_error = 'playlist deleted' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        let error = persist_user_settings(&mut conn, &stale).unwrap_err();
+        assert_eq!(error, "La playlist seleccionada ya no existe");
+
+        let persisted: (i32, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT dynamic_enabled, dynamic_playlist_id, dynamic_last_error FROM settings WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, (0, None, Some("playlist deleted".into())));
+    }
 }
