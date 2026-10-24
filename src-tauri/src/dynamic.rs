@@ -258,7 +258,22 @@ fn apply_next(
                     };
                 match animated_wallpaper::wait_for_activation(&handle, Duration::from_secs(30)) {
                     AnimatedActivationOutcome::Ready => {
-                        persist_monitor_rotation(&mut conn, &monitor_id, &next_id)?;
+                        if let Err(error) =
+                            persist_monitor_rotation(&mut conn, &monitor_id, &next_id)
+                        {
+                            let cleanup_error =
+                                animated_wallpaper::close_animated_activation(app, &handle)
+                                    .err()
+                                    .map(|error| format!("; cleanup: {error}"))
+                                    .unwrap_or_default();
+                            set_monitor_playlist_error(
+                                &conn,
+                                &monitor_id,
+                                &format!(
+                                    "Animated listo, pero no se pudo persistir la asignaciÃ³n: {error}{cleanup_error}"
+                                ),
+                            );
+                        }
                     }
                     AnimatedActivationOutcome::Pending => {
                         let cleanup_error =

@@ -533,7 +533,7 @@ pub fn activate_cursor(cursor_id: String) -> Result<(), String> {
         )
         .map_err(|_| "El cursor ya no existe".to_string())?;
     apply_system_cursor(Path::new(&path))?;
-    conn.execute("UPDATE settings SET cursor_enabled = 1, active_cursor_id = ?1 WHERE id = (SELECT id FROM settings LIMIT 1)", [&cursor_id]).map_err(|e| e.to_string())?;
+    conn.execute("UPDATE settings SET cursor_enabled = 1, active_cursor_id = ?1 WHERE id = (SELECT id FROM settings LIMIT 1)", [&cursor_id]).map_err(|error| format!("El cursor se aplicÃ³ en Windows, pero no se pudo persistir la selecciÃ³n: {error}"))?;
     Ok(())
 }
 
@@ -541,7 +541,7 @@ pub fn activate_cursor(cursor_id: String) -> Result<(), String> {
 pub fn restore_default_cursor() -> Result<(), String> {
     restore_system_cursor()?;
     let conn = get_connection().map_err(|e| e.to_string())?;
-    conn.execute("UPDATE settings SET cursor_enabled = 0, active_cursor_id = NULL WHERE id = (SELECT id FROM settings LIMIT 1)", []).map_err(|e| e.to_string())?;
+    conn.execute("UPDATE settings SET cursor_enabled = 0, active_cursor_id = NULL WHERE id = (SELECT id FROM settings LIMIT 1)", []).map_err(|error| format!("Windows restaurÃ³ el cursor predeterminado, pero no se pudo persistir el estado: {error}"))?;
     Ok(())
 }
 
@@ -564,7 +564,7 @@ pub fn delete_cursor(cursor_id: String) -> Result<(), String> {
         .unwrap_or(false);
     if active {
         restore_system_cursor()?;
-        conn.execute("UPDATE settings SET cursor_enabled = 0, active_cursor_id = NULL WHERE id = (SELECT id FROM settings LIMIT 1)", []).map_err(|e| e.to_string())?;
+        conn.execute("UPDATE settings SET cursor_enabled = 0, active_cursor_id = NULL WHERE id = (SELECT id FROM settings LIMIT 1)", []).map_err(|error| format!("Windows restaurÃ³ el cursor predeterminado, pero no se pudo persistir la eliminaciÃ³n: {error}"))?;
     }
     conn.execute("DELETE FROM cursor_resources WHERE id = ?1", [&cursor_id])
         .map_err(|e| e.to_string())?;
