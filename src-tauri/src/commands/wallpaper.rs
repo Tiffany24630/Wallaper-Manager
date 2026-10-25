@@ -390,6 +390,20 @@ pub async fn set_active_wallpaper(
     })
 }
 
+pub(crate) fn read_scaling_mode(conn: &rusqlite::Connection) -> Result<wallpaper::Mode, String> {
+    let value: String = conn
+        .query_row("SELECT scaling_mode FROM settings LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| format!("No se pudo leer scaling_mode desde SQLite: {error}"))?;
+    Ok(match value.as_str() {
+        "fit" => wallpaper::Mode::Fit,
+        "stretch" => wallpaper::Mode::Stretch,
+        "center" => wallpaper::Mode::Center,
+        _ => wallpaper::Mode::Crop,
+    })
+}
+
 fn set_active_wallpaper_on_monitor(
     wallpaper_id: &str,
     monitor_id: &str,
@@ -405,17 +419,7 @@ fn set_active_wallpaper_on_monitor(
     ensure_asset_available(path)?;
 
     let mut conn = get_connection().map_err(|e| e.to_string())?;
-    let scaling_mode: String = conn
-        .query_row("SELECT scaling_mode FROM settings LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap_or_else(|_| "fill".into());
-    let mode = match scaling_mode.as_str() {
-        "fit" => wallpaper::Mode::Fit,
-        "stretch" => wallpaper::Mode::Stretch,
-        "center" => wallpaper::Mode::Center,
-        _ => wallpaper::Mode::Crop,
-    };
+    let mode = read_scaling_mode(&conn)?;
     wallpaper::set_mode(mode)
         .map_err(|e| format!("Windows no pudo cambiar el modo de ajuste: {e}"))?;
 
@@ -485,17 +489,7 @@ pub(crate) fn set_active_wallpaper_internal(wallpaper_id: String) -> Result<(), 
         )
         .map_err(|_| "El fondo ya no existe en la biblioteca".to_string())?;
     ensure_asset_available(&path)?;
-    let scaling_mode: String = conn
-        .query_row("SELECT scaling_mode FROM settings LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap_or_else(|_| "fill".into());
-    let mode = match scaling_mode.as_str() {
-        "fit" => wallpaper::Mode::Fit,
-        "stretch" => wallpaper::Mode::Stretch,
-        "center" => wallpaper::Mode::Center,
-        _ => wallpaper::Mode::Crop,
-    };
+    let mode = read_scaling_mode(&conn)?;
     let operations = reserve_static_for_all_monitors()?;
     if let Err(error) = wallpaper::set_mode(mode)
         .map_err(|e| format!("Windows no pudo cambiar el modo de ajuste: {e}"))
@@ -1108,6 +1102,53 @@ fn realesrgan_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     }
 }
 
+#[derive(Debug)]
+struct RealEsrganResources {
+    directory: PathBuf,
+    executable: PathBuf,
+}
+
+fn resolve_realesrgan_resources(
+    app: &tauri::AppHandle,
+    model: &str,
+) -> Result<RealEsrganResources, String> {
+    let directory = realesrgan_dir(app)?;
+    validate_realesrgan_resources(&directory, model)?;
+    let executable = directory.join("realesrgan-ncnn-vulkan.exe");
+    Ok(RealEsrganResources {
+        directory,
+        executable,
+    })
+}
+
+fn validate_realesrgan_resources(directory: &Path, model: &str) -> Result<(), String> {
+    let executable = directory.join("realesrgan-ncnn-vulkan.exe");
+    if !executable.is_file() {
+        return Err(format!(
+            "No se encontrÃ³ el ejecutable Real-ESRGAN en {}",
+            executable.display()
+        ));
+    }
+    let dll = directory.join("vcomp140.dll");
+    if !dll.is_file() {
+        return Err(format!(
+            "Falta la DLL requerida de Real-ESRGAN: {}",
+            dll.display()
+        ));
+    }
+    let model_directory = directory.join("models");
+    for extension in ["bin", "param"] {
+        let path = model_directory.join(format!("{model}.{extension}"));
+        if !path.is_file() {
+            return Err(format!(
+                "Falta el modelo Real-ESRGAN requerido: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn target_dimensions(width: u32, height: u32, scale: u8) -> Result<(u32, u32), String> {
     let target_width = width
         .checked_mul(scale as u32)
@@ -1263,17 +1304,68 @@ impl Drop for EnhancementJobGuard {
 
 struct TemporaryOutput {
     path: PathBuf,
+    cleaned: bool,
 }
 
 impl TemporaryOutput {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            cleaned: false,
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        self.cleanup_with(|path| fs::remove_file(path))
+    }
+
+    fn cleanup_with<F>(&mut self, remove: F) -> Result<(), String>
+    where
+        F: FnOnce(&Path) -> std::io::Result<()>,
+    {
+        if self.cleaned {
+            return Ok(());
+        }
+        match remove(&self.path) {
+            Ok(()) => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "No se pudo limpiar el temporal de mejora {}: {error}",
+                self.path.display()
+            )),
+        }
     }
 }
 
 impl Drop for TemporaryOutput {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if !self.cleaned {
+            if let Err(error) = self.cleanup() {
+                eprintln!("{error}");
+            }
+        }
+    }
+}
+
+fn combine_operation_and_cleanup<T>(
+    operation: Result<T, String>,
+    cleanup: Result<(), String>,
+) -> Result<T, String> {
+    match (operation, cleanup) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(_), Err(cleanup_error)) => Err(format!(
+            "La mejora se completÃ³ y se persistiÃ³, pero la limpieza del temporal fallÃ³: {cleanup_error}"
+        )),
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Err(operation_error), Err(cleanup_error)) => Err(format!(
+            "{operation_error}; ademÃ¡s, la limpieza del temporal fallÃ³: {cleanup_error}"
+        )),
     }
 }
 
@@ -1324,6 +1416,15 @@ fn run_realesrgan(
         .map_err(|e| format!("No se pudo recoger la salida de Real-ESRGAN: {e}"))
 }
 
+fn realesrgan_process_failure(output: &Output) -> String {
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if detail.is_empty() {
+        "Real-ESRGAN terminÃ³ con error de ejecuciÃ³n".into()
+    } else {
+        format!("Real-ESRGAN terminÃ³ con error de ejecuciÃ³n: {detail}")
+    }
+}
+
 #[tauri::command]
 pub fn upscale_wallpaper(
     app: tauri::AppHandle,
@@ -1365,29 +1466,33 @@ pub fn upscale_wallpaper(
         .map_err(|e| e.to_string())?
         .join("wallpapers/enhanced")
         .join(format!("{}-{scale}x.png", Uuid::new_v4()));
-    let _temporary_output = TemporaryOutput::new(output_path.clone());
-    let output_string = output_path.to_string_lossy().into_owned();
-    let scale_string = scale.to_string();
-    let source = image::open(&source_path)
-        .map_err(|e| format!("No se pudo abrir la imagen para mejorarla: {e}"))?;
-    let expected_dimensions = target_dimensions(source.width(), source.height(), scale)?;
-    job.running();
-    let mut used_ai = false;
-    let mut warning = None;
+    let mut temporary_output = TemporaryOutput::new(output_path.clone());
+    let operation = (|| -> Result<UpscaleResult, String> {
+        let output_string = output_path.to_string_lossy().into_owned();
+        let scale_string = scale.to_string();
+        let source = image::open(&source_path)
+            .map_err(|e| format!("No se pudo abrir la imagen para mejorarla: {e}"))?;
+        let expected_dimensions = target_dimensions(source.width(), source.height(), scale)?;
+        job.running();
+        let mut used_ai = false;
+        let mut warning = None;
 
-    if hardware_acceleration {
-        if let Ok(tool_dir) = realesrgan_dir(&app) {
-            let executable = tool_dir.join("realesrgan-ncnn-vulkan.exe");
-            if executable.is_file() {
-                let result = run_realesrgan(
-                    &executable,
-                    &tool_dir,
-                    &source_path,
-                    &output_string,
-                    model,
-                    &scale_string,
-                )?;
-                if result.status.success() {
+        if hardware_acceleration {
+            if let Ok(resources) = resolve_realesrgan_resources(&app, model) {
+                let tool_dir = resources.directory;
+                let executable = resources.executable;
+                if executable.is_file() {
+                    let result = run_realesrgan(
+                        &executable,
+                        &tool_dir,
+                        &source_path,
+                        &output_string,
+                        model,
+                        &scale_string,
+                    )?;
+                    if !result.status.success() {
+                        return Err(realesrgan_process_failure(&result));
+                    }
                     let valid_output = validate_generated_image(&output_path, expected_dimensions)
                         .is_ok()
                         && validate_ai_pixels(&output_path, expected_dimensions, &source).is_ok();
@@ -1397,82 +1502,87 @@ pub fn upscale_wallpaper(
                         warning = Some("Real-ESRGAN generÃ³ una salida invÃ¡lida; se usÃ³ el respaldo Lanczos.".into());
                     }
                 } else {
-                    let detail = String::from_utf8_lossy(&result.stderr).trim().to_string();
-                    warning = Some(if detail.is_empty() {
-                        "Real-ESRGAN no pudo ejecutarse; se usó el respaldo Lanczos.".into()
-                    } else {
-                        format!("Real-ESRGAN no pudo ejecutarse ({detail}); se usó el respaldo Lanczos.")
-                    });
+                    warning = Some(
+                        "No se encontró el ejecutable Real-ESRGAN; se usó el respaldo Lanczos."
+                            .into(),
+                    );
                 }
             } else {
                 warning = Some(
-                    "No se encontró el ejecutable Real-ESRGAN; se usó el respaldo Lanczos.".into(),
+                    "No se encontraron los recursos de Real-ESRGAN; se usó el respaldo Lanczos."
+                        .into(),
                 );
             }
         } else {
             warning = Some(
-                "No se encontraron los recursos de Real-ESRGAN; se usó el respaldo Lanczos.".into(),
+                "La aceleración por hardware está desactivada; se usó el respaldo Lanczos.".into(),
             );
         }
-    } else {
-        warning = Some(
-            "La aceleración por hardware está desactivada; se usó el respaldo Lanczos.".into(),
-        );
-    }
 
-    if !used_ai {
+        if hardware_acceleration && !used_ai {
+            if let Err(reason) = resolve_realesrgan_resources(&app, model) {
+                warning = Some(format!("{reason}; se usÃ³ el respaldo Lanczos."));
+            }
+        }
+
+        if !used_ai {
+            let _ = fs::remove_file(&output_path);
+            source
+                .resize_exact(
+                    expected_dimensions.0,
+                    expected_dimensions.1,
+                    FilterType::Lanczos3,
+                )
+                .save(&output_path)
+                .map_err(|e| format!("No se pudo guardar la imagen mejorada: {e}"))?;
+            validate_generated_image(&output_path, expected_dimensions)?;
+        }
+
+        let current_hash = file_hash(&source_path)?;
+        if current_hash != source_hash {
+            return Err(
+                "El wallpaper de origen cambió durante la mejora; no se registró el resultado"
+                    .into(),
+            );
+        }
+
+        let stem = Path::new(&original_name)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let method = if used_ai { "IA" } else { "Lanczos" };
+        let new_id = match import_file_with_parent(
+            &output_path,
+            Some(format!("{stem} · mejorado {scale}x ({method})")),
+            Some(&source_id),
+        ) {
+            Ok(id) => id,
+            Err(error) => return Err(error),
+        };
         let _ = fs::remove_file(&output_path);
-        source
-            .resize_exact(
-                expected_dimensions.0,
-                expected_dimensions.1,
-                FilterType::Lanczos3,
-            )
-            .save(&output_path)
-            .map_err(|e| format!("No se pudo guardar la imagen mejorada: {e}"))?;
-        validate_generated_image(&output_path, expected_dimensions)?;
-    }
-
-    let current_hash = file_hash(&source_path)?;
-    if current_hash != source_hash {
-        return Err(
-            "El wallpaper de origen cambió durante la mejora; no se registró el resultado".into(),
-        );
-    }
-
-    let stem = Path::new(&original_name)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let method = if used_ai { "IA" } else { "Lanczos" };
-    let new_id = match import_file_with_parent(
-        &output_path,
-        Some(format!("{stem} · mejorado {scale}x ({method})")),
-        Some(&source_id),
-    ) {
-        Ok(id) => id,
-        Err(error) => return Err(error),
-    };
-    let _ = fs::remove_file(&output_path);
-    job.complete();
-    Ok(UpscaleResult {
-        job_id: job.job_id.clone(),
-        state: job.state.clone(),
-        id: new_id,
-        method: method.into(),
-        warning,
-    })
+        job.complete();
+        Ok(UpscaleResult {
+            job_id: job.job_id.clone(),
+            state: job.state.clone(),
+            id: new_id,
+            method: method.into(),
+            warning,
+        })
+    })();
+    let cleanup = temporary_output.cleanup();
+    combine_operation_and_cleanup(operation, cleanup)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_wallpaper_references, compensate_import_failure, ensure_asset_available,
-        ensure_rotatable_resource_type, persist_active_wallpaper,
-        persist_monitor_wallpaper_assignment, remove_owned_file, rename_wallpaper_in_connection,
-        replace_validated_image, rotate_image, target_dimensions, validate_ai_pixels,
-        validate_generated_image, validate_imported_copy, validate_wallpaper_name,
-        wallpaper_assigned_monitors, EnhancementJobGuard, EnhancementJobState, TemporaryOutput,
+        clear_wallpaper_references, combine_operation_and_cleanup, compensate_import_failure,
+        ensure_asset_available, ensure_rotatable_resource_type, persist_active_wallpaper,
+        persist_monitor_wallpaper_assignment, read_scaling_mode, realesrgan_process_failure,
+        remove_owned_file, rename_wallpaper_in_connection, replace_validated_image, rotate_image,
+        target_dimensions, validate_ai_pixels, validate_generated_image, validate_imported_copy,
+        validate_realesrgan_resources, validate_wallpaper_name, wallpaper_assigned_monitors,
+        EnhancementJobGuard, EnhancementJobState, TemporaryOutput,
     };
     use crate::models::wallpaper::WallpaperResourceType;
     use crate::utils::thumbnail::generate_thumbnail;
@@ -1482,6 +1592,42 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use uuid::Uuid;
+
+    #[test]
+    fn scaling_mode_reads_valid_configuration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE settings(scaling_mode TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO settings(scaling_mode) VALUES ('fit')", [])
+            .unwrap();
+
+        assert!(matches!(
+            read_scaling_mode(&conn).unwrap(),
+            wallpaper::Mode::Fit
+        ));
+    }
+
+    #[test]
+    fn scaling_mode_keeps_existing_policy_for_invalid_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE settings(scaling_mode TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO settings(scaling_mode) VALUES ('invalid')", [])
+            .unwrap();
+
+        assert!(matches!(
+            read_scaling_mode(&conn).unwrap(),
+            wallpaper::Mode::Crop
+        ));
+    }
+
+    #[test]
+    fn scaling_mode_does_not_turn_a_read_failure_into_fill() {
+        let conn = Connection::open_in_memory().unwrap();
+        let error = read_scaling_mode(&conn).unwrap_err();
+        assert!(error.contains("scaling_mode"));
+    }
 
     #[test]
     fn persists_active_wallpaper_atomically_in_sqlite() {
@@ -1870,5 +2016,69 @@ mod tests {
             let _temporary = TemporaryOutput::new(path.clone());
         }
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn validates_all_realesrgan_resources_before_starting_process() {
+        let directory =
+            std::env::temp_dir().join(format!("lumina-realesrgan-resources-{}", Uuid::new_v4()));
+        fs::create_dir_all(directory.join("models")).unwrap();
+
+        let missing_executable =
+            validate_realesrgan_resources(&directory, "realesrgan-x4plus").unwrap_err();
+        assert!(missing_executable.contains("ejecutable"));
+
+        fs::write(directory.join("realesrgan-ncnn-vulkan.exe"), b"test").unwrap();
+        let missing_dll =
+            validate_realesrgan_resources(&directory, "realesrgan-x4plus").unwrap_err();
+        assert!(missing_dll.contains("DLL"));
+
+        fs::write(directory.join("vcomp140.dll"), b"test").unwrap();
+        let missing_model =
+            validate_realesrgan_resources(&directory, "realesrgan-x4plus").unwrap_err();
+        assert!(missing_model.contains("modelo"));
+
+        fs::write(directory.join("models/realesrgan-x4plus.bin"), b"test").unwrap();
+        fs::write(directory.join("models/realesrgan-x4plus.param"), b"test").unwrap();
+        assert!(validate_realesrgan_resources(&directory, "realesrgan-x4plus").is_ok());
+        assert!(validate_realesrgan_resources(&directory, "realesr-animevideov3-x3").is_err());
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn explicit_temporary_cleanup_reports_filesystem_errors() {
+        let path = std::env::temp_dir().join(format!("lumina-cleanup-test-{}", Uuid::new_v4()));
+        let mut temporary = TemporaryOutput::new(path);
+        let error = temporary
+            .cleanup_with(|_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)))
+            .unwrap_err();
+        assert!(error.contains("limpiar el temporal"));
+    }
+
+    #[test]
+    fn operation_and_cleanup_errors_are_both_preserved() {
+        let error = combine_operation_and_cleanup::<()>(
+            Err("fallo de procesamiento".into()),
+            Err("fallo de limpieza".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("fallo de procesamiento"));
+        assert!(error.contains("fallo de limpieza"));
+
+        let error = combine_operation_and_cleanup::<()>(Ok(()), Err("fallo de limpieza".into()))
+            .unwrap_err();
+        assert!(error.contains("persistiÃ³"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_external_process_is_not_converted_to_lanczos_success() {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit", "7"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(realesrgan_process_failure(&output).contains("error de ejecuciÃ³n"));
     }
 }

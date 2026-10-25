@@ -218,6 +218,18 @@ pub fn app_data_dir() -> Result<PathBuf> {
         )))
 }
 
+fn resolve_database_path(path: Option<&Path>) -> Result<PathBuf> {
+    path.map(PathBuf::from).ok_or_else(|| {
+        rusqlite::Error::InvalidPath(PathBuf::from(
+            "DATABASE_PATH no inicializado; SQLite no estÃ¡ disponible",
+        ))
+    })
+}
+
+fn database_path() -> Result<PathBuf> {
+    resolve_database_path(DATABASE_PATH.get().map(|path| path.as_path()))
+}
+
 fn write_smoke_diagnostic(
     directory: &Path,
     token: &str,
@@ -278,10 +290,7 @@ pub fn record_smoke_diagnostic(stage: &str, detail: Option<&str>) -> Result<bool
 }
 
 pub fn get_connection() -> Result<Connection> {
-    let path = DATABASE_PATH
-        .get()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("lumina.db"));
+    let path = database_path()?;
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
@@ -473,7 +482,8 @@ fn backfill_cursor_hashes(conn: &Connection) -> Result<()> {
 mod tests {
     use super::{
         backfill_cursor_hashes, physical_operations_allowed_for_mode, resolve_data_dir,
-        smoke_exit_after_init_from_args, smoke_test_token_from_args, validate_smoke_token,
+        resolve_database_path, smoke_exit_after_init_from_args, smoke_test_token_from_args,
+        validate_smoke_token,
     };
     use rusqlite::Connection;
     use sha2::{Digest, Sha256};
@@ -529,6 +539,24 @@ mod tests {
     fn production_mode_keeps_the_requested_data_directory() {
         let production = std::env::temp_dir().join("lumina-production-contract");
         assert_eq!(resolve_data_dir(&production, None).unwrap(), production);
+    }
+
+    #[test]
+    fn uninitialized_database_path_fails_without_relative_fallback() {
+        let error = resolve_database_path(None).unwrap_err();
+        assert!(error.to_string().contains("DATABASE_PATH no inicializado"));
+    }
+
+    #[test]
+    fn initialized_database_path_helper_preserves_isolated_path() {
+        let isolated =
+            std::env::temp_dir().join(format!("lumina-database-path-{}", std::process::id()));
+        let resolved = resolve_database_path(Some(&isolated)).unwrap();
+        assert_eq!(resolved, isolated);
+        let connection = Connection::open(&resolved).unwrap();
+        drop(connection);
+        assert!(resolved.is_file());
+        fs::remove_file(resolved).unwrap();
     }
 
     #[test]

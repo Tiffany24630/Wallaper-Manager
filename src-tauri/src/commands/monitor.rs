@@ -175,17 +175,7 @@ pub fn restore_monitor_wallpapers(app: &tauri::AppHandle) -> Result<(), String> 
         }
         assignments
     };
-    let scaling_mode: String = conn
-        .query_row("SELECT scaling_mode FROM settings LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap_or_else(|_| "fill".into());
-    let mode = match scaling_mode.as_str() {
-        "fit" => wallpaper::Mode::Fit,
-        "stretch" => wallpaper::Mode::Stretch,
-        "center" => wallpaper::Mode::Center,
-        _ => wallpaper::Mode::Crop,
-    };
+    let mode = crate::commands::wallpaper::read_scaling_mode(&conn)?;
     let assignments = restorable_assignments(&ids, &assignments);
     if assignments.is_empty() && restore_errors.is_empty() {
         return Ok(());
@@ -293,17 +283,7 @@ pub fn assign_wallpaper_to_monitor(
             |row| row.get(0),
         )
         .map_err(|_| "No se encontró el fondo seleccionado".to_string())?;
-    let scaling_mode: String = conn
-        .query_row("SELECT scaling_mode FROM settings LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap_or_else(|_| "fill".into());
-    let mode = match scaling_mode.as_str() {
-        "fit" => wallpaper::Mode::Fit,
-        "stretch" => wallpaper::Mode::Stretch,
-        "center" => wallpaper::Mode::Center,
-        _ => wallpaper::Mode::Crop,
-    };
+    let mode = crate::commands::wallpaper::read_scaling_mode(&conn)?;
     wallpaper::set_mode(mode)
         .map_err(|e| format!("Windows no pudo cambiar el modo de ajuste: {e}"))?;
     let identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;

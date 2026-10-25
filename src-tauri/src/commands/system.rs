@@ -1,4 +1,5 @@
 use crate::db::get_connection;
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::sync::{Mutex, OnceLock};
 use sysinfo::{Disks, System};
@@ -61,22 +62,8 @@ pub fn get_system_info() -> Result<SystemInfo, String> {
 
     let conn = get_connection().map_err(|e| e.to_string())?;
 
-    let wallpaper_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM wallpapers", [], |row| row.get(0))
-        .unwrap_or(0);
-
-    let active_wallpaper: Option<String> = conn
-        .query_row(
-            "
-            SELECT name
-            FROM wallpapers
-            WHERE active = 1
-            LIMIT 1
-            ",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
+    let wallpaper_count = wallpaper_count(&conn)?;
+    let active_wallpaper = active_wallpaper(&conn)?;
 
     Ok(SystemInfo {
         cpu_usage: system.global_cpu_info().cpu_usage().clamp(0.0, 100.0),
@@ -99,13 +86,45 @@ pub fn get_system_info() -> Result<SystemInfo, String> {
     })
 }
 
+fn wallpaper_count(conn: &rusqlite::Connection) -> Result<i64, String> {
+    conn.query_row("SELECT COUNT(*) FROM wallpapers", [], |row| row.get(0))
+        .map_err(|error| format!("No se pudo consultar el número de wallpapers: {error}"))
+}
+
+fn active_wallpaper(conn: &rusqlite::Connection) -> Result<Option<String>, String> {
+    conn.query_row(
+        "
+        SELECT name
+        FROM wallpapers
+        WHERE active = 1
+        LIMIT 1
+        ",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| format!("No se pudo consultar el wallpaper activo: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::used_storage;
+    use super::{active_wallpaper, used_storage, wallpaper_count};
+    use rusqlite::Connection;
 
     #[test]
     fn storage_usage_never_underflows() {
         assert_eq!(used_storage(1_000, 250), 750);
         assert_eq!(used_storage(250, 1_000), 0);
+    }
+
+    #[test]
+    fn empty_library_is_distinguished_from_query_failure() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE wallpapers(name TEXT, active INTEGER)", [])
+            .unwrap();
+
+        assert_eq!(wallpaper_count(&conn).unwrap(), 0);
+        assert_eq!(active_wallpaper(&conn).unwrap(), None);
+        assert!(wallpaper_count(&Connection::open_in_memory().unwrap()).is_err());
     }
 }

@@ -2,7 +2,7 @@ use crate::{
     animated_wallpaper::{self, AnimatedActivationOutcome},
     commands::monitor::current_monitor_ids,
     commands::settings::DYNAMIC_INTERVALS,
-    commands::wallpaper::set_active_wallpaper_internal,
+    commands::wallpaper::{read_scaling_mode, set_active_wallpaper_internal},
     db::get_connection,
     models::monitor_assignment::{MonitorIdentity, WallpaperBackend},
     models::wallpaper_coordinator,
@@ -195,7 +195,7 @@ fn apply_next(
     };
     if !monitor_assignments.is_empty() {
         let current_monitor_ids = app_handle.map(current_monitor_ids);
-        wallpaper::set_mode(scaling_mode(&conn))
+        wallpaper::set_mode(read_scaling_mode(&conn)?)
             .map_err(|e| format!("No se pudo cambiar el modo de ajuste: {e}"))?;
         for (monitor_id, playlist_id, current_id) in monitor_assignments {
             match &current_monitor_ids {
@@ -470,21 +470,6 @@ fn wallpaper_is_animated(conn: &rusqlite::Connection, wallpaper_id: &str) -> Res
         )
         .map_err(|e| e.to_string())?;
     Ok(resource_type == "animated")
-}
-
-fn scaling_mode(conn: &rusqlite::Connection) -> wallpaper::Mode {
-    match conn
-        .query_row("SELECT scaling_mode FROM settings LIMIT 1", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .unwrap_or_else(|_| "fill".into())
-        .as_str()
-    {
-        "fit" => wallpaper::Mode::Fit,
-        "stretch" => wallpaper::Mode::Stretch,
-        "center" => wallpaper::Mode::Center,
-        _ => wallpaper::Mode::Crop,
-    }
 }
 
 fn wait_for_next_cycle(

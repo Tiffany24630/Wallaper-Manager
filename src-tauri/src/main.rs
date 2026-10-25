@@ -24,6 +24,23 @@ fn smoke_diagnostic(stage: &str, detail: Option<String>) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::minimize_to_tray_value;
+
+    #[test]
+    fn minimize_to_tray_preserves_persisted_boolean() {
+        assert_eq!(minimize_to_tray_value(Ok(1)).unwrap(), true);
+        assert_eq!(minimize_to_tray_value(Ok(0)).unwrap(), false);
+    }
+
+    #[test]
+    fn minimize_to_tray_does_not_hide_read_errors() {
+        let error = minimize_to_tray_value(Err("sqlite unavailable".into())).unwrap_err();
+        assert_eq!(error, "sqlite unavailable");
+    }
+}
+
 fn smoke_thread_detail() -> serde_json::Value {
     serde_json::json!({
         "thread_id": format!("{:?}", std::thread::current().id()),
@@ -253,15 +270,19 @@ fn request_smoke_exit(
     Ok(())
 }
 
-fn should_minimize_to_tray() -> bool {
-    db::get_connection()
-        .and_then(|connection| {
-            connection.query_row("SELECT minimize_to_tray FROM settings LIMIT 1", [], |row| {
-                row.get::<_, i32>(0)
-            })
+fn should_minimize_to_tray() -> Result<bool, String> {
+    let connection = db::get_connection()
+        .map_err(|error| format!("No se pudo leer la preferencia minimize_to_tray: {error}"))?;
+    let value = connection
+        .query_row("SELECT minimize_to_tray FROM settings LIMIT 1", [], |row| {
+            row.get::<_, i32>(0)
         })
-        .map(|value| value == 1)
-        .unwrap_or(true)
+        .map_err(|error| format!("No se pudo leer la preferencia minimize_to_tray: {error}"))?;
+    minimize_to_tray_value(Ok(value))
+}
+
+fn minimize_to_tray_value(value: Result<i32, String>) -> Result<bool, String> {
+    value.map(|value| value == 1)
 }
 
 fn shutdown_runtime(app: &tauri::AppHandle, scheduler: &DynamicScheduler) {
@@ -415,9 +436,16 @@ fn main() {
                     };
                     smoke_diagnostic(stage, None);
                     if let WindowEvent::CloseRequested { api, .. } = event {
-                        if should_minimize_to_tray() {
-                            api.prevent_close();
-                            let _ = window_for_close.hide();
+                        match should_minimize_to_tray() {
+                            Ok(true) => {
+                                api.prevent_close();
+                                let _ = window_for_close.hide();
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                eprintln!("No se pudo decidir minimizar al tray; se permite el cierre: {error}");
+                                smoke_diagnostic("minimize_to_tray_read_failed", Some(error));
+                            }
                         }
                     }
                 });
@@ -560,9 +588,16 @@ fn main() {
                                 };
                                 smoke_diagnostic(stage, None);
                                 if let WindowEvent::CloseRequested { api, .. } = event {
-                                    if should_minimize_to_tray() {
-                                        api.prevent_close();
-                                        let _ = window_for_close.hide();
+                                    match should_minimize_to_tray() {
+                                        Ok(true) => {
+                                            api.prevent_close();
+                                            let _ = window_for_close.hide();
+                                        }
+                                        Ok(false) => {}
+                                        Err(error) => {
+                                            eprintln!("No se pudo decidir minimizar al tray; se permite el cierre: {error}");
+                                            smoke_diagnostic("minimize_to_tray_read_failed", Some(error));
+                                        }
                                     }
                                 }
                             });
