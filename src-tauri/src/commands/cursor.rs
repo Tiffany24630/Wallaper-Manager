@@ -5,7 +5,7 @@ use std::{fs, path::Path};
 use uuid::Uuid;
 
 use crate::{
-    db::{app_data_dir, get_connection},
+    db::{app_data_dir, ensure_physical_operations_allowed, get_connection},
     models::cursor::CursorResource,
     utils::thumbnail::generate_thumbnail,
 };
@@ -496,6 +496,7 @@ fn restore_system_cursor() -> Result<(), String> {
 }
 
 pub fn restore_active_cursor() -> Result<(), String> {
+    ensure_physical_operations_allowed()?;
     let conn = get_connection().map_err(|e| e.to_string())?;
     let active: Option<String> = conn
         .query_row(
@@ -524,6 +525,7 @@ fn restore_system_cursor() -> Result<(), String> {
 
 #[tauri::command]
 pub fn activate_cursor(cursor_id: String) -> Result<(), String> {
+    ensure_physical_operations_allowed()?;
     let conn = get_connection().map_err(|e| e.to_string())?;
     let path: String = conn
         .query_row(
@@ -539,6 +541,7 @@ pub fn activate_cursor(cursor_id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn restore_default_cursor() -> Result<(), String> {
+    ensure_physical_operations_allowed()?;
     restore_system_cursor()?;
     let conn = get_connection().map_err(|e| e.to_string())?;
     conn.execute("UPDATE settings SET cursor_enabled = 0, active_cursor_id = NULL WHERE id = (SELECT id FROM settings LIMIT 1)", []).map_err(|error| format!("Windows restaurÃ³ el cursor predeterminado, pero no se pudo persistir el estado: {error}"))?;
@@ -563,6 +566,7 @@ pub fn delete_cursor(cursor_id: String) -> Result<(), String> {
         )
         .unwrap_or(false);
     if active {
+        ensure_physical_operations_allowed()?;
         restore_system_cursor()?;
         conn.execute("UPDATE settings SET cursor_enabled = 0, active_cursor_id = NULL WHERE id = (SELECT id FROM settings LIMIT 1)", []).map_err(|error| format!("Windows restaurÃ³ el cursor predeterminado, pero no se pudo persistir la eliminaciÃ³n: {error}"))?;
     }

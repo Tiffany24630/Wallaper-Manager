@@ -1,5 +1,5 @@
 use crate::{
-    db::get_connection,
+    db::{ensure_physical_operations_allowed, get_connection},
     dynamic::DynamicScheduler,
     models::monitor::MonitorInfo,
     models::monitor_assignment::{
@@ -150,6 +150,7 @@ pub fn get_monitors(app: tauri::AppHandle) -> Result<Vec<MonitorInfo>, String> {
 }
 
 pub fn restore_monitor_wallpapers(app: &tauri::AppHandle) -> Result<(), String> {
+    ensure_physical_operations_allowed()?;
     let ids = current_monitor_ids(app)?;
     if ids.is_empty() {
         return Ok(());
@@ -276,6 +277,7 @@ pub fn assign_wallpaper_to_monitor(
     wallpaper_id: String,
     scheduler: State<'_, DynamicScheduler>,
 ) -> Result<(), String> {
+    ensure_physical_operations_allowed()?;
     let mut manual_operation = scheduler.begin_manual_operation();
     if !current_monitor_ids(&app)?
         .iter()

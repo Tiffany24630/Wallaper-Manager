@@ -836,6 +836,7 @@ async fn open_animated_surface(
     diagnostic: bool,
     wallpaper_id: Option<String>,
 ) -> Result<AnimatedActivationHandle, String> {
+    crate::db::ensure_physical_operations_allowed()?;
     let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
     let source = PathBuf::from(media_path);
     let format = validate_media_source(&source)?;

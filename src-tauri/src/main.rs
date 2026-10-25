@@ -232,6 +232,27 @@ fn record_smoke_diagnostic(stage: String, detail: Option<String>) -> Result<bool
     db::record_smoke_diagnostic(&stage, detail.as_deref())
 }
 
+#[tauri::command]
+fn request_smoke_exit(
+    app: tauri::AppHandle,
+    token: String,
+    reason: Option<String>,
+    code: Option<i32>,
+) -> Result<(), String> {
+    db::smoke_token_matches(&token)?;
+    let reason = reason.unwrap_or_else(|| "requested".into());
+    if reason.len() > 256 {
+        return Err("El motivo de salida smoke es demasiado largo".into());
+    }
+    let code = code.unwrap_or(0);
+    smoke_diagnostic(
+        "smoke_exit_requested",
+        Some(serde_json::json!({ "reason": reason, "code": code }).to_string()),
+    );
+    app.exit(code);
+    Ok(())
+}
+
 fn should_minimize_to_tray() -> bool {
     db::get_connection()
         .and_then(|connection| {
@@ -278,6 +299,13 @@ fn shutdown_runtime(app: &tauri::AppHandle, scheduler: &DynamicScheduler) {
 fn main() {
     eprintln!("LUMINA_START main_entered");
     let smoke_mode = match db::smoke_mode_requested() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("LUMINA_SMOKE_ARGUMENTS_INVALID error={error}");
+            return;
+        }
+    };
+    let smoke_exit_after_init = match db::smoke_exit_after_init_requested() {
         Ok(value) => value,
         Err(error) => {
             eprintln!("LUMINA_SMOKE_ARGUMENTS_INVALID error={error}");
@@ -336,15 +364,23 @@ fn main() {
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             eprintln!("WALLPAPER_COORDINATOR_READY");
             smoke_diagnostic("coordinator_initialized", None);
-            smoke_diagnostic("animated_startup_started", None);
-            if let Err(error) = animated_wallpaper::prepare_animated_startup(app.handle()) {
-                smoke_diagnostic("animated_startup_failed", Some(error.to_string()));
-                eprintln!("No se pudo preparar el arranque limpio del POC animado: {error}");
+            if smoke_mode {
+                smoke_diagnostic("animated_startup_skipped_smoke", None);
+            } else {
+                smoke_diagnostic("animated_startup_started", None);
+                if let Err(error) = animated_wallpaper::prepare_animated_startup(app.handle()) {
+                    smoke_diagnostic("animated_startup_failed", Some(error.to_string()));
+                    eprintln!("No se pudo preparar el arranque limpio del POC animado: {error}");
+                }
             }
-            smoke_diagnostic("cursor_restore_started", None);
-            if let Err(error) = restore_active_cursor() {
-                smoke_diagnostic("cursor_restore_failed", Some(error.clone()));
-                eprintln!("No se pudo restaurar el cursor activo: {error}");
+            if smoke_mode {
+                smoke_diagnostic("cursor_restore_skipped_smoke", None);
+            } else {
+                smoke_diagnostic("cursor_restore_started", None);
+                if let Err(error) = restore_active_cursor() {
+                    smoke_diagnostic("cursor_restore_failed", Some(error.clone()));
+                    eprintln!("No se pudo restaurar el cursor activo: {error}");
+                }
             }
             smoke_diagnostic("monitor_restore_started", None);
             if smoke_window_config.is_none() {
@@ -453,7 +489,14 @@ fn main() {
                             );
                             builder
                                 .data_directory(webview_data_dir)
-                                .initialization_script("window.__LUMINA_SMOKE__ = true;")
+                                .initialization_script(if smoke_exit_after_init {
+                                    format!(
+                                        "window.__LUMINA_SMOKE__ = true; window.__LUMINA_SMOKE_EXIT__ = true; window.__LUMINA_SMOKE_TOKEN__ = {};",
+                                        serde_json::to_string(&db::smoke_token().ok().flatten()).unwrap_or_else(|_| "null".into())
+                                    )
+                                } else {
+                                    "window.__LUMINA_SMOKE__ = true;".into()
+                                })
                                 .on_navigation(|url| {
                                     smoke_diagnostic(
                                         "webview_navigation_requested",
@@ -731,6 +774,7 @@ fn main() {
             animated_wallpaper::report_animated_ready,
             animated_wallpaper::report_animated_media_error,
             record_smoke_diagnostic,
+            request_smoke_exit,
         ])
         .plugin(tauri_plugin_dialog::init())
         .build(context);

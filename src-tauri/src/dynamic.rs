@@ -98,6 +98,9 @@ impl DynamicScheduler {
         if let Some(worker) = slot.take() {
             stop_worker(worker);
         }
+        if crate::db::smoke_mode_requested().unwrap_or(false) {
+            return;
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
         let thread_stop = Arc::clone(&stop);

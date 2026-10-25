@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     animated_wallpaper,
-    db::{app_data_dir, get_connection},
+    db::{app_data_dir, ensure_physical_operations_allowed, get_connection},
     models::wallpaper::{Wallpaper, WallpaperAsset, WallpaperResourceType, WallpaperThumbnail},
     utils::{hash::file_hash, thumbnail::generate_thumbnail},
 };
@@ -316,6 +316,7 @@ pub async fn set_active_wallpaper(
     monitor_id: Option<String>,
     scheduler: State<'_, DynamicScheduler>,
 ) -> Result<WallpaperApplyResult, String> {
+    ensure_physical_operations_allowed()?;
     let (resource_type, path): (String, String) = get_connection()
         .map_err(|e| e.to_string())?
         .query_row(
@@ -474,6 +475,7 @@ fn set_active_wallpaper_on_monitor(
 }
 
 pub(crate) fn set_active_wallpaper_internal(wallpaper_id: String) -> Result<(), String> {
+    ensure_physical_operations_allowed()?;
     let mut conn = get_connection().map_err(|e| e.to_string())?;
     let path: String = conn
         .query_row(
@@ -794,6 +796,7 @@ pub fn scan_wallpaper_folder() -> Result<(), String> {
 
 #[tauri::command]
 pub fn rotate_random_wallpaper(scheduler: State<'_, DynamicScheduler>) -> Result<(), String> {
+    ensure_physical_operations_allowed()?;
     let mut manual_operation = scheduler.begin_manual_operation();
     let conn = get_connection().map_err(|e| e.to_string())?;
     let mut stmt = conn

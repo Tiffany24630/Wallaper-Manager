@@ -65,6 +65,35 @@ pub fn smoke_mode_requested() -> Result<bool, String> {
     Ok(smoke_test_token_from_args(std::env::args())?.is_some())
 }
 
+pub fn smoke_token() -> Result<Option<String>, String> {
+    smoke_test_token_from_args(std::env::args())
+}
+
+pub fn smoke_exit_after_init_requested() -> Result<bool, String> {
+    let requested = std::env::args().any(|argument| argument == "--lumina-smoke-exit-after-init");
+    if requested && !smoke_mode_requested()? {
+        return Err("La salida smoke requiere un token smoke vÃ¡lido".into());
+    }
+    Ok(requested)
+}
+
+pub fn ensure_physical_operations_allowed() -> Result<(), String> {
+    if smoke_mode_requested()? {
+        Err("Las operaciones fÃ­sicas estÃ¡n bloqueadas en modo smoke".into())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn smoke_token_matches(token: &str) -> Result<(), String> {
+    let expected = smoke_test_token_from_args(std::env::args())?
+        .ok_or_else(|| "La salida smoke solo estÃ¡ disponible en modo smoke".to_string())?;
+    if expected != token {
+        return Err("El token smoke no pertenece a esta instancia".into());
+    }
+    Ok(())
+}
+
 pub fn prepare_smoke_webview_data_dir() -> Result<Option<PathBuf>, String> {
     let Some(token) = smoke_test_token_from_args(std::env::args())? else {
         return Ok(None);

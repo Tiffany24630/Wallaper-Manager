@@ -1360,6 +1360,7 @@ fn open_internal(
     variant: ZOrderVariant,
     desktop_host: Option<desktop_host::RawDesktopHost>,
 ) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     native_surface_closing().store(false, Ordering::Release);
     let active = native_surface()
         .lock()
@@ -1484,6 +1485,7 @@ fn open_physical_surface_internal(
     desktop_host: desktop_host::RawDesktopHost,
     remember_desired: bool,
 ) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     if multi_surfaces()
         .lock()
         .expect("multi surface mutex poisoned")
