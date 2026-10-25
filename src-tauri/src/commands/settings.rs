@@ -315,29 +315,31 @@ pub fn save_settings(
             return Err("Desactiva primero las playlists asignadas por monitor para usar el fondo dinámico global".into());
         }
     }
-    apply_launch_at_startup_and_persist(
-        settings.launch_at_startup,
-        startup::set_enabled,
-        startup::is_enabled,
-        || {
-            let mut conn = get_connection().map_err(|e| e.to_string())?;
-            persist_user_settings(&mut conn, &settings)
-        },
+    restart_scheduler_if_needed(
+        apply_launch_at_startup_and_persist(
+            settings.launch_at_startup,
+            startup::set_enabled,
+            startup::is_enabled,
+            || {
+                let mut conn = get_connection().map_err(|e| e.to_string())?;
+                persist_user_settings(&mut conn, &settings)
+            },
+        ),
+        || scheduler.restart(),
     )?;
-    scheduler.restart();
     Ok(())
 }
 
-fn apply_launch_at_startup_and_persist<SetStartup, ReadStartup, Persist>(
+fn apply_launch_at_startup_and_persist<SetStartup, ReadStartup, Persist, Persisted>(
     requested: bool,
     set_startup: SetStartup,
     read_startup: ReadStartup,
     persist: Persist,
-) -> Result<(), String>
+) -> Result<Persisted, String>
 where
     SetStartup: FnOnce(bool) -> Result<(), String>,
     ReadStartup: FnOnce() -> Result<bool, String>,
-    Persist: FnOnce() -> Result<(), String>,
+    Persist: FnOnce() -> Result<Persisted, String>,
 {
     set_startup(requested).map_err(|error| {
         format!("No se pudo actualizar el inicio automático de Lumina: {error}")
@@ -361,11 +363,39 @@ where
     })
 }
 
+fn restart_scheduler_if_needed(
+    dynamic_configuration_changed: Result<bool, String>,
+    restart: impl FnOnce(),
+) -> Result<(), String> {
+    if dynamic_configuration_changed? {
+        restart();
+    }
+    Ok(())
+}
+
+fn dynamic_configuration_changed(
+    previous: &(i32, Option<String>, u32),
+    settings: &Settings,
+) -> bool {
+    previous.0 != settings.dynamic_enabled as i32
+        || previous.1.as_deref() != settings.dynamic_playlist_id.as_deref()
+        || previous.2 != settings.dynamic_interval_minutes
+}
+
 fn persist_user_settings(
     conn: &mut rusqlite::Connection,
     settings: &Settings,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    let previous_dynamic: (i32, Option<String>, u32) = tx
+        .query_row(
+            "SELECT dynamic_enabled, dynamic_playlist_id, dynamic_interval_minutes FROM settings LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let dynamic_configuration_changed = dynamic_configuration_changed(&previous_dynamic, settings);
 
     // Re-check dynamic configuration inside the write transaction. The
     // validation performed by `save_settings` happens before opening this
@@ -443,13 +473,14 @@ fn persist_user_settings(
     .map_err(|e| e.to_string())?;
 
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(dynamic_configuration_changed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_launch_at_startup_and_persist, diagnose_dynamic_configuration, persist_user_settings,
+        apply_launch_at_startup_and_persist, diagnose_dynamic_configuration,
+        dynamic_configuration_changed, persist_user_settings, restart_scheduler_if_needed,
     };
     use crate::models::settings::Settings;
     use rusqlite::Connection;
@@ -556,6 +587,96 @@ mod tests {
             cursor_enabled: false,
             active_cursor_id: Some("stale-cursor".into()),
         }
+    }
+
+    #[test]
+    fn scheduler_restart_tracks_only_persisted_dynamic_configuration() {
+        let previous = (0, None, 10);
+        let mut next = settings_snapshot();
+
+        next.dynamic_enabled = true;
+        next.dynamic_playlist_id = Some("playlist-a".into());
+        assert!(dynamic_configuration_changed(&previous, &next));
+
+        let previous_enabled = (1, Some("playlist-a".into()), 10);
+        next = settings_snapshot();
+        assert!(dynamic_configuration_changed(&previous_enabled, &next));
+
+        next = settings_snapshot();
+        next.dynamic_playlist_id = Some("playlist-a".into());
+        assert!(dynamic_configuration_changed(&previous, &next));
+
+        next.dynamic_playlist_id = Some("playlist-b".into());
+        assert!(dynamic_configuration_changed(&previous_enabled, &next));
+
+        next = settings_snapshot();
+        next.dynamic_interval_minutes = 15;
+        assert!(dynamic_configuration_changed(&previous, &next));
+
+        next = settings_snapshot();
+        next.accent_color = "cyan".into();
+        next.ui_scale = 110;
+        next.cursor_enabled = true;
+        assert!(!dynamic_configuration_changed(&previous, &next));
+        assert!(!dynamic_configuration_changed(
+            &previous,
+            &settings_snapshot()
+        ));
+    }
+
+    #[test]
+    fn scheduler_restart_is_not_called_when_persistence_fails() {
+        let mut restarted = false;
+        let result = restart_scheduler_if_needed(Err("sqlite unavailable".into()), || {
+            restarted = true;
+        });
+
+        assert_eq!(result, Err("sqlite unavailable".into()));
+        assert!(!restarted);
+    }
+
+    #[test]
+    fn unchanged_dynamic_configuration_preserves_derived_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings(
+                id INTEGER PRIMARY KEY,
+                launch_at_startup INTEGER,
+                minimize_to_tray INTEGER,
+                hardware_acceleration INTEGER,
+                pause_on_battery INTEGER,
+                pause_when_maximized INTEGER,
+                scaling_mode TEXT,
+                accent_color TEXT,
+                ui_scale INTEGER,
+                dynamic_enabled INTEGER,
+                dynamic_playlist_id TEXT,
+                dynamic_interval_minutes INTEGER,
+                dynamic_current_wallpaper_id TEXT,
+                dynamic_last_error TEXT,
+                cursor_enabled INTEGER,
+                active_cursor_id TEXT
+            );
+            INSERT INTO settings VALUES
+                (1, 0, 1, 1, 0, 1, 'fill', 'violet', 100, 0, NULL, 10,
+                 'wallpaper-current', 'old error', 0, NULL);",
+        )
+        .unwrap();
+
+        let changed = persist_user_settings(&mut conn, &settings_snapshot()).unwrap();
+        assert!(!changed);
+
+        let derived: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT dynamic_current_wallpaper_id, dynamic_last_error FROM settings",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            derived,
+            (Some("wallpaper-current".into()), Some("old error".into()))
+        );
     }
 
     #[test]
