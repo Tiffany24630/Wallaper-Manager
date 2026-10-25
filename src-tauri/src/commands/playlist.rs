@@ -65,6 +65,34 @@ fn ensure_playlist_exists(conn: &rusqlite::Connection, playlist_id: &str) -> Res
     }
 }
 
+fn clear_deleted_playlist_references(
+    tx: &rusqlite::Transaction<'_>,
+    playlist_id: &str,
+) -> Result<(), String> {
+    for table in [
+        "playlist_wallpapers",
+        "monitor_playlists",
+        "sync_pending_playlist_items",
+    ] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE playlist_id = ?1"),
+            [playlist_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.execute(
+        "UPDATE settings
+         SET dynamic_enabled = 0,
+             dynamic_playlist_id = NULL,
+             dynamic_current_wallpaper_id = NULL,
+             dynamic_last_error = ?1
+         WHERE dynamic_playlist_id = ?2",
+        ("La lista del fondo dinámico fue eliminada", playlist_id),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn add_wallpaper_to_playlist(playlist_id: String, wallpaper_id: String) -> Result<(), String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
@@ -330,6 +358,8 @@ pub fn delete_playlist(
     ensure_playlist_exists(&conn, &playlist_id)?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
 
+    clear_deleted_playlist_references(&tx, &playlist_id)?;
+
     tx.execute(
         "
         DELETE FROM playlists
@@ -339,11 +369,6 @@ pub fn delete_playlist(
     )
     .map_err(|e| e.to_string())?;
 
-    tx.execute(
-        "UPDATE settings SET dynamic_enabled = 0, dynamic_playlist_id = NULL, dynamic_current_wallpaper_id = NULL, dynamic_last_error = ?1 WHERE dynamic_playlist_id = ?2",
-        ("La lista del fondo dinámico fue eliminada", &playlist_id),
-    )
-    .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     scheduler.restart();
 
@@ -427,8 +452,8 @@ fn normalize_playlist_positions(
 #[cfg(test)]
 mod tests {
     use super::{
-        insert_playlist_wallpaper, normalize_playlist_positions, reorder_playlist_in_connection,
-        validate_playlist_name,
+        clear_deleted_playlist_references, insert_playlist_wallpaper, normalize_playlist_positions,
+        reorder_playlist_in_connection, validate_playlist_name,
     };
     use rusqlite::Connection;
 
@@ -502,6 +527,102 @@ mod tests {
         assert_eq!(
             after_error,
             vec![("three".into(), 0), ("two".into(), 1), ("one".into(), 2)]
+        );
+    }
+
+    #[test]
+    fn deleting_playlist_clears_all_persistent_references_atomically() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE playlist_wallpapers(playlist_id TEXT, wallpaper_id TEXT, position INTEGER);
+             CREATE TABLE monitor_playlists(monitor_id TEXT PRIMARY KEY, playlist_id TEXT, current_wallpaper_id TEXT, last_error TEXT);
+             CREATE TABLE sync_pending_playlist_items(playlist_id TEXT, wallpaper_id TEXT);
+             CREATE TABLE settings(dynamic_enabled INTEGER, dynamic_playlist_id TEXT, dynamic_current_wallpaper_id TEXT, dynamic_last_error TEXT);
+             INSERT INTO playlist_wallpapers VALUES ('playlist-a', 'wallpaper-a', 0);
+             INSERT INTO monitor_playlists VALUES ('monitor-a', 'playlist-a', 'wallpaper-a', NULL);
+             INSERT INTO sync_pending_playlist_items VALUES ('playlist-a', 'wallpaper-missing');
+             INSERT INTO settings VALUES (1, 'playlist-a', 'wallpaper-a', NULL);",
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        clear_deleted_playlist_references(&tx, "playlist-a").unwrap();
+        tx.commit().unwrap();
+
+        for table in [
+            "playlist_wallpapers",
+            "monitor_playlists",
+            "sync_pending_playlist_items",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE playlist_id = 'playlist-a'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "references remain in {table}");
+        }
+        let settings: (i64, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT dynamic_enabled, dynamic_playlist_id, dynamic_current_wallpaper_id, dynamic_last_error FROM settings",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(settings.0, 0);
+        assert_eq!(settings.1, None);
+        assert_eq!(settings.2, None);
+        assert_eq!(
+            settings.3.as_deref(),
+            Some("La lista del fondo dinámico fue eliminada")
+        );
+    }
+
+    #[test]
+    fn deleting_monitor_playlist_preserves_assignments_and_other_monitors() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE playlist_wallpapers(playlist_id TEXT, wallpaper_id TEXT, position INTEGER);
+             CREATE TABLE monitor_playlists(monitor_id TEXT PRIMARY KEY, playlist_id TEXT, current_wallpaper_id TEXT, last_error TEXT);
+             CREATE TABLE sync_pending_playlist_items(playlist_id TEXT, wallpaper_id TEXT);
+             CREATE TABLE monitor_wallpapers(monitor_id TEXT PRIMARY KEY, wallpaper_id TEXT NOT NULL);
+             CREATE TABLE settings(dynamic_enabled INTEGER, dynamic_playlist_id TEXT, dynamic_current_wallpaper_id TEXT, dynamic_last_error TEXT);
+             INSERT INTO monitor_playlists VALUES ('monitor-a', 'playlist-a', 'wallpaper-a', NULL), ('monitor-b', 'playlist-b', 'wallpaper-b', NULL);
+             INSERT INTO monitor_wallpapers VALUES ('monitor-a', 'wallpaper-a'), ('monitor-b', 'wallpaper-b');
+             INSERT INTO settings VALUES (0, NULL, NULL, NULL);",
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        clear_deleted_playlist_references(&tx, "playlist-a").unwrap();
+        tx.commit().unwrap();
+
+        let monitor_playlists: Vec<(String, String)> = conn
+            .prepare("SELECT monitor_id, playlist_id FROM monitor_playlists ORDER BY monitor_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            monitor_playlists,
+            vec![("monitor-b".into(), "playlist-b".into())]
+        );
+
+        let assignments: Vec<(String, String)> = conn
+            .prepare("SELECT monitor_id, wallpaper_id FROM monitor_wallpapers ORDER BY monitor_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            assignments,
+            vec![
+                ("monitor-a".into(), "wallpaper-a".into()),
+                ("monitor-b".into(), "wallpaper-b".into())
+            ]
         );
     }
 }
