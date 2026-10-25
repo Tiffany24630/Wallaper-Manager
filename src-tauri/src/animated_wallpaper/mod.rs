@@ -1065,6 +1065,7 @@ async fn open_animated_surface(
 
 #[tauri::command]
 pub fn inspect_animated_desktop_host() -> Result<serde_json::Value, String> {
+    crate::db::ensure_physical_operations_allowed()?;
     #[cfg(target_os = "windows")]
     {
         let inspection = desktop_host::inspect_desktop_structure()?;
@@ -1080,6 +1081,7 @@ pub fn inspect_animated_desktop_host() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 pub fn validate_animated_desktop_host() -> Result<String, String> {
+    crate::db::ensure_physical_operations_allowed()?;
     #[cfg(target_os = "windows")]
     {
         let result = native_window::validate_registered_desktop_host()?;
@@ -1112,6 +1114,7 @@ pub fn open_native_animated_prototype_test(
     app: AppHandle,
     monitor_id: String,
 ) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     #[cfg(target_os = "windows")]
     {
         let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
@@ -1138,6 +1141,7 @@ pub fn open_native_animated_prototype_test(
 
 #[tauri::command]
 pub fn open_animated_desktop_poc(app: AppHandle, monitor_id: String) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     #[cfg(target_os = "windows")]
     {
         let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
@@ -1167,6 +1171,7 @@ pub fn open_animated_desktop_recovery_poc(
     app: AppHandle,
     monitor_id: String,
 ) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     #[cfg(target_os = "windows")]
     {
         let monitor_identity = MonitorIdentity::new(monitor_id.clone()).map_err(str::to_string)?;
@@ -1193,6 +1198,7 @@ pub fn open_animated_desktop_recovery_poc(
 
 #[cfg(target_os = "windows")]
 pub fn open_animated_lifecycle_poc(app: AppHandle, monitor_id: String) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     let window = app
         .get_webview_window("main")
         .ok_or("No se encontró la ventana principal de Lumina")?;
@@ -1314,6 +1320,7 @@ pub fn open_animated_lifecycle_poc(app: AppHandle, monitor_id: String) -> Result
 
 #[tauri::command]
 pub fn open_animated_multimonitor_poc(app: AppHandle) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     #[cfg(target_os = "windows")]
     {
         let window = app
@@ -1476,6 +1483,7 @@ pub fn open_animated_multimonitor_poc(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn open_animated_host_watcher_poc(app: AppHandle) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     #[cfg(target_os = "windows")]
     {
         let window = app
@@ -1524,6 +1532,7 @@ pub fn open_animated_host_watcher_poc(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn open_animated_multimonitor_physical_poc(app: AppHandle) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     #[cfg(target_os = "windows")]
     {
         let temporary_directory = prototype_directory(&app)?;
@@ -1686,6 +1695,7 @@ fn run_simulated_multimonitor_validation() -> Result<(), String> {
 
 #[tauri::command]
 pub fn close_native_animated_prototype() -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     #[cfg(target_os = "windows")]
     {
         return native_window::close();
@@ -1698,6 +1708,7 @@ pub fn close_native_animated_prototype() -> Result<(), String> {
 
 #[tauri::command]
 pub fn close_animated_multimonitor_physical_poc(monitor_id: String) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     #[cfg(target_os = "windows")]
     {
         let monitor_id = MonitorIdentity::new(monitor_id).map_err(str::to_string)?;
@@ -1715,6 +1726,7 @@ pub async fn open_animated_prototype_test(
     app: AppHandle,
     monitor_id: String,
 ) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     let path = prototype_directory(&app)?.join(format!("diagnostic-{}.gif", Uuid::new_v4()));
     create_diagnostic_gif(&path)?;
     let diagnostic = std::env::var_os("LUMINA_ANIMATED_SMOKE_WALLPAPER").is_none();
@@ -1731,6 +1743,7 @@ pub async fn open_animated_prototype_test(
 
 #[tauri::command]
 pub fn close_animated_prototype(app: AppHandle, monitor_id: String) -> Result<(), String> {
+    crate::db::ensure_physical_operations_allowed()?;
     let monitor_identity = MonitorIdentity::new(monitor_id).map_err(str::to_string)?;
     let label = prototype_surface_label(&monitor_identity);
     if let Some(window) = app.get_webview_window(&label) {

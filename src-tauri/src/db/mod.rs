@@ -65,11 +65,43 @@ pub fn smoke_mode_requested() -> Result<bool, String> {
     Ok(smoke_test_token_from_args(std::env::args())?.is_some())
 }
 
+fn physical_operations_allowed_for_mode(smoke_mode: bool) -> Result<(), String> {
+    if smoke_mode {
+        Err("physical operations are blocked in smoke mode".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn smoke_exit_after_init_from_args<I>(args: I) -> Result<bool, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let arguments = args.into_iter().collect::<Vec<_>>();
+    let requested = arguments
+        .iter()
+        .any(|argument| argument == "--lumina-smoke-exit-after-init");
+    if requested && smoke_test_token_from_args(arguments)?.is_none() {
+        return Err("smoke exit requires a valid smoke token".into());
+    }
+    Ok(requested)
+}
+
+fn validate_smoke_token(expected: Option<&str>, supplied: &str) -> Result<(), String> {
+    let expected = expected.ok_or_else(|| "smoke exit is not available".to_string())?;
+    if expected != supplied {
+        return Err("smoke token does not belong to this instance".into());
+    }
+    Ok(())
+}
+
 pub fn smoke_token() -> Result<Option<String>, String> {
     smoke_test_token_from_args(std::env::args())
 }
 
+#[allow(unreachable_code)]
 pub fn smoke_exit_after_init_requested() -> Result<bool, String> {
+    return smoke_exit_after_init_from_args(std::env::args());
     let requested = std::env::args().any(|argument| argument == "--lumina-smoke-exit-after-init");
     if requested && !smoke_mode_requested()? {
         return Err("La salida smoke requiere un token smoke vÃ¡lido".into());
@@ -77,7 +109,9 @@ pub fn smoke_exit_after_init_requested() -> Result<bool, String> {
     Ok(requested)
 }
 
+#[allow(unreachable_code)]
 pub fn ensure_physical_operations_allowed() -> Result<(), String> {
+    return physical_operations_allowed_for_mode(smoke_mode_requested()?);
     if smoke_mode_requested()? {
         Err("Las operaciones fÃ­sicas estÃ¡n bloqueadas en modo smoke".into())
     } else {
@@ -85,7 +119,12 @@ pub fn ensure_physical_operations_allowed() -> Result<(), String> {
     }
 }
 
+#[allow(unreachable_code)]
 pub fn smoke_token_matches(token: &str) -> Result<(), String> {
+    return validate_smoke_token(
+        smoke_test_token_from_args(std::env::args())?.as_deref(),
+        token,
+    );
     let expected = smoke_test_token_from_args(std::env::args())?
         .ok_or_else(|| "La salida smoke solo estÃ¡ disponible en modo smoke".to_string())?;
     if expected != token {
@@ -432,7 +471,10 @@ fn backfill_cursor_hashes(conn: &Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{backfill_cursor_hashes, resolve_data_dir, smoke_test_token_from_args};
+    use super::{
+        backfill_cursor_hashes, physical_operations_allowed_for_mode, resolve_data_dir,
+        smoke_exit_after_init_from_args, smoke_test_token_from_args, validate_smoke_token,
+    };
     use rusqlite::Connection;
     use sha2::{Digest, Sha256};
     use std::{
@@ -532,5 +574,33 @@ mod tests {
         )
         .is_err());
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn smoke_mode_blocks_physical_operations_but_production_allows_them() {
+        assert!(physical_operations_allowed_for_mode(true).is_err());
+        assert!(physical_operations_allowed_for_mode(false).is_ok());
+    }
+
+    #[test]
+    fn smoke_exit_flag_requires_a_valid_smoke_token() {
+        assert!(smoke_exit_after_init_from_args(vec![
+            "lumina.exe".into(),
+            "--lumina-smoke-exit-after-init".into(),
+        ])
+        .is_err());
+        assert!(smoke_exit_after_init_from_args(vec![
+            "lumina.exe".into(),
+            "--lumina-smoke-test=exit-test".into(),
+            "--lumina-smoke-exit-after-init".into(),
+        ])
+        .unwrap());
+    }
+
+    #[test]
+    fn smoke_exit_token_must_match_the_current_instance() {
+        assert!(validate_smoke_token(Some("expected"), "expected").is_ok());
+        assert!(validate_smoke_token(Some("expected"), "other").is_err());
+        assert!(validate_smoke_token(None, "expected").is_err());
     }
 }

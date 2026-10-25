@@ -98,7 +98,7 @@ impl DynamicScheduler {
         if let Some(worker) = slot.take() {
             stop_worker(worker);
         }
-        if crate::db::smoke_mode_requested().unwrap_or(false) {
+        if !scheduler_can_start_worker(crate::db::smoke_mode_requested().unwrap_or(false)) {
             return;
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -122,6 +122,10 @@ impl DynamicScheduler {
             stop_worker(worker);
         }
     }
+}
+
+fn scheduler_can_start_worker(smoke_mode: bool) -> bool {
+    !smoke_mode
 }
 
 fn stop_worker(worker: Worker) {
@@ -575,8 +579,8 @@ fn set_dynamic_error(error: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        persist_monitor_rotation, select_next_id, wait_for_next_cycle, DynamicScheduler,
-        DYNAMIC_INTERVALS,
+        persist_monitor_rotation, scheduler_can_start_worker, select_next_id, wait_for_next_cycle,
+        DynamicScheduler, DYNAMIC_INTERVALS,
     };
     use rusqlite::Connection;
     use std::sync::{atomic::AtomicBool, Arc, Condvar, Mutex};
@@ -684,5 +688,11 @@ mod tests {
         operation.complete();
         drop(operation);
         assert!(scheduler.apply_lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn smoke_scheduler_cannot_start_a_worker() {
+        assert!(!scheduler_can_start_worker(true));
+        assert!(scheduler_can_start_worker(false));
     }
 }

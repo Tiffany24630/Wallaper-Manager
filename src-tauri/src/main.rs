@@ -280,7 +280,12 @@ fn shutdown_runtime(app: &tauri::AppHandle, scheduler: &DynamicScheduler) {
     } else {
         eprintln!("WALLPAPER_COORDINATOR_SHUTDOWN_BEGIN_FAILED error=lock");
     }
-    let pending_surface_confirmations = animated_wallpaper::close_all_animated_prototypes(app);
+    let pending_surface_confirmations = if db::smoke_mode_requested().unwrap_or(false) {
+        smoke_diagnostic("animated_shutdown_skipped_smoke", None);
+        0
+    } else {
+        animated_wallpaper::close_all_animated_prototypes(app)
+    };
     if pending_surface_confirmations != 0 {
         eprintln!(
             "WALLPAPER_COORDINATOR_CLOSE_CONFIRMATION_PENDING count={pending_surface_confirmations}"
@@ -382,8 +387,10 @@ fn main() {
                     eprintln!("No se pudo restaurar el cursor activo: {error}");
                 }
             }
-            smoke_diagnostic("monitor_restore_started", None);
-            if smoke_window_config.is_none() {
+            if smoke_mode {
+                smoke_diagnostic("monitor_restore_skipped_smoke", None);
+            } else if smoke_window_config.is_none() {
+                smoke_diagnostic("monitor_restore_started", None);
                 if let Err(error) = restore_monitor_wallpapers(app.handle()) {
                 smoke_diagnostic("monitor_restore_failed", Some(error.clone()));
                 eprintln!("No se pudieron restaurar las asignaciones por monitor: {error}");
@@ -574,7 +581,7 @@ fn main() {
             if smoke_window_config.is_some() {
                 spawn_smoke_differential_windows(app.handle());
             }
-            if std::env::var_os("LUMINA_ANIMATED_SMOKE_TEST").is_some() {
+            if !smoke_mode && std::env::var_os("LUMINA_ANIMATED_SMOKE_TEST").is_some() {
                 let smoke_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let result = match animated_wallpaper::primary_monitor_identity(&smoke_handle) {
@@ -592,7 +599,7 @@ fn main() {
                     }
                 });
             }
-            if std::env::var_os("LUMINA_ANIMATED_MEDIA_ERROR_TEST").is_some() {
+            if !smoke_mode && std::env::var_os("LUMINA_ANIMATED_MEDIA_ERROR_TEST").is_some() {
                 let media_error_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let result =
@@ -611,6 +618,7 @@ fn main() {
                     }
                 });
             }
+            if !smoke_mode {
             if std::env::var_os("LUMINA_ANIMATED_NATIVE_MEDIA_ERROR_TEST").is_some() {
                 let monitor_id =
                     animated_wallpaper::primary_monitor_identity(app.handle()).unwrap_or_default();
@@ -690,6 +698,7 @@ fn main() {
                     Ok(message) => eprintln!("Animated host monitor result: {message}"),
                     Err(error) => eprintln!("Animated host monitor failed: {error}"),
                 }
+            }
             }
             if let Some(window) = window.as_ref() {
                 record_main_window_state(window, "main_window_state_after_tray");
