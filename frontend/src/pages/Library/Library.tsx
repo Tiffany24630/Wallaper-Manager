@@ -20,6 +20,7 @@ export default function Library() {
   const [monitors, setMonitors] = useState<Awaited<ReturnType<typeof monitorService.getAll>>>([]);
   const [monitorId, setMonitorId] = useState("");
   const [monitorWallpapers, setMonitorWallpapers] = useState<Awaited<ReturnType<typeof monitorService.getWallpapers>>>([]);
+  const [monitorError, setMonitorError] = useState<string | null>(null);
   useEffect(() => { void store.loadWallpapers(); }, [store.loadWallpapers]);
   useEffect(() => {
     let active = true;
@@ -50,7 +51,8 @@ export default function Library() {
         if (selected) localStorage.setItem("lumina.library.monitor", selected);
         return selected;
       });
-    }).catch(() => { setMonitors([]); setMonitorWallpapers([]); });
+      setMonitorError(null);
+    }).catch(error => setMonitorError(String(error)));
   }, []);
   useEffect(() => {
     if (!deleteTarget) return;
@@ -175,7 +177,7 @@ export default function Library() {
         <button className="btn btn-primary" disabled={busy} onClick={() => void importAndOfferEnhancement()}><ImagePlus size={17}/> {busy ? "Procesando…" : "Importar imágenes"}</button>
       </div>
     </header>
-    {(store.error || message) && <div className={store.error || message?.startsWith("Error:") ? "status-error" : "status-success"}>{store.error || message}</div>}
+    {(store.error || monitorError || message) && <div className={store.error || monitorError || message?.startsWith("Error:") ? "status-error" : "status-success"}>{store.error || monitorError || message}</div>}
     <div className="panel flex flex-wrap items-center gap-3 p-3">
       <label className="relative min-w-[220px] flex-1"><Search size={16} className="absolute left-3 top-3.5 text-slate-500"/><input className="input pl-10" value={query} onChange={e => setQuery(e.target.value)} placeholder="Buscar por nombre…" /></label>
       <button className={`btn ${favorites ? "bg-rose-500/15 text-rose-200" : ""}`} onClick={() => setFavorites(v => !v)}>Favoritos {favorites ? "activados" : ""}</button>
@@ -184,7 +186,7 @@ export default function Library() {
       </select>
       <span className="px-2 text-sm muted">{visible.length} de {store.wallpapers.length}</span>
     </div>
-    {store.loading ? <div className="empty">Cargando biblioteca…</div> : visible.length === 0 ? <div className="empty"><ImagePlus className="mx-auto mb-3"/> {store.wallpapers.length ? "No hay coincidencias." : "Todavía no hay fondos. Importa tu primera imagen para comenzar."}</div> :
+    {store.loading ? <div className="empty">Cargando biblioteca…</div> : store.error ? <div className="empty">No se pudo cargar la biblioteca. Revisa el error anterior y vuelve a intentarlo.</div> : visible.length === 0 ? <div className="empty"><ImagePlus className="mx-auto mb-3"/> {store.wallpapers.length ? "No hay coincidencias." : "Todavía no hay fondos. Importa tu primera imagen para comenzar."}</div> :
       <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{visible.map(w => <WallpaperCard key={w.id} wallpaper={w} isActive={monitorWallpapers.some(item => item.monitorId === monitorId && item.wallpaperId === w.id)} busy={busy} onActivate={id => void run(async () => { if (!monitorId) throw new Error("Selecciona un monitor de destino antes de aplicar el fondo."); const state = await store.setActive(id, monitorId); setMonitorWallpapers(await monitorService.getWallpapers()); setMessage(state === "pending" ? "Animated en carga; la aplicación física y su visibilidad aún no están confirmadas." : "Fondo aplicado."); })} onFavorite={id => void run(() => store.toggleFavorite(id))} onDelete={remove} onRename={beginRename} onRotate={rotate} onRegenerateThumbnail={id => void run(() => store.regenerateThumbnail(id), "Miniatura regenerada.")}/>)}</section>}
     {renameId && <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="rename-title"><div className="modal-card max-w-lg"><h2 id="rename-title" className="text-xl font-semibold">Renombrar fondo</h2><p className="mt-1 text-sm muted">El nombre visible cambiará en toda la biblioteca, sin mover el archivo.</p><input className="input mt-5" autoFocus value={renameValue} onChange={event => setRenameValue(event.target.value)} maxLength={200} onKeyDown={event => { if (event.key === "Enter") void confirmRename(); if (event.key === "Escape") setRenameId(null); }}/><div className="mt-5 flex justify-end gap-2"><button className="btn" onClick={() => setRenameId(null)} disabled={busy}>Cancelar</button><button className="btn btn-primary" onClick={() => void confirmRename()} disabled={busy}>Guardar</button></div></div></div>}
     {deleteTarget && <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-title" onClick={event => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}><div className="modal-card max-w-lg"><h2 id="delete-title" className="text-xl font-semibold">Eliminar wallpaper</h2><p className="mt-2 text-sm muted">¿Quieres eliminar <strong className="text-slate-200">{deleteTarget.name}</strong> de la biblioteca?</p><p className="mt-2 text-sm muted">Se eliminarán el registro y los archivos administrados por Lumina. Esta acción no se puede deshacer.</p><div className="mt-5 flex justify-end gap-2"><button className="btn" onClick={() => setDeleteTarget(null)} disabled={busy}>Cancelar</button><button className="btn btn-danger" onClick={() => void confirmDelete()} disabled={busy}>{busy ? "Eliminando…" : "Eliminar"}</button></div></div></div>}

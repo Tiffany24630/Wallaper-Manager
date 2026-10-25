@@ -46,8 +46,8 @@ export default function Dashboard() {
       </div>
       <div className="panel panel-pad">
         <div className="flex items-center gap-2"><Image size={18} className="text-violet-300"/><h2 className="text-lg font-semibold">Biblioteca</h2></div>
-        <div className="mt-5 text-4xl font-bold">{systemInfo?.wallpaperCount ?? 0}</div><div className="muted text-sm">fondos guardados</div>
-        <div className="mt-5 border-t border-white/10 pt-4"><div className="text-xs muted">Fondo activo</div><div className="mt-1 truncate font-medium">{systemInfo?.activeWallpaper || "Ninguno"}</div></div>
+        <div className="mt-5 text-4xl font-bold">{error ? "—" : systemInfo?.wallpaperCount ?? 0}</div><div className="muted text-sm">{error ? "estado no disponible" : "fondos guardados"}</div>
+        <div className="mt-5 border-t border-white/10 pt-4"><div className="text-xs muted">Fondo activo</div><div className="mt-1 truncate font-medium">{error ? "No disponible" : systemInfo?.activeWallpaper || "Ninguno"}</div></div>
       </div>
     </section>
   </div>;

@@ -39,6 +39,9 @@ export default function Settings() {
   const [draftDirty, setDraftDirty] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [dynamicDiagnostic, setDynamicDiagnostic] = useState<DynamicConfigurationDiagnostic | null>(null);
+  const [dynamicDiagnosticError, setDynamicDiagnosticError] = useState<string | null>(null);
+  const [playlistsError, setPlaylistsError] = useState<string | null>(null);
+  const [prototypeMonitorsError, setPrototypeMonitorsError] = useState<string | null>(null);
   const [prototypeBusy, setPrototypeBusy] = useState(false);
   const [prototypeMediaPath, setPrototypeMediaPath] = useState<string | null>(null);
   const [prototypeStatus, setPrototypeStatus] = useState("Selecciona un archivo GIF para comenzar.");
@@ -47,19 +50,21 @@ export default function Settings() {
   const [playlists, setPlaylists] = useState<{ id: string; name: string }[]>([]);
   const [playlistMembers, setPlaylistMembers] = useState<string[]>([]);
   const [playlistMembersLoading, setPlaylistMembersLoading] = useState(false);
+  const [playlistMembersError, setPlaylistMembersError] = useState<string | null>(null);
   const playlistMembersCache = useRef(new Map<string, string[]>());
   const { wallpapers, loadWallpapers } = useWallpaperStore();
   useEffect(() => {
     void loadSettings();
-    void settingsService.diagnostic().then(setDynamicDiagnostic).catch(() => setDynamicDiagnostic(null));
+    void settingsService.diagnostic().then(diagnostic => { setDynamicDiagnostic(diagnostic); setDynamicDiagnosticError(null); }).catch(error => setDynamicDiagnosticError(String(error)));
   }, [loadSettings]);
-  useEffect(() => { void playlistService.getAll().then(setPlaylists).catch(() => setPlaylists([])); void loadWallpapers(); }, [loadWallpapers]);
+  useEffect(() => { void playlistService.getAll().then(items => { setPlaylists(items); setPlaylistsError(null); }).catch(error => setPlaylistsError(String(error))); void loadWallpapers(); }, [loadWallpapers]);
   useEffect(() => {
     void monitorService.getAll().then(monitors => {
       setPrototypeMonitors(monitors);
       const primary = monitors.find(monitor => monitor.primary) ?? monitors[0];
       setPrototypeMonitorId(primary?.id ?? "");
-    }).catch(() => setPrototypeMonitors([]));
+      setPrototypeMonitorsError(null);
+    }).catch(error => setPrototypeMonitorsError(String(error)));
   }, []);
   useEffect(() => { const timer = window.setInterval(() => void loadSettings(), 5000); return () => window.clearInterval(timer); }, [loadSettings]);
   useEffect(() => { if (settings && !draftDirty) setDraft(settings); }, [settings, draftDirty]);
@@ -68,21 +73,26 @@ export default function Settings() {
     if (!playlistId) {
       setPlaylistMembers([]);
       setPlaylistMembersLoading(false);
+      setPlaylistMembersError(null);
       return;
     }
     const cached = playlistMembersCache.current.get(playlistId);
     if (cached) {
       setPlaylistMembers(cached);
       setPlaylistMembersLoading(false);
+      setPlaylistMembersError(null);
       return;
     }
     let cancelled = false;
     setPlaylistMembersLoading(true);
     void playlistService.getPlaylistWallpapers(playlistId).then(memberIds => {
       playlistMembersCache.current.set(playlistId, memberIds);
-      if (!cancelled) setPlaylistMembers(memberIds);
-    }).catch(() => {
-      if (!cancelled) setPlaylistMembers([]);
+      if (!cancelled) {
+        setPlaylistMembers(memberIds);
+        setPlaylistMembersError(null);
+      }
+    }).catch(error => {
+      if (!cancelled) setPlaylistMembersError(String(error));
     }).finally(() => {
       if (!cancelled) setPlaylistMembersLoading(false);
     });
@@ -183,9 +193,10 @@ export default function Settings() {
     }
   }
 
+  const loadError = [dynamicDiagnosticError, playlistsError, prototypeMonitorsError, playlistMembersError].filter(Boolean).join(" ");
   return <div className="page">
     <header className="page-header"><div><div className="eyebrow">Preferencias locales</div><h1 className="page-title">Ajustes</h1><p className="page-subtitle">Configura el comportamiento que Lumina conservará entre sesiones.</p></div><button className="btn btn-primary" onClick={() => void save()} disabled={loading}><Save size={16}/> Guardar cambios</button></header>
-    {(error || message) && <div className={error ? "status-error" : "status-success"}>{error || message}</div>}
+    {(error || loadError || message) && <div className={error || loadError ? "status-error" : "status-success"}>{error || loadError || message}</div>}
     <div className="grid gap-5 lg:grid-cols-2">
       <section className="panel panel-pad"><div className="mb-2 flex items-center gap-2"><Settings2 size={18} className="text-violet-300"/><h2 className="font-semibold">Aplicación</h2></div>
         <Switch checked={draft.launch_at_startup} onChange={v => patch("launch_at_startup", v)} label="Ejecutar Lumina al iniciar Windows" description="Añade o elimina Lumina del inicio automático de tu usuario de Windows."/>
@@ -201,7 +212,7 @@ export default function Settings() {
         <div className="grid gap-4 md:grid-cols-2"><div><label className="block text-sm font-medium">Lista de fondos</label><select className="input mt-2" value={draft.dynamic_playlist_id ?? ""} onChange={event => patch("dynamic_playlist_id", event.target.value || null)}><option value="">Selecciona una lista</option>{playlists.map(list => <option key={list.id} value={list.id}>{list.name}</option>)}</select></div><div><label className="block text-sm font-medium">Cambiar cada</label><select className="input mt-2" value={draft.dynamic_interval_minutes} onChange={event => patch("dynamic_interval_minutes", Number(event.target.value))}>{dynamicIntervals.map(minutes => <option key={minutes} value={minutes}>{minutes < 60 ? `${minutes} minuto${minutes === 1 ? "" : "s"}` : minutes < 1440 ? `${minutes / 60} hora${minutes === 60 ? "" : "s"}` : "24 horas"}</option>)}</select></div></div>
         {draft.dynamic_playlist_id && <div className="mt-5">
           <div className="mb-2 flex items-center justify-between gap-3"><span className="text-sm font-medium">Imágenes de la lista</span><span className="text-xs muted">{playlistMembers.length} {playlistMembers.length === 1 ? "imagen" : "imágenes"}</span></div>
-          {playlistMembersLoading && playlistMembers.length === 0 ? <div className="rounded-xl border border-white/10 p-4 text-sm muted">Cargando miniaturas…</div> : playlistMembers.length === 0 ? <div className="rounded-xl border border-white/10 p-4 text-sm muted">Esta lista no contiene imágenes.</div> : <div className="grid max-h-72 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">{playlistMembers.map(id => {
+          {playlistMembersError ? <div className="status-error">No se pudieron cargar los elementos de la playlist: {playlistMembersError}</div> : playlistMembersLoading && playlistMembers.length === 0 ? <div className="rounded-xl border border-white/10 p-4 text-sm muted">Cargando miniaturas…</div> : playlistMembers.length === 0 ? <div className="rounded-xl border border-white/10 p-4 text-sm muted">Esta lista no contiene imágenes.</div> : <div className="grid max-h-72 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">{playlistMembers.map(id => {
             const wallpaper = wallpapers.find(item => item.id === id);
             return <article key={id} className="overflow-hidden rounded-xl border border-white/10 bg-white/[.03]">
               <PlaylistWallpaperPreview wallpaper={wallpaper} name={wallpaper?.name ?? "Wallpaper no disponible"}/>
@@ -210,7 +221,7 @@ export default function Settings() {
           })}</div>}
         </div>}
         {draft.dynamic_enabled && !draft.dynamic_playlist_id && <div className="status-error mt-4">Selecciona una lista antes de guardar el fondo dinámico.</div>}
-        {dynamicDiagnostic && dynamicDiagnostic.issues.length > 0 && <div className="status-error mt-4">{dynamicDiagnostic.issues.map(issue => issue.message).join(" ")}</div>}
+        {dynamicDiagnosticError ? <div className="status-error mt-4">No se pudo comprobar la configuración dinámica: {dynamicDiagnosticError}</div> : dynamicDiagnostic && dynamicDiagnostic.issues.length > 0 && <div className="status-error mt-4">{dynamicDiagnostic.issues.map(issue => issue.message).join(" ")}</div>}
         {draft.dynamic_last_error && <div className="status-error mt-4">{draft.dynamic_last_error}</div>}
         {draft.dynamic_current_wallpaper_id && <div className="mt-3 text-sm muted">Fondo actual: {wallpapers.find(w => w.id === draft.dynamic_current_wallpaper_id)?.name ?? "no disponible"}</div>}
       </section>

@@ -154,7 +154,11 @@ fn run_worker(
             Ok(Some(minutes)) => minutes,
             Ok(None) => return,
             Err(error) => {
-                set_dynamic_error(&error);
+                if let Err(persistence_error) = set_dynamic_error(&error) {
+                    eprintln!(
+                    "[DynamicScheduler] no se pudo persistir el error original: original={error}; persistencia={persistence_error}"
+                );
+                }
                 return;
             }
         };
@@ -515,11 +519,35 @@ fn playlist_wallpapers(
         .collect())
 }
 
-fn set_monitor_playlist_error(conn: &rusqlite::Connection, monitor_id: &str, error: &str) {
-    let _ = conn.execute(
+fn persist_monitor_playlist_error(
+    conn: &rusqlite::Connection,
+    monitor_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    let affected = conn
+        .execute(
         "UPDATE monitor_playlists SET last_error = ?1 WHERE monitor_id = ?2",
         (error, monitor_id),
-    );
+        )
+        .map_err(|persist_error| {
+            format!(
+                "No se pudo persistir el error de la playlist del monitor {monitor_id}: {persist_error}"
+            )
+        })?;
+    if affected != 1 {
+        return Err(format!(
+            "No se pudo persistir el error de la playlist del monitor {monitor_id}: la asignación no existe"
+        ));
+    }
+    Ok(())
+}
+
+fn set_monitor_playlist_error(conn: &rusqlite::Connection, monitor_id: &str, error: &str) {
+    if let Err(persistence_error) = persist_monitor_playlist_error(conn, monitor_id, error) {
+        eprintln!(
+            "[DynamicScheduler] no se pudo persistir el error original: monitor={monitor_id}; original={error}; persistencia={persistence_error}"
+        );
+    }
 }
 
 fn persist_monitor_rotation(
@@ -552,24 +580,95 @@ fn select_next_id(valid: &[(String, String)], current: Option<&str>) -> Option<S
     }
 }
 
-fn set_dynamic_error(error: &str) {
-    if let Ok(conn) = get_connection() {
-        let _ = conn.execute(
-            "UPDATE settings SET dynamic_last_error = ?1 WHERE id = (SELECT id FROM settings LIMIT 1)",
-            [error],
+fn persist_dynamic_error(conn: &rusqlite::Connection, error: &str) -> Result<(), String> {
+    let affected = conn
+        .execute(
+        "UPDATE settings SET dynamic_last_error = ?1 WHERE id = (SELECT id FROM settings LIMIT 1)",
+        [error],
+        )
+        .map_err(|persist_error| {
+            format!("No se pudo persistir dynamic_last_error: {persist_error}")
+        })?;
+    if affected != 1 {
+        return Err(
+            "No se pudo persistir dynamic_last_error: no existe la fila de settings".into(),
         );
     }
+    Ok(())
+}
+
+fn set_dynamic_error(error: &str) -> Result<(), String> {
+    let conn = get_connection().map_err(|connection_error| {
+        format!("No se pudo abrir SQLite para persistir dynamic_last_error: {connection_error}")
+    })?;
+    persist_dynamic_error(&conn, error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        persist_monitor_rotation, scheduler_can_start_worker, select_next_id, wait_for_next_cycle,
-        DynamicScheduler, DYNAMIC_INTERVALS,
+        persist_dynamic_error, persist_monitor_playlist_error, persist_monitor_rotation,
+        scheduler_can_start_worker, select_next_id, wait_for_next_cycle, DynamicScheduler,
+        DYNAMIC_INTERVALS,
     };
     use rusqlite::Connection;
     use std::sync::{atomic::AtomicBool, Arc, Condvar, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn persists_dynamic_error_and_reports_missing_settings() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE settings(id INTEGER PRIMARY KEY, dynamic_last_error TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO settings(id, dynamic_last_error) VALUES (1, NULL)",
+            [],
+        )
+        .unwrap();
+
+        persist_dynamic_error(&conn, "fallo de prueba").unwrap();
+        let stored: String = conn
+            .query_row("SELECT dynamic_last_error FROM settings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, "fallo de prueba");
+
+        let missing = Connection::open_in_memory().unwrap();
+        let error = persist_dynamic_error(&missing, "fallo").unwrap_err();
+        assert!(error.contains("dynamic_last_error"));
+    }
+
+    #[test]
+    fn persists_monitor_error_and_reports_missing_assignment() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE monitor_playlists(monitor_id TEXT PRIMARY KEY, last_error TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO monitor_playlists(monitor_id, last_error) VALUES ('DISPLAY-A', NULL)",
+            [],
+        )
+        .unwrap();
+
+        persist_monitor_playlist_error(&conn, "DISPLAY-A", "fallo de prueba").unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT last_error FROM monitor_playlists WHERE monitor_id = 'DISPLAY-A'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "fallo de prueba");
+
+        let error = persist_monitor_playlist_error(&conn, "DISPLAY-B", "fallo").unwrap_err();
+        assert!(error.contains("DISPLAY-B"));
+    }
 
     #[test]
     fn accepts_only_supported_intervals() {

@@ -315,14 +315,50 @@ pub fn save_settings(
             return Err("Desactiva primero las playlists asignadas por monitor para usar el fondo dinámico global".into());
         }
     }
-    startup::set_enabled(settings.launch_at_startup)?;
-    if startup::is_enabled()? != settings.launch_at_startup {
-        return Err("Windows no pudo confirmar el estado del inicio automático de Lumina".into());
-    }
-    let mut conn = get_connection().map_err(|e| e.to_string())?;
-    persist_user_settings(&mut conn, &settings)?;
+    apply_launch_at_startup_and_persist(
+        settings.launch_at_startup,
+        startup::set_enabled,
+        startup::is_enabled,
+        || {
+            let mut conn = get_connection().map_err(|e| e.to_string())?;
+            persist_user_settings(&mut conn, &settings)
+        },
+    )?;
     scheduler.restart();
     Ok(())
+}
+
+fn apply_launch_at_startup_and_persist<SetStartup, ReadStartup, Persist>(
+    requested: bool,
+    set_startup: SetStartup,
+    read_startup: ReadStartup,
+    persist: Persist,
+) -> Result<(), String>
+where
+    SetStartup: FnOnce(bool) -> Result<(), String>,
+    ReadStartup: FnOnce() -> Result<bool, String>,
+    Persist: FnOnce() -> Result<(), String>,
+{
+    set_startup(requested).map_err(|error| {
+        format!("No se pudo actualizar el inicio automático de Lumina: {error}")
+    })?;
+
+    let applied = read_startup().map_err(|error| {
+        format!(
+            "Windows pudo haber actualizado el inicio automático, pero no se pudo verificar su estado: {error}"
+        )
+    })?;
+    if applied != requested {
+        return Err(format!(
+            "Windows no confirmó el estado solicitado del inicio automático (solicitado={requested}, observado={applied})"
+        ));
+    }
+
+    persist().map_err(|error| {
+        format!(
+            "Windows confirmó el inicio automático, pero SQLite no pudo persistir la preferencia; el estado puede haber quedado divergente: {error}"
+        )
+    })
 }
 
 fn persist_user_settings(
@@ -412,9 +448,95 @@ fn persist_user_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::{diagnose_dynamic_configuration, persist_user_settings};
+    use super::{
+        apply_launch_at_startup_and_persist, diagnose_dynamic_configuration, persist_user_settings,
+    };
     use crate::models::settings::Settings;
     use rusqlite::Connection;
+    use std::cell::Cell;
+
+    #[test]
+    fn startup_and_sqlite_success_is_reported_only_after_both_steps() {
+        let external_state = Cell::new(false);
+        let mut persisted = false;
+
+        apply_launch_at_startup_and_persist(
+            true,
+            |requested| {
+                external_state.set(requested);
+                Ok(())
+            },
+            || Ok(external_state.get()),
+            || {
+                persisted = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(external_state.get());
+        assert!(persisted);
+    }
+
+    #[test]
+    fn startup_failure_does_not_attempt_sqlite_persistence() {
+        let mut persisted = false;
+        let error = apply_launch_at_startup_and_persist(
+            true,
+            |_| Err("registro rechazado".into()),
+            || Ok(true),
+            || {
+                persisted = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("registro rechazado"));
+        assert!(!persisted);
+    }
+
+    #[test]
+    fn sqlite_failure_after_external_success_reports_partial_state() {
+        let external_state = Cell::new(false);
+        let error = apply_launch_at_startup_and_persist(
+            true,
+            |requested| {
+                external_state.set(requested);
+                Ok(())
+            },
+            || Ok(external_state.get()),
+            || {
+                let conn = Connection::open_in_memory().unwrap();
+                conn.execute("UPDATE missing_settings SET value = 1", [])
+                    .map(|_| ())
+                    .map_err(|db_error| db_error.to_string())
+            },
+        )
+        .unwrap_err();
+
+        assert!(external_state.get());
+        assert!(error.contains("Windows confirmÃ³") || error.contains("Windows confirmó"));
+        assert!(error.contains("SQLite"));
+    }
+
+    #[test]
+    fn unverified_external_state_is_not_persisted_as_success() {
+        let mut persisted = false;
+        let error = apply_launch_at_startup_and_persist(
+            true,
+            |_| Ok(()),
+            || Ok(false),
+            || {
+                persisted = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("solicitado"));
+        assert!(!persisted);
+    }
 
     fn settings_snapshot() -> Settings {
         Settings {
