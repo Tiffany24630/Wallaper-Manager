@@ -85,7 +85,7 @@ class Store:
           user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           record_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
           revision INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
-          PRIMARY KEY(user_id, record_id)
+          PRIMARY KEY(user_id, kind, record_id)
         );
         CREATE INDEX IF NOT EXISTS sync_records_user_revision ON sync_records(user_id, revision);
         CREATE TABLE IF NOT EXISTS files(
@@ -110,7 +110,28 @@ class Store:
           status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
         );
         """)
+        self._migrate_typed_sync_records()
         self.conn.commit()
+
+    def _migrate_typed_sync_records(self):
+        columns = self.conn.execute("PRAGMA table_info(sync_records)").fetchall()
+        primary_key = [row[1] for row in sorted(columns, key=lambda row: row[5]) if row[5]]
+        if primary_key != ["user_id", "kind", "record_id"]:
+            self.conn.execute("""
+                CREATE TABLE sync_records_typed(
+                  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  record_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+                  revision INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
+                  PRIMARY KEY(user_id, kind, record_id)
+                )
+            """)
+            self.conn.execute("""
+                INSERT INTO sync_records_typed(user_id,record_id,kind,payload,revision,updated_at,deleted)
+                SELECT user_id,record_id,kind,payload,revision,updated_at,deleted FROM sync_records
+            """)
+            self.conn.execute("DROP TABLE sync_records")
+            self.conn.execute("ALTER TABLE sync_records_typed RENAME TO sync_records")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS sync_records_user_revision ON sync_records(user_id, revision)")
 
     def close(self):
         self.conn.close()
@@ -305,14 +326,14 @@ class Api(BaseHTTPRequestHandler):
             record_id, kind = str(change.get("id", "")), str(change.get("kind", ""))
             if not record_id or kind not in ("wallpaper", "playlist", "playlist_item", "setting", "cursor"):
                 raise ValueError("Registro de sincronización no válido")
-            current = self.server.store.conn.execute("SELECT * FROM sync_records WHERE user_id=? AND record_id=?", (user["id"], record_id)).fetchone()
+            current = self.server.store.conn.execute("SELECT * FROM sync_records WHERE user_id=? AND kind=? AND record_id=?", (user["id"], kind, record_id)).fetchone()
             base = int(change.get("base_revision", 0))
             if current and current["revision"] != base:
-                conflicts.append({"id": record_id, "server_revision": current["revision"], "server_payload": json.loads(current["payload"])})
+                conflicts.append({"id": record_id, "kind": kind, "server_revision": current["revision"], "server_payload": json.loads(current["payload"])})
                 continue
             revision = (current["revision"] if current else 0) + 1
             self.server.store.conn.execute(
-                "INSERT INTO sync_records VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,record_id) DO UPDATE SET kind=excluded.kind,payload=excluded.payload,revision=excluded.revision,updated_at=excluded.updated_at,deleted=excluded.deleted",
+                "INSERT INTO sync_records VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,kind,record_id) DO UPDATE SET payload=excluded.payload,revision=excluded.revision,updated_at=excluded.updated_at,deleted=excluded.deleted",
                 (user["id"], record_id, kind, json.dumps(change.get("payload", {}), ensure_ascii=False), revision, now(), int(bool(change.get("deleted", False)))))
         self.server.store.conn.execute("UPDATE devices SET last_sync_at=? WHERE id=? AND user_id=?", (now(), device_id, user["id"]))
         self.server.store.conn.commit()
@@ -349,7 +370,7 @@ class Api(BaseHTTPRequestHandler):
             int(sha256, 16)
         except ValueError:
             raise ValueError("Hash de archivo no vÃ¡lido")
-        record = self.server.store.conn.execute("SELECT kind FROM sync_records WHERE user_id=? AND record_id=?", (user["id"], record_id)).fetchone()
+        record = self.server.store.conn.execute("SELECT kind FROM sync_records WHERE user_id=? AND kind=? AND record_id=?", (user["id"], kind, record_id)).fetchone()
         if not record or record["kind"] != kind:
             return self.json(409, {"error": "Sincroniza primero el registro de metadatos"})
         existing = self.server.store.conn.execute("SELECT id,size_bytes,sha256 FROM files WHERE user_id=? AND sha256=?", (user["id"], sha256)).fetchone()

@@ -8,6 +8,8 @@ const apiKey = "lumina.account.apiUrl";
 const deviceKey = "lumina.account.deviceId";
 let tokenCache: string | null | undefined;
 export type SyncResponse = { records: Array<{ record_id: string; kind: string; revision: number; payload: Record<string, unknown>; deleted?: boolean }>; files: Array<{ id: string; record_id: string; sha256: string; kind: string; original_name?: string; extension?: string }>; conflicts: unknown[] };
+export type SyncConflict = { id: string; kind: "wallpaper" | "cursor" | "playlist"; recordId: string; localPayload: string; remotePayload: string; baseRevision?: number; remoteRevision: number; lastError?: string };
+type SyncConflictResponse = { id: string; kind: "wallpaper" | "cursor" | "playlist"; server_revision: number; server_payload: Record<string, unknown> };
 type PlaylistSyncState = { playlistId: string; lastRemoteRevision?: number; basePayload?: string; localDirty: boolean; deletedPending: boolean };
 const apiUrl = () => localStorage.getItem(apiKey) || "http://127.0.0.1:8765";
 const normalizeApiUrl = (value: string) => {
@@ -82,9 +84,11 @@ export const accountService = {
   claim: (id: string) => invoke<boolean>("claim_sync_operation", { id }),
   finish: (id: string, success: boolean, error?: string) => invoke("finish_sync_operation", { id, success, error: error?.slice(0, 500) }),
   retry: (id: string) => invoke("retry_sync_operation", { id }),
+  listConflicts: () => invoke<SyncConflict[]>("list_sync_conflicts"),
+  resolveConflict: (id: string, kind: SyncConflict["kind"]) => invoke("resolve_sync_conflict", { id, kind }),
   syncLibrary: async () => {
     const wallpapers = await wallpaperService.getAll(); const cursors = await cursorService.list(); const playlists = await playlistService.getAll();
-    const remote = await accountService.sync(); const revisions = new Map(remote.records.map(record => [record.record_id, record.revision]));
+    const remote = await accountService.sync(); const key = (kind: string, id: string) => `${kind}:${id}`; const revisions = new Map(remote.records.map(record => [key(record.kind, record.record_id), record.revision]));
     const states = await invoke<PlaylistSyncState[]>("list_sync_playlist_states").catch(() => [] as PlaylistSyncState[]);
     const stateMap = new Map(states.map(state => [state.playlistId, state]));
     const localPlaylistMap = new Map(playlists.map(playlist => [playlist.id, playlist]));
@@ -103,7 +107,7 @@ export const accountService = {
       if (state.localDirty) {
         let remoteUnchanged = false;
         try { remoteUnchanged = !!state.basePayload && JSON.stringify(JSON.parse(state.basePayload)) === JSON.stringify(record.payload); } catch { remoteUnchanged = false; }
-        if (!remoteUnchanged && record.revision > (state.lastRemoteRevision ?? 0)) await invoke("record_playlist_conflict", { playlistId: record.record_id, localPayload: localPlaylistPayloads.get(record.record_id), remotePayload: record.payload, baseRevision: state.lastRemoteRevision ?? null, remoteRevision: record.revision });
+        if (!remoteUnchanged && record.revision > (state.lastRemoteRevision ?? 0)) await invoke("record_sync_conflict", { kind: "playlist", recordId: record.record_id, localPayload: localPlaylistPayloads.get(record.record_id) || {}, remotePayload: record.payload, baseRevision: state.lastRemoteRevision ?? null, remoteRevision: record.revision });
       } else if (record.deleted) {
         await invoke("delete_playlist", { playlistId: record.record_id }).catch(() => undefined);
         await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload });
@@ -112,23 +116,32 @@ export const accountService = {
         await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload });
       }
     }
-    const changes = wallpapers.map(wallpaper => ({ id: wallpaper.id, kind: "wallpaper", base_revision: revisions.get(wallpaper.id) ?? 0, payload: { name: wallpaper.name, hash: wallpaper.hash ?? null, size_bytes: wallpaper.sizeBytes ?? null, width: wallpaper.width ?? null, height: wallpaper.height ?? null, file_type: wallpaper.fileType ?? null, favorite: wallpaper.favorite } }));
-    const cursorChanges = cursors.map(cursor => ({ id: cursor.id, kind: "cursor", base_revision: revisions.get(cursor.id) ?? 0, payload: { name: cursor.name, resource_type: cursor.resourceType, hotspot_x: cursor.hotspotX, hotspot_y: cursor.hotspotY } }));
+    const changes = wallpapers.map(wallpaper => ({ id: wallpaper.id, kind: "wallpaper", base_revision: revisions.get(key("wallpaper", wallpaper.id)) ?? 0, payload: { name: wallpaper.name, hash: wallpaper.hash ?? null, size_bytes: wallpaper.sizeBytes ?? null, width: wallpaper.width ?? null, height: wallpaper.height ?? null, file_type: wallpaper.fileType ?? null, favorite: wallpaper.favorite } }));
+    const cursorChanges = cursors.map(cursor => ({ id: cursor.id, kind: "cursor", base_revision: revisions.get(key("cursor", cursor.id)) ?? 0, payload: { name: cursor.name, resource_type: cursor.resourceType, hotspot_x: cursor.hotspotX, hotspot_y: cursor.hotspotY } }));
     const playlistChanges = playlists.map(playlist => ({ id: playlist.id, kind: "playlist", base_revision: stateMap.get(playlist.id)?.lastRemoteRevision ?? 0, payload: localPlaylistPayloads.get(playlist.id) }));
     const tombstones = await invoke<Array<[string, string]>>("list_sync_tombstones").catch(() => []);
-    const deletedChanges = tombstones.map(([id, kind]) => ({ id, kind, base_revision: stateMap.get(id)?.lastRemoteRevision ?? revisions.get(id) ?? 0, deleted: true, payload: {} }));
-    const result = await accountService.sync([...changes, ...cursorChanges, ...playlistChanges, ...deletedChanges]);
-    const conflictIds = new Set(result.conflicts.map(conflict => String((conflict as { id?: string }).id || "")));
-    for (const record of result.records.filter(item => item.kind === "playlist" && !conflictIds.has(item.record_id))) await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload }).catch(() => undefined);
+    const deletedChanges = tombstones.map(([id, kind]) => ({ id, kind, base_revision: kind === "playlist" ? stateMap.get(id)?.lastRemoteRevision ?? 0 : revisions.get(key(kind, id)) ?? 0, deleted: true, payload: {} }));
+    const outgoing = [...changes, ...cursorChanges, ...playlistChanges, ...deletedChanges];
+    const outgoingByKey = new Map(outgoing.map(change => [key(change.kind, change.id), change]));
+    const result = await accountService.sync(outgoing);
+    const conflicts = result.conflicts as SyncConflictResponse[];
+    for (const conflict of conflicts) {
+      const local = outgoingByKey.get(key(conflict.kind, conflict.id));
+      await invoke("record_sync_conflict", { kind: conflict.kind, recordId: conflict.id, localPayload: local?.payload || {}, remotePayload: conflict.server_payload, baseRevision: local?.base_revision ?? null, remoteRevision: conflict.server_revision });
+    }
+    const conflictKeys = new Set(conflicts.map(conflict => key(conflict.kind, conflict.id)));
+    for (const record of result.records.filter(item => item.kind === "playlist" && !conflictKeys.has(key(item.kind, item.record_id)))) await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload }).catch(() => undefined);
     const uploaded: string[] = []; const errors: string[] = [];
     for (const wallpaper of wallpapers) {
+      if (conflictKeys.has(key("wallpaper", wallpaper.id))) continue;
       if (result.files.some(file => file.record_id === wallpaper.id && file.sha256 === (wallpaper.hash ?? ""))) continue;
       try { const blob = await (await fetch(convertFileSrc(wallpaper.path, "asset"))).blob(); await accountService.uploadFile(blob, wallpaper.name, wallpaper.id, "wallpaper", mimeFor(wallpaper.fileType, wallpaper.path)); uploaded.push(wallpaper.id); } catch (error) { errors.push(`${wallpaper.name}: ${String(error)}`); }
     }
     for (const cursor of cursors) {
+      if (conflictKeys.has(key("cursor", cursor.id))) continue;
       try { const blob = await (await fetch(convertFileSrc(cursor.path, "asset"))).blob(); if (!result.files.some(file => file.record_id === cursor.id)) { await accountService.uploadFile(blob, cursor.name, cursor.id, "cursor", cursor.resourceType === "animated" ? "application/octet-stream" : "image/x-icon"); uploaded.push(cursor.id); } } catch (error) { errors.push(`${cursor.name}: ${String(error)}`); }
     }
-    return { ...result, uploaded, errors };
+    return { ...result, uploaded, errors: [...errors, ...conflicts.map(conflict => `Conflicto de ${conflict.kind}: ${conflict.id}`)] };
   },
   uploadFile: async (file: Blob, name: string, recordId: string, kind: "wallpaper" | "cursor", mime: string) => {
     const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", await file.arrayBuffer()))).map(value => value.toString(16).padStart(2, "0")).join("");

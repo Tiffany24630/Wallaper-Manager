@@ -1,5 +1,6 @@
 import json
 import hashlib
+import sqlite3
 import threading
 import tempfile
 import unittest
@@ -27,6 +28,36 @@ class AccountSecurityTests(unittest.TestCase):
             store.conn.commit()
             self.assertEqual(store.session_user("missing"), None)
             self.assertEqual(store.conn.execute("SELECT user_id FROM devices WHERE id='device'").fetchone()[0], "u1")
+            store.close()
+
+    def test_store_migrates_existing_record_ids_to_typed_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sync.db"
+            legacy = sqlite3.connect(path)
+            legacy.executescript(
+                """
+                CREATE TABLE users(id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+                CREATE TABLE sync_records(
+                    user_id TEXT NOT NULL, record_id TEXT NOT NULL, kind TEXT NOT NULL,
+                    payload TEXT NOT NULL, revision INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                    deleted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id, record_id)
+                );
+                INSERT INTO users VALUES('u1','legacy@example.com','not-used',1);
+                INSERT INTO sync_records VALUES('u1','same-id','wallpaper','{}',1,1,0);
+                """
+            )
+            legacy.commit(); legacy.close()
+
+            store = Store(str(path))
+            store.conn.execute(
+                "INSERT INTO sync_records VALUES(?,?,?,?,?,?,?)",
+                ("u1", "same-id", "cursor", "{}", 1, 2, 0),
+            )
+            store.conn.commit()
+            self.assertEqual(
+                store.conn.execute("SELECT COUNT(*) FROM sync_records WHERE user_id='u1' AND record_id='same-id'").fetchone()[0],
+                2,
+            )
             store.close()
 
 
@@ -107,6 +138,39 @@ class FileTransferTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.call("/v1/sync", {"device_id": "lists@example.com", "changes": []}, token)
         self.assertEqual(error.exception.code, 403)
+
+    def test_same_record_id_isolated_by_kind_for_updates_conflicts_and_deletes(self):
+        token = self.account("typed@example.com")
+        changes = [
+            {"id": "same-id", "kind": "wallpaper", "base_revision": 0, "payload": {"name": "Fondo"}},
+            {"id": "same-id", "kind": "playlist", "base_revision": 0, "payload": {"name": "Lista"}},
+            {"id": "same-id", "kind": "cursor", "base_revision": 0, "payload": {"name": "Cursor"}},
+        ]
+        _, initial = self.call("/v1/sync", {"device_id": "typed@example.com", "changes": changes}, token)
+        self.assertEqual(len([record for record in initial["records"] if record["record_id"] == "same-id"]), 3)
+
+        self.call("/v1/sync", {"device_id": "typed@example.com", "changes": [
+            {"id": "same-id", "kind": "wallpaper", "base_revision": 1, "payload": {"name": "Fondo actualizado"}},
+            {"id": "same-id", "kind": "playlist", "base_revision": 1, "payload": {"name": "Lista actualizada"}},
+        ]}, token)
+        _, conflict = self.call("/v1/sync", {"device_id": "typed@example.com", "changes": [
+            {"id": "same-id", "kind": "playlist", "base_revision": 1, "payload": {"name": "Lista obsoleta"}},
+        ]}, token)
+        self.assertEqual(conflict["conflicts"][0]["kind"], "playlist")
+        for kind, payload in (("wallpaper", {"name": "Fondo obsoleto"}), ("cursor", {"name": "Cursor obsoleto"})):
+            _, typed_conflict = self.call("/v1/sync", {"device_id": "typed@example.com", "changes": [
+                {"id": "same-id", "kind": kind, "base_revision": 1, "payload": payload},
+            ]}, token)
+            self.assertEqual(typed_conflict["conflicts"][0]["kind"], kind)
+            self.assertEqual(typed_conflict["conflicts"][0]["id"], "same-id")
+
+        _, deleted = self.call("/v1/sync", {"device_id": "typed@example.com", "changes": [
+            {"id": "same-id", "kind": "wallpaper", "base_revision": 2, "deleted": True, "payload": {}},
+        ]}, token)
+        records = {(record["kind"], record["record_id"]): record for record in deleted["records"]}
+        self.assertTrue(records[("wallpaper", "same-id")]["deleted"])
+        self.assertFalse(records[("playlist", "same-id")]["deleted"])
+        self.assertFalse(records[("cursor", "same-id")]["deleted"])
 
 
 if __name__ == "__main__":
