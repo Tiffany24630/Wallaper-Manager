@@ -1585,6 +1585,7 @@ mod tests {
         EnhancementJobGuard, EnhancementJobState, TemporaryOutput,
     };
     use crate::models::wallpaper::WallpaperResourceType;
+    use crate::utils::hash::file_hash;
     use crate::utils::thumbnail::generate_thumbnail;
     use image::{GenericImageView, RgbImage};
     use rusqlite::Connection;
@@ -1750,13 +1751,70 @@ mod tests {
         let source_path = dir.join("source.png");
         let output_path = dir.join("output.png");
         source.save(&source_path).unwrap();
-        image::RgbaImage::from_pixel(8, 6, image::Rgba([255, 255, 255, 255]))
+        image::RgbaImage::from_pixel(8, 6, image::Rgba([0, 0, 0, 255]))
             .save(&output_path)
             .unwrap();
 
         assert!(
             validate_ai_pixels(&output_path, (8, 6), &image::open(&source_path).unwrap()).is_err()
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ai_pixel_validation_distinguishes_transparency_and_valid_low_contrast_output() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumina-ai-pixel-variants-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let visible_source = RgbImage::from_fn(4, 3, |x, _| {
+            if x < 2 {
+                image::Rgb([220, 80, 40])
+            } else {
+                image::Rgb([20, 140, 220])
+            }
+        });
+        let visible_source_path = dir.join("visible-source.png");
+        visible_source.save(&visible_source_path).unwrap();
+        let visible_source = image::open(&visible_source_path).unwrap();
+
+        let transparent_output_path = dir.join("transparent-output.png");
+        image::RgbaImage::from_pixel(8, 6, image::Rgba([0, 0, 0, 0]))
+            .save(&transparent_output_path)
+            .unwrap();
+        assert!(validate_ai_pixels(&transparent_output_path, (8, 6), &visible_source).is_err());
+
+        let alpha_black_output_path = dir.join("alpha-black-output.png");
+        image::RgbaImage::from_pixel(8, 6, image::Rgba([0, 0, 0, 128]))
+            .save(&alpha_black_output_path)
+            .unwrap();
+        assert!(validate_ai_pixels(&alpha_black_output_path, (8, 6), &visible_source).is_err());
+
+        let low_contrast_output_path = dir.join("low-contrast-output.png");
+        image::RgbaImage::from_fn(8, 6, |x, _| {
+            let red = if x % 2 == 0 { 10 } else { 11 };
+            image::Rgba([red, 10, 10, 255])
+        })
+        .save(&low_contrast_output_path)
+        .unwrap();
+        assert!(validate_ai_pixels(&low_contrast_output_path, (8, 6), &visible_source).is_ok());
+
+        let transparent_source_path = dir.join("transparent-source.png");
+        image::RgbaImage::from_pixel(4, 3, image::Rgba([0, 0, 0, 0]))
+            .save(&transparent_source_path)
+            .unwrap();
+        let transparent_source = image::open(&transparent_source_path).unwrap();
+        let transparent_result_path = dir.join("transparent-result.png");
+        image::RgbaImage::from_pixel(8, 6, image::Rgba([0, 0, 0, 255]))
+            .save(&transparent_result_path)
+            .unwrap();
+        assert!(validate_ai_pixels(&transparent_result_path, (8, 6), &transparent_source).is_ok());
+
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1877,27 +1935,30 @@ mod tests {
         let source = dir.join("source.png");
         let destination = dir.join("wallpaper.png");
         let thumbnail = dir.join("thumbnail.jpg");
-        RgbImage::new(3, 2).save(&source).unwrap();
+        let mut fixture = RgbImage::new(2, 1);
+        fixture.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        fixture.put_pixel(1, 0, image::Rgb([0, 255, 0]));
+        fixture.save(&source).unwrap();
         fs::copy(&source, &destination).unwrap();
 
-        assert_eq!(
-            rotate_image(image::open(&source).unwrap(), 90)
-                .unwrap()
-                .dimensions(),
-            (2, 3)
-        );
-        assert_eq!(
-            rotate_image(image::open(&source).unwrap(), 180)
-                .unwrap()
-                .dimensions(),
-            (3, 2)
-        );
-        assert_eq!(
-            rotate_image(image::open(&source).unwrap(), 270)
-                .unwrap()
-                .dimensions(),
-            (2, 3)
-        );
+        let original_hash = file_hash(&source.to_string_lossy()).unwrap();
+        let original_bytes = fs::read(&source).unwrap();
+
+        let rotated_90 = rotate_image(image::open(&source).unwrap(), 90).unwrap();
+        assert_eq!(rotated_90.dimensions(), (1, 2));
+        assert_eq!(rotated_90.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(rotated_90.get_pixel(0, 1).0, [0, 255, 0, 255]);
+
+        let rotated_180 = rotate_image(image::open(&source).unwrap(), 180).unwrap();
+        assert_eq!(rotated_180.dimensions(), (2, 1));
+        assert_eq!(rotated_180.get_pixel(0, 0).0, [0, 255, 0, 255]);
+        assert_eq!(rotated_180.get_pixel(1, 0).0, [255, 0, 0, 255]);
+
+        let rotated_270 = rotate_image(image::open(&source).unwrap(), 270).unwrap();
+        assert_eq!(rotated_270.dimensions(), (1, 2));
+        assert_eq!(rotated_270.get_pixel(0, 0).0, [0, 255, 0, 255]);
+        assert_eq!(rotated_270.get_pixel(0, 1).0, [255, 0, 0, 255]);
+
         assert_eq!(
             rotate_image(image::DynamicImage::ImageRgb8(RgbImage::new(4, 4)), 90)
                 .unwrap()
@@ -1907,10 +1968,27 @@ mod tests {
 
         assert_eq!(
             replace_validated_image(&source, &destination, 90).unwrap(),
-            (2, 3)
+            (1, 2)
+        );
+        let rotated_file = image::open(&destination).unwrap();
+        assert_eq!(rotated_file.dimensions(), (1, 2));
+        assert_eq!(rotated_file.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(rotated_file.get_pixel(0, 1).0, [0, 255, 0, 255]);
+        assert_ne!(
+            file_hash(&destination.to_string_lossy()).unwrap(),
+            original_hash
         );
         generate_thumbnail(&destination.to_string_lossy(), &thumbnail.to_string_lossy()).unwrap();
         assert!(image::open(&thumbnail).is_ok());
+        assert_eq!(
+            replace_validated_image(&source, &destination, 0).unwrap(),
+            (2, 1)
+        );
+        assert_eq!(fs::read(&destination).unwrap(), original_bytes);
+        assert_eq!(
+            file_hash(&destination.to_string_lossy()).unwrap(),
+            original_hash
+        );
         assert!(replace_validated_image(&dir.join("missing.png"), &destination, 90).is_err());
         let _ = fs::remove_dir_all(dir);
     }

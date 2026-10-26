@@ -35,3 +35,16 @@ pub struct SyncPlaylistConflict {
     pub base_revision: Option<i64>,
     pub remote_revision: i64,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConflict {
+    pub id: String,
+    pub kind: String,
+    pub record_id: String,
+    pub local_payload: String,
+    pub remote_payload: String,
+    pub base_revision: Option<i64>,
+    pub remote_revision: i64,
+    pub last_error: Option<String>,
+}

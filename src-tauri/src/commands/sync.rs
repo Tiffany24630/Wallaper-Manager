@@ -1,8 +1,8 @@
 use crate::{
     db::get_connection,
-    models::sync::{SyncPlaylistConflict, SyncPlaylistState, SyncQueueItem},
+    models::sync::{SyncConflict, SyncPlaylistConflict, SyncPlaylistState, SyncQueueItem},
 };
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -51,6 +51,133 @@ pub fn mark_playlist_synced(
     Ok(())
 }
 
+fn validate_conflict_kind(kind: &str) -> Result<(), String> {
+    if ["wallpaper", "cursor", "playlist"].contains(&kind) {
+        Ok(())
+    } else {
+        Err("Tipo de conflicto de sincronización no válido".into())
+    }
+}
+
+fn record_sync_conflict_in_connection(
+    conn: &Connection,
+    kind: &str,
+    record_id: &str,
+    local_payload: &Value,
+    remote_payload: &Value,
+    base_revision: Option<i64>,
+    remote_revision: i64,
+) -> Result<String, String> {
+    validate_conflict_kind(kind)?;
+    if record_id.trim().is_empty() {
+        return Err("Identidad de conflicto no válida".into());
+    }
+    let local_payload = serde_json::to_string(local_payload).map_err(|e| e.to_string())?;
+    let remote_payload = serde_json::to_string(remote_payload).map_err(|e| e.to_string())?;
+    if let Ok(existing) = conn.query_row(
+        "SELECT id FROM sync_conflicts WHERE kind=?1 AND record_id=?2 AND local_payload=?3 AND remote_payload=?4 AND resolved=0 LIMIT 1",
+        params![kind, record_id, local_payload, remote_payload],
+        |row| row.get::<_, String>(0),
+    ) {
+        return Ok(existing);
+    }
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO sync_conflicts(id,kind,record_id,local_payload,remote_payload,base_revision,remote_revision,created_at,resolved) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0)",
+        params![id, kind, record_id, local_payload, remote_payload, base_revision, remote_revision, now()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn record_sync_conflict(
+    kind: String,
+    record_id: String,
+    local_payload: Value,
+    remote_payload: Value,
+    base_revision: Option<i64>,
+    remote_revision: i64,
+) -> Result<String, String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    record_sync_conflict_in_connection(
+        &conn,
+        &kind,
+        &record_id,
+        &local_payload,
+        &remote_payload,
+        base_revision,
+        remote_revision,
+    )
+}
+
+#[tauri::command]
+pub fn list_sync_conflicts() -> Result<Vec<SyncConflict>, String> {
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    let mut statement = conn
+        .prepare("SELECT id,kind,record_id,local_payload,remote_payload,base_revision,remote_revision,last_error FROM sync_conflicts WHERE resolved=0 ORDER BY created_at")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SyncConflict {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                record_id: row.get(2)?,
+                local_payload: row.get(3)?,
+                remote_payload: row.get(4)?,
+                base_revision: row.get(5)?,
+                remote_revision: row.get(6)?,
+                last_error: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn resolve_sync_conflict(id: String, kind: String) -> Result<(), String> {
+    validate_conflict_kind(&kind)?;
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    resolve_sync_conflict_in_connection(&conn, &id, &kind)
+}
+
+#[tauri::command]
+pub fn record_sync_conflict_error(id: String, kind: String, error: String) -> Result<(), String> {
+    validate_conflict_kind(&kind)?;
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    let error = error.chars().take(500).collect::<String>();
+    let changed = conn
+        .execute(
+            "UPDATE sync_conflicts SET last_error=?3 WHERE id=?1 AND kind=?2 AND resolved=0",
+            params![id, kind, error],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err("El conflicto no existe, ya fue resuelto o su tipo no coincide".into())
+    }
+}
+
+fn resolve_sync_conflict_in_connection(
+    conn: &Connection,
+    id: &str,
+    kind: &str,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE sync_conflicts SET resolved=1,last_error=NULL WHERE id=?1 AND kind=?2 AND resolved=0",
+            params![id, kind],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err("El conflicto no existe, ya fue resuelto o su tipo no coincide".into())
+    }
+}
+
 #[tauri::command]
 pub fn record_playlist_conflict(
     playlist_id: String,
@@ -60,12 +187,21 @@ pub fn record_playlist_conflict(
     remote_revision: i64,
 ) -> Result<String, String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
+    let generic_id = record_sync_conflict_in_connection(
+        &conn,
+        "playlist",
+        &playlist_id,
+        &local_payload,
+        &remote_payload,
+        base_revision,
+        remote_revision,
+    )?;
     let local_payload = serde_json::to_string(&local_payload).map_err(|e| e.to_string())?;
     let remote_payload = serde_json::to_string(&remote_payload).map_err(|e| e.to_string())?;
     if let Ok(existing) = conn.query_row("SELECT id FROM sync_playlist_conflicts WHERE playlist_id=?1 AND local_payload=?2 AND remote_payload=?3 AND resolved=0 LIMIT 1", params![playlist_id, local_payload, remote_payload], |row| row.get::<_, String>(0)) { return Ok(existing); }
     let id = Uuid::new_v4().to_string();
     conn.execute("INSERT INTO sync_playlist_conflicts(id,playlist_id,local_payload,remote_payload,base_revision,remote_revision,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![id, playlist_id, local_payload, remote_payload, base_revision, remote_revision, now()]).map_err(|e| e.to_string())?;
-    Ok(id)
+    Ok(generic_id)
 }
 
 #[tauri::command]
@@ -95,7 +231,7 @@ pub fn record_sync_tombstone(entity_id: String, kind: String) -> Result<(), Stri
         return Err("Tombstone de sincronización no válido".into());
     }
     let conn = get_connection().map_err(|e| e.to_string())?;
-    conn.execute("INSERT INTO sync_tombstones(entity_id, kind, created_at) VALUES(?1, ?2, ?3) ON CONFLICT(entity_id) DO UPDATE SET kind=excluded.kind", params![entity_id, kind, now()]).map_err(|e| e.to_string())?;
+    conn.execute("INSERT INTO sync_tombstones(entity_id, kind, created_at) VALUES(?1, ?2, ?3) ON CONFLICT(entity_id, kind) DO UPDATE SET created_at=excluded.created_at", params![entity_id, kind, now()]).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -202,4 +338,86 @@ pub fn retry_sync_operation(id: String) -> Result<(), String> {
     let conn = get_connection().map_err(|e| e.to_string())?;
     conn.execute("UPDATE sync_queue SET state='retry', next_retry_at=NULL, updated_at=?, last_error=NULL WHERE id=? AND state IN ('failed','retry')", params![now(), id]).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{record_sync_conflict_in_connection, resolve_sync_conflict_in_connection};
+    use rusqlite::Connection;
+    use serde_json::json;
+
+    fn connection() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sync_conflicts(
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, record_id TEXT NOT NULL,
+                local_payload TEXT NOT NULL, remote_payload TEXT NOT NULL,
+                base_revision INTEGER, remote_revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL, last_error TEXT,
+                resolved INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn conflicts_are_persisted_by_kind_for_the_same_record_id() {
+        let conn = connection();
+        for kind in ["wallpaper", "cursor", "playlist"] {
+            record_sync_conflict_in_connection(
+                &conn,
+                kind,
+                "same-id",
+                &json!({"local": kind}),
+                &json!({"remote": kind}),
+                Some(1),
+                2,
+            )
+            .unwrap();
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_conflicts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn conflict_resolution_is_typed_and_only_marks_confirmed_rows() {
+        let conn = connection();
+        let id = record_sync_conflict_in_connection(
+            &conn,
+            "playlist",
+            "same-id",
+            &json!({"local": 1}),
+            &json!({"remote": 2}),
+            Some(1),
+            2,
+        )
+        .unwrap();
+        assert!(resolve_sync_conflict_in_connection(&conn, &id, "wallpaper").is_err());
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT resolved FROM sync_conflicts WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 0);
+        conn.execute(
+            "UPDATE sync_conflicts SET last_error='No se pudo aplicar' WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+        let error: String = conn
+            .query_row(
+                "SELECT last_error FROM sync_conflicts WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error, "No se pudo aplicar");
+        resolve_sync_conflict_in_connection(&conn, &id, "playlist").unwrap();
+        assert!(resolve_sync_conflict_in_connection(&conn, &id, "playlist").is_err());
+    }
 }

@@ -400,9 +400,10 @@ pub fn get_connection() -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS sync_queue_ready ON sync_queue(state, next_retry_at, created_at);
 
         CREATE TABLE IF NOT EXISTS sync_tombstones(
-            entity_id TEXT PRIMARY KEY,
+            entity_id TEXT NOT NULL,
             kind TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(entity_id, kind)
         );
         CREATE TABLE IF NOT EXISTS sync_pending_playlist_items(
             playlist_id TEXT NOT NULL,
@@ -427,6 +428,20 @@ pub fn get_connection() -> Result<Connection> {
             created_at INTEGER NOT NULL,
             resolved INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS sync_conflicts(
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            local_payload TEXT NOT NULL,
+            remote_payload TEXT NOT NULL,
+            base_revision INTEGER,
+            remote_revision INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_error TEXT,
+            resolved INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS sync_conflicts_unresolved
+            ON sync_conflicts(resolved, kind, record_id, created_at);
         ",
     )?;
     migrations::run(&conn)?;
