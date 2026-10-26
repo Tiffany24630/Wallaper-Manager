@@ -333,10 +333,12 @@ class ApiClientIntegrationTest {
                     assertTrue(request.body.contains("\"prepared_upload_id\":\"prepared-retry\""))
                     if (resolveAttempts.incrementAndGet() == 1) {
                         appliedRevision = 4L
-                        throw java.io.IOException("simulated lost response")
+                        val response = "{\"resolved\":true,\"idempotent\":true,\"kind\":\"wallpaper\",\"record_id\":\"retry-id\",\"revision\":4}"
+                        Response(200, response.toByteArray(StandardCharsets.UTF_8), closeAfterBytes = 12)
+                    } else {
+                        assertEquals(4L, appliedRevision)
+                        Response(200, "{\"resolved\":true,\"idempotent\":true,\"kind\":\"wallpaper\",\"record_id\":\"retry-id\",\"revision\":${appliedRevision}}")
                     }
-                    assertEquals(4L, appliedRevision)
-                    Response(200, "{\"resolved\":true,\"idempotent\":true,\"kind\":\"wallpaper\",\"record_id\":\"retry-id\",\"revision\":${appliedRevision}}")
                 }
                 else -> Response(404, "{\"error\":\"unexpected\"}")
             }
@@ -346,8 +348,8 @@ class ApiClientIntegrationTest {
         try {
             client.resolveConflict("android-device", conflict, keepRemote = false, resolutionId = "retry-resolution", preparedUploadId = prepared)
             throw AssertionError("the lost response was accepted")
-        } catch (_: java.io.IOException) {
-            // The caller must retain its pending payload until a later confirmed retry.
+        } catch (_: Exception) {
+            // The server applied the resolution, but the JSON response was truncated.
         }
         val retry = client.resolveConflict("android-device", conflict, keepRemote = false, resolutionId = "retry-resolution", preparedUploadId = prepared)
         assertTrue(retry.getBoolean("resolved"))

@@ -9,3 +9,4 @@ lumina-files
 /.gradle/
 /build/
 /app/build/
+/.gradle-user/
