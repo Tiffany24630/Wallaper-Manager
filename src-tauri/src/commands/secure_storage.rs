@@ -3,6 +3,13 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 const TARGET: &str = "Lumina/session-token";
 static SESSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+fn credential_target() -> String {
+    match crate::db::smoke_token() {
+        Ok(Some(token)) => format!("{TARGET}/smoke/{token}"),
+        _ => TARGET.to_string(),
+    }
+}
+
 pub(crate) fn session_lock() -> Result<MutexGuard<'static, ()>, String> {
     SESSION_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -29,7 +36,7 @@ pub(crate) fn get_secure_session_token_unlocked() -> Result<Option<String>, Stri
         use windows::Win32::Security::Credentials::{
             CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
         };
-        let target = wide(TARGET);
+        let target = wide(&credential_target());
         let mut credential: *mut CREDENTIALW = null_mut();
         if CredReadW(
             PCWSTR(target.as_ptr()),
@@ -77,7 +84,7 @@ pub fn set_secure_session_token(token: String) -> Result<(), String> {
         use windows::Win32::Security::Credentials::{
             CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
         };
-        let mut target = wide(TARGET);
+        let mut target = wide(&credential_target());
         let mut bytes = token.into_bytes();
         let credential = CREDENTIALW {
             Flags: windows::Win32::Security::Credentials::CRED_FLAGS(0),
@@ -111,7 +118,7 @@ pub fn delete_secure_session_token() -> Result<(), String> {
     unsafe {
         use windows::core::PCWSTR;
         use windows::Win32::Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC};
-        let target = wide(TARGET);
+        let target = wide(&credential_target());
         let _ = CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0);
         return Ok(());
     }

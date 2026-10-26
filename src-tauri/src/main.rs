@@ -338,6 +338,20 @@ fn main() {
             return;
         }
     };
+    let smoke_api_url = match db::smoke_api_url() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("LUMINA_SMOKE_API_URL_INVALID error={error}");
+            return;
+        }
+    };
+    let smoke_e2e_credentials = match db::smoke_e2e_credentials() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("LUMINA_SMOKE_E2E_CREDENTIALS_INVALID error={error}");
+            return;
+        }
+    };
     if smoke_mode {
         match db::prepare_smoke_webview_data_dir() {
             Ok(Some(webview_dir)) => std::env::set_var("LOCALAPPDATA", webview_dir),
@@ -498,6 +512,8 @@ fn main() {
                 .build(&handle)?;
             if let Some(window_config) = smoke_window_config.clone() {
                 let window_handle = handle.clone();
+                let smoke_api_url = smoke_api_url.clone();
+                let smoke_e2e_credentials = smoke_e2e_credentials.clone();
                 let webview_data_dir = db::app_data_dir()
                     .map_err(|error| std::io::Error::other(error.to_string()))?
                     .join("webview");
@@ -522,16 +538,32 @@ fn main() {
                                 "main_window_builder_configured",
                                 Some(smoke_thread_detail().to_string()),
                             );
+                            let initialization_script = {
+                                let mut script = format!(
+                                    "window.__LUMINA_SMOKE__ = true; window.__LUMINA_SMOKE_TOKEN__ = {};",
+                                    serde_json::to_string(&db::smoke_token().ok().flatten()).unwrap_or_else(|_| "null".into())
+                                );
+                                if smoke_exit_after_init {
+                                    script.push_str("window.__LUMINA_SMOKE_EXIT__ = true;");
+                                }
+                                if let Some(url) = smoke_api_url.as_deref() {
+                                    script.push_str(&format!(
+                                        "window.localStorage.setItem('lumina.account.apiUrl', {});",
+                                        serde_json::to_string(url).unwrap_or_else(|_| "null".into())
+                                    ));
+                                }
+                                if let Some((email, password)) = smoke_e2e_credentials.as_ref() {
+                                    script.push_str(&format!(
+                                        "window.__LUMINA_SMOKE_E2E__ = {{email:{},password:{}}};",
+                                        serde_json::to_string(email).unwrap_or_else(|_| "null".into()),
+                                        serde_json::to_string(password).unwrap_or_else(|_| "null".into())
+                                    ));
+                                }
+                                script
+                            };
                             builder
                                 .data_directory(webview_data_dir)
-                                .initialization_script(if smoke_exit_after_init {
-                                    format!(
-                                        "window.__LUMINA_SMOKE__ = true; window.__LUMINA_SMOKE_EXIT__ = true; window.__LUMINA_SMOKE_TOKEN__ = {};",
-                                        serde_json::to_string(&db::smoke_token().ok().flatten()).unwrap_or_else(|_| "null".into())
-                                    )
-                                } else {
-                                    "window.__LUMINA_SMOKE__ = true;".into()
-                                })
+                                .initialization_script(initialization_script)
                                 .on_navigation(|url| {
                                     smoke_diagnostic(
                                         "webview_navigation_requested",

@@ -65,6 +65,77 @@ pub fn smoke_mode_requested() -> Result<bool, String> {
     Ok(smoke_test_token_from_args(std::env::args())?.is_some())
 }
 
+fn validate_smoke_api_url(value: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(value.trim())
+        .map_err(|_| "La URL de la API smoke no es válida".to_string())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("La URL de la API smoke no es segura".into());
+    }
+    if url.scheme() == "http" && !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+    {
+        return Err("La API smoke HTTP debe estar en loopback".into());
+    }
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+pub fn smoke_api_url() -> Result<Option<String>, String> {
+    resolve_smoke_api_url(
+        smoke_mode_requested()?,
+        std::env::var("LUMINA_SMOKE_API_URL").ok().as_deref(),
+    )
+}
+
+fn resolve_smoke_api_url(
+    smoke_mode: bool,
+    configured: Option<&str>,
+) -> Result<Option<String>, String> {
+    if configured.is_some() && !smoke_mode {
+        return Err("LUMINA_SMOKE_API_URL solo está disponible en modo smoke".into());
+    }
+    configured.map(validate_smoke_api_url).transpose()
+}
+
+fn resolve_smoke_e2e_credentials(
+    smoke_mode: bool,
+    email: Option<&str>,
+    password: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    if (email.is_some() || password.is_some()) && !smoke_mode {
+        return Err("Las credenciales E2E solo están disponibles en modo smoke".into());
+    }
+    match (email, password) {
+        (None, None) => Ok(None),
+        (Some(email), Some(password)) => {
+            let email = email.trim();
+            if email.is_empty()
+                || !email
+                    .rsplit_once('@')
+                    .is_some_and(|(_, domain)| domain.ends_with(".test"))
+            {
+                return Err("La cuenta smoke debe usar un dominio .test".into());
+            }
+            if !(10..=256).contains(&password.len()) {
+                return Err("La contraseña smoke debe tener entre 10 y 256 caracteres".into());
+            }
+            Ok(Some((email.to_string(), password.to_string())))
+        }
+        _ => Err("Las credenciales E2E requieren correo y contraseña".into()),
+    }
+}
+
+pub fn smoke_e2e_credentials() -> Result<Option<(String, String)>, String> {
+    resolve_smoke_e2e_credentials(
+        smoke_mode_requested()?,
+        std::env::var("LUMINA_SMOKE_E2E_EMAIL").ok().as_deref(),
+        std::env::var("LUMINA_SMOKE_E2E_PASSWORD").ok().as_deref(),
+    )
+}
+
 fn physical_operations_allowed_for_mode(smoke_mode: bool) -> Result<(), String> {
     if smoke_mode {
         Err("physical operations are blocked in smoke mode".into())
@@ -497,7 +568,8 @@ fn backfill_cursor_hashes(conn: &Connection) -> Result<()> {
 mod tests {
     use super::{
         backfill_cursor_hashes, physical_operations_allowed_for_mode, resolve_data_dir,
-        resolve_database_path, smoke_exit_after_init_from_args, smoke_test_token_from_args,
+        resolve_database_path, resolve_smoke_api_url, resolve_smoke_e2e_credentials,
+        smoke_exit_after_init_from_args, smoke_test_token_from_args, validate_smoke_api_url,
         validate_smoke_token,
     };
     use rusqlite::Connection;
@@ -623,6 +695,55 @@ mod tests {
     fn smoke_mode_blocks_physical_operations_but_production_allows_them() {
         assert!(physical_operations_allowed_for_mode(true).is_err());
         assert!(physical_operations_allowed_for_mode(false).is_ok());
+    }
+
+    #[test]
+    fn smoke_api_url_accepts_only_safe_loopback_http_or_https() {
+        assert_eq!(
+            validate_smoke_api_url("http://127.0.0.1:8765/").unwrap(),
+            "http://127.0.0.1:8765"
+        );
+        assert!(validate_smoke_api_url("https://sync.example.test").is_ok());
+        assert!(validate_smoke_api_url("http://sync.example.test").is_err());
+        assert!(validate_smoke_api_url("http://user:pass@127.0.0.1:8765").is_err());
+        assert!(validate_smoke_api_url("http://127.0.0.1:8765/?token=secret").is_err());
+    }
+
+    #[test]
+    fn smoke_api_url_cannot_configure_production() {
+        assert!(resolve_smoke_api_url(false, Some("http://127.0.0.1:8765")).is_err());
+        assert_eq!(
+            resolve_smoke_api_url(true, Some("http://127.0.0.1:8765")).unwrap(),
+            Some("http://127.0.0.1:8765".to_string())
+        );
+    }
+
+    #[test]
+    fn smoke_e2e_credentials_are_synthetic_and_mode_scoped() {
+        assert!(resolve_smoke_e2e_credentials(
+            false,
+            Some("test@example.test"),
+            Some("synthetic-password")
+        )
+        .is_err());
+        assert!(resolve_smoke_e2e_credentials(
+            true,
+            Some("test@example.com"),
+            Some("synthetic-password")
+        )
+        .is_err());
+        assert_eq!(
+            resolve_smoke_e2e_credentials(
+                true,
+                Some("test@example.test"),
+                Some("synthetic-password")
+            )
+            .unwrap(),
+            Some((
+                "test@example.test".to_string(),
+                "synthetic-password".to_string()
+            ))
+        );
     }
 
     #[test]

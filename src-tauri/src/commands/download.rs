@@ -142,6 +142,20 @@ mod tests {
     }
 
     #[test]
+    fn temporary_download_path_keeps_format_extension_for_importers() {
+        let path = temporary_download_path(Path::new("C:/lumina-test-downloads"), "png");
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(".part."));
+    }
+
+    #[test]
     fn validates_file_ids_and_hashes() {
         assert!(valid_file_id(&"a".repeat(32)));
         assert!(!valid_file_id("../file"));
@@ -221,6 +235,10 @@ fn valid_extension(kind: &str, extension: &str) -> bool {
         "cursor" => ["cur", "ani", "png", "jpg", "jpeg", "webp", "bmp"].contains(&extension),
         _ => false,
     }
+}
+
+fn temporary_download_path(root: &Path, extension: &str) -> PathBuf {
+    root.join(format!("{}.part.{}", Uuid::new_v4(), extension))
 }
 fn validate_base_url(value: &str) -> Result<Url, String> {
     let url = Url::parse(value.trim())
@@ -373,7 +391,10 @@ where
         .map_err(|e| e.to_string())?
         .join("sync/downloads");
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let temp = TempFile(root.join(format!("{}.{}.part", Uuid::new_v4(), extension)));
+    // Keep the real extension last: the importer derives the format from the
+    // temporary path, while the `.part` marker still makes incomplete files
+    // distinguishable from published resources.
+    let temp = TempFile(temporary_download_path(&root, &extension));
     let mut output = File::create(&temp.0).map_err(|e| e.to_string())?;
     let mut stream = response;
     let mut buffer = vec![0u8; CHUNK_SIZE];
