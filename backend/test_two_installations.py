@@ -22,6 +22,7 @@ class TwoInstallationIntegrationTests(unittest.TestCase):
         self.http.store = Store(str(root / "api.db"))
         self.http.files_root = root / "remote-files"
         (self.http.files_root / "uploads").mkdir(parents=True)
+        self.http.sync_lock = threading.RLock()
         self.http.auth_attempts = {}; self.http.transfer_attempts = {}; self.http.auth_lock = threading.Lock()
         self.http.allow_auth_attempt = lambda address: True
         self.http.allow_transfer_attempt = lambda address: True

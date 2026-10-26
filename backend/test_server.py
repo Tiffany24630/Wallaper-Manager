@@ -8,10 +8,20 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from http.server import ThreadingHTTPServer
-from server import Api, Store, password_hash, password_verify
+from server import Api, Store, is_loopback_host, parse_allowed_origins, password_hash, password_verify, validate_bind_host
 
 
 class AccountSecurityTests(unittest.TestCase):
+    def test_network_mode_is_loopback_only_and_cors_origins_are_explicit(self):
+        self.assertTrue(is_loopback_host("127.0.0.1"))
+        self.assertTrue(is_loopback_host("::1"))
+        self.assertFalse(is_loopback_host("0.0.0.0"))
+        validate_bind_host("localhost")
+        with self.assertRaises(ValueError):
+            validate_bind_host("192.0.2.10")
+        with self.assertRaises(ValueError):
+            parse_allowed_origins("*")
+
     def test_password_is_scrypt_and_verifies(self):
         encoded = password_hash("correct horse battery")
         self.assertTrue(encoded.startswith("scrypt$"))
@@ -68,6 +78,8 @@ class FileTransferTests(unittest.TestCase):
         self.http.store = Store(str(Path(self.temp.name) / "sync.db"))
         self.http.files_root = Path(self.temp.name) / "files"
         (self.http.files_root / "uploads").mkdir(parents=True)
+        self.http.allowed_origins = {"https://app.example"}
+        self.http.sync_lock = threading.RLock()
         self.http.auth_attempts = {}
         self.http.auth_lock = threading.Lock()
         self.http.allow_auth_attempt = lambda address: True
@@ -105,6 +117,79 @@ class FileTransferTests(unittest.TestCase):
             request = urllib.request.Request(self.base + f"/v1/files/{completed['file_id']}", headers={"Authorization": "Bearer " + other, "X-Device-ID": "b@example.com"})
             urllib.request.urlopen(request)
         self.assertEqual(error.exception.code, 404)
+
+    def test_cors_allowlist_preflight_and_auth_error_do_not_reflect_origin_or_token(self):
+        allowed = urllib.request.Request(
+            self.base + "/v1/auth/session",
+            headers={"Origin": "https://app.example", "Authorization": "Bearer super-secret-token"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(allowed)
+        self.assertEqual(error.exception.code, 401)
+        self.assertEqual(error.exception.headers.get("Access-Control-Allow-Origin"), "https://app.example")
+        self.assertNotIn("*", error.exception.headers.get("Access-Control-Allow-Origin", ""))
+        self.assertNotIn("super-secret-token", error.exception.read().decode())
+
+        denied = urllib.request.Request(
+            self.base + "/v1/auth/session",
+            headers={"Origin": "https://evil.example"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(denied)
+        self.assertEqual(error.exception.code, 403)
+        self.assertIsNone(error.exception.headers.get("Access-Control-Allow-Origin"))
+
+        preflight = urllib.request.Request(
+            self.base + "/v1/sync",
+            method="OPTIONS",
+            headers={
+                "Origin": "https://app.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Authorization, Content-Type, X-Device-ID, X-Sync-Revision",
+            },
+        )
+        with urllib.request.urlopen(preflight) as response:
+            self.assertEqual(response.status, 204)
+            self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "https://app.example")
+            self.assertIn("authorization", response.headers.get("Access-Control-Allow-Headers", "").lower())
+            self.assertIn("x-sync-revision", response.headers.get("Access-Control-Allow-Headers", "").lower())
+
+        denied_preflight = urllib.request.Request(
+            self.base + "/v1/sync",
+            method="OPTIONS",
+            headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(denied_preflight)
+        self.assertEqual(error.exception.code, 403)
+
+    def test_conditional_download_requires_expected_revision_and_typed_hash(self):
+        token = self.account("conditional@example.com")
+        content = b"\x89PNG\r\n\x1a\nconditional"; digest = hashlib.sha256(content).hexdigest()
+        self.call("/v1/sync", {"device_id": "conditional@example.com", "changes": [{"id": "same-id", "kind": "wallpaper", "base_revision": 0, "payload": {"hash": digest}}]}, token)
+        _, init = self.call("/v1/files/upload/init", {"device_id": "conditional@example.com", "record_id": "same-id", "kind": "wallpaper", "name": "wall.png", "mime": "image/png", "size": len(content), "sha256": digest}, token)
+        self.call(f"/v1/files/upload/{init['upload_id']}", token=token, method="PUT", body=content, headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(content)), "X-Upload-Offset": "0"})
+        _, completed = self.call(f"/v1/files/upload/{init['upload_id']}/complete", token=token, method="POST")
+        headers = {"Authorization": "Bearer " + token, "X-Device-ID": "conditional@example.com", "Origin": "https://app.example", "X-Sync-Kind": "wallpaper", "X-Sync-Record-ID": "same-id", "X-Sync-Revision": "1"}
+        request = urllib.request.Request(self.base + f"/v1/files/{completed['file_id']}", headers=headers)
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.read(), content)
+            self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "https://app.example")
+
+        wrong_kind = {**headers, "X-Sync-Kind": "cursor"}
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(urllib.request.Request(self.base + f"/v1/files/{completed['file_id']}", headers=wrong_kind))
+        self.assertEqual(error.exception.code, 409)
+
+        self.call("/v1/sync", {"device_id": "conditional@example.com", "changes": [{"id": "same-id", "kind": "wallpaper", "base_revision": 1, "payload": {"hash": digest, "changed": True}}]}, token)
+        request = urllib.request.Request(self.base + f"/v1/files/{completed['file_id']}", headers=headers)
+        with self.assertRaises(urllib.error.HTTPError) as error: urllib.request.urlopen(request)
+        self.assertEqual(error.exception.code, 409)
+
+        self.http.store.conn.execute("UPDATE sync_records SET payload=? WHERE record_id='same-id' AND kind='wallpaper'", (json.dumps({"hash": "0" * 64}),)); self.http.store.conn.commit()
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            request = urllib.request.Request(self.base + f"/v1/files/{completed['file_id']}", headers={**headers, "X-Sync-Revision": "2"}); urllib.request.urlopen(request)
+        self.assertEqual(error.exception.code, 409)
 
     def test_invalid_hash_and_incomplete_transfer_are_rejected(self):
         token = self.account("c@example.com")
@@ -152,6 +237,7 @@ class FileTransferTests(unittest.TestCase):
         self.call("/v1/sync", {"device_id": "typed@example.com", "changes": [
             {"id": "same-id", "kind": "wallpaper", "base_revision": 1, "payload": {"name": "Fondo actualizado"}},
             {"id": "same-id", "kind": "playlist", "base_revision": 1, "payload": {"name": "Lista actualizada"}},
+            {"id": "same-id", "kind": "cursor", "base_revision": 1, "payload": {"name": "Cursor actualizado"}},
         ]}, token)
         _, conflict = self.call("/v1/sync", {"device_id": "typed@example.com", "changes": [
             {"id": "same-id", "kind": "playlist", "base_revision": 1, "payload": {"name": "Lista obsoleta"}},

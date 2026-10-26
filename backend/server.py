@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -21,6 +22,51 @@ ALLOWED_FILES = {
     "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/bmp": ".bmp",
     "image/x-icon": ".cur", "application/octet-stream": ".ani",
 }
+DEFAULT_ALLOWED_ORIGINS = frozenset({
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+})
+CORS_METHODS = frozenset({"GET", "POST", "PUT", "DELETE", "OPTIONS"})
+CORS_HEADERS = frozenset({
+    "authorization", "content-type", "x-device-id", "x-sync-kind",
+    "x-sync-record-id", "x-sync-revision", "x-upload-length", "x-upload-offset",
+})
+
+
+def is_loopback_host(host):
+    value = str(host or "").strip().lower().strip("[]")
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_bind_host(host):
+    if not is_loopback_host(host):
+        raise ValueError("El servidor HTTP solo puede enlazarse a loopback; usa un terminador TLS externo restringido a loopback para acceso de red")
+    return host
+
+
+def parse_allowed_origins(value=None):
+    if value is None:
+        value = os.environ.get("LUMINA_API_ALLOWED_ORIGINS", "")
+    if isinstance(value, str):
+        origins = [item.strip() for item in value.split(",") if item.strip()]
+    else:
+        origins = [str(item).strip() for item in value or [] if str(item).strip()]
+    if not origins:
+        return set(DEFAULT_ALLOWED_ORIGINS)
+    result = set()
+    for origin in origins:
+        parsed = urlparse(origin)
+        if origin == "*" or parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.path or parsed.params or parsed.query or parsed.fragment:
+            raise ValueError("Cada origen CORS debe ser una URL explícita sin comodines ni rutas")
+        result.add(origin.rstrip("/"))
+    return result
 
 
 def now():
@@ -157,12 +203,31 @@ class Store:
 class Api(BaseHTTPRequestHandler):
     server_version = "LuminaSync/1.0"
 
+    def request_origin(self):
+        origin = self.headers.get("Origin")
+        return origin.rstrip("/") if origin else None
+
+    def origin_allowed(self):
+        origin = self.request_origin()
+        return origin is None or origin in getattr(self.server, "allowed_origins", DEFAULT_ALLOWED_ORIGINS)
+
+    def cors_headers(self, origin):
+        if origin and origin in getattr(self.server, "allowed_origins", DEFAULT_ALLOWED_ORIGINS):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
+    def reject_disallowed_origin(self):
+        if self.origin_allowed():
+            return False
+        self.json(403, {"error": "Origen no permitido"})
+        return True
+
     def json(self, status, value):
         raw = json.dumps(value, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.cors_headers(self.request_origin())
         self.end_headers()
         self.wfile.write(raw)
 
@@ -180,13 +245,27 @@ class Api(BaseHTTPRequestHandler):
         return self.server.store.session_user(value[7:])
 
     def do_OPTIONS(self):
+        origin = self.request_origin()
+        if not origin or not self.origin_allowed():
+            return self.json(403, {"error": "Origen CORS no permitido"})
+        requested_method = self.headers.get("Access-Control-Request-Method", "GET").upper()
+        requested_headers = {
+            header.strip().lower()
+            for header in self.headers.get("Access-Control-Request-Headers", "").split(",")
+            if header.strip()
+        }
+        if requested_method not in CORS_METHODS or not requested_headers.issubset(CORS_HEADERS):
+            return self.json(403, {"error": "Solicitud CORS no permitida"})
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.cors_headers(origin)
+        self.send_header("Access-Control-Allow-Headers", ", ".join(sorted(CORS_HEADERS)))
+        self.send_header("Access-Control-Allow-Methods", ", ".join(sorted(CORS_METHODS)))
+        self.send_header("Access-Control-Max-Age", "600")
         self.end_headers()
 
     def do_POST(self):
+        if self.reject_disallowed_origin():
+            return
         try:
             path = urlparse(self.path).path
             if path in ("/v1/auth/register", "/v1/auth/login") and not self.server.allow_auth_attempt(self.client_address[0]):
@@ -215,6 +294,8 @@ class Api(BaseHTTPRequestHandler):
             self.json(500, {"error": "Error interno del servidor"})
 
     def do_GET(self):
+        if self.reject_disallowed_origin():
+            return
         path = urlparse(self.path).path
         if path.startswith("/v1/files/") and not getattr(self.server, "allow_transfer_attempt", lambda address: True)(self.client_address[0]):
             return self.json(429, {"error": "Demasiadas transferencias; inténtalo más tarde"})
@@ -235,6 +316,8 @@ class Api(BaseHTTPRequestHandler):
         self.json(404, {"error": "Ruta no encontrada"})
 
     def do_PUT(self):
+        if self.reject_disallowed_origin():
+            return
         path = urlparse(self.path).path
         if not path.startswith("/v1/files/upload/") or path.endswith("/complete"):
             return self.json(404, {"error": "Ruta no encontrada"})
@@ -248,6 +331,8 @@ class Api(BaseHTTPRequestHandler):
             self.json(500, {"error": "No se pudo recibir la transferencia"})
 
     def do_DELETE(self):
+        if self.reject_disallowed_origin():
+            return
         path = unquote(urlparse(self.path).path)
         user = self.auth()
         if not user:
@@ -311,6 +396,10 @@ class Api(BaseHTTPRequestHandler):
         return self.json(200, {"device_id": device_id})
 
     def sync(self, data):
+        with self.server.sync_lock:
+            return self._sync_locked(data)
+
+    def _sync_locked(self, data):
         user = self.auth()
         if not user:
             return self.json(401, {"error": "Sesión no válida"})
@@ -455,21 +544,57 @@ class Api(BaseHTTPRequestHandler):
             return self.json(401, {"error": "SesiÃ³n no vÃ¡lida"})
         if not self.server.store.device_for(self.headers.get("X-Device-ID", ""), user["id"]):
             return self.json(403, {"error": "Dispositivo no vinculado o revocado"})
+        conditional = [self.headers.get(name) for name in ("X-Sync-Kind", "X-Sync-Record-ID", "X-Sync-Revision")]
+        if any(value is not None for value in conditional):
+            if not all(value for value in conditional):
+                return self.json(400, {"error": "La descarga condicionada requiere kind, record_id y revisión"})
+            kind, record_id, revision_text = conditional
+            try:
+                revision = int(revision_text)
+            except (TypeError, ValueError):
+                return self.json(400, {"error": "La revisión condicionada no es válida"})
+            with self.server.sync_lock:
+                file = self.server.store.conn.execute(
+                    "SELECT f.*, sr.revision, sr.payload AS record_payload FROM files f "
+                    "JOIN file_records fr ON fr.file_id=f.id AND fr.user_id=f.user_id AND fr.record_id=f.record_id AND fr.kind=f.kind "
+                    "JOIN sync_records sr ON sr.user_id=f.user_id AND sr.record_id=f.record_id AND sr.kind=f.kind "
+                    "WHERE f.id=? AND f.user_id=? AND f.record_id=? AND f.kind=? AND sr.revision=? AND sr.deleted=0",
+                    (file_id, user["id"], record_id, kind, revision),
+                ).fetchone()
+                if not file:
+                    return self.json(409, {"error": "La revisión remota ya no coincide con el conflicto"})
+                try:
+                    payload_hash = str(json.loads(file["record_payload"]).get("hash", "")).lower()
+                except (TypeError, ValueError):
+                    payload_hash = ""
+                if not payload_hash or payload_hash != file["sha256"].lower():
+                    return self.json(409, {"error": "El archivo no coincide con los metadatos de la revisión"})
+                target = (self.server.files_root / file["storage_name"]).resolve(); root = self.server.files_root.resolve()
+                if root not in target.parents or not target.is_file():
+                    return self.json(404, {"error": "Archivo no disponible"})
+                self.send_response(200); self.send_header("Content-Type", file["mime"]); self.send_header("Content-Length", str(file["size_bytes"])); self.send_header("X-Content-SHA256", file["sha256"]); self.cors_headers(self.request_origin()); self.end_headers()
+                with target.open("rb") as stream:
+                    while chunk := stream.read(CHUNK_SIZE): self.wfile.write(chunk)
+            return
         file = self.server.store.conn.execute("SELECT * FROM files WHERE id=? AND user_id=?", (file_id, user["id"])).fetchone()
         if not file:
             return self.json(404, {"error": "Archivo no encontrado"})
         target = (self.server.files_root / file["storage_name"]).resolve(); root = self.server.files_root.resolve()
         if root not in target.parents or not target.is_file():
             return self.json(404, {"error": "Archivo no disponible"})
-        self.send_response(200); self.send_header("Content-Type", file["mime"]); self.send_header("Content-Length", str(file["size_bytes"])); self.send_header("X-Content-SHA256", file["sha256"]); self.end_headers()
+        self.send_response(200); self.send_header("Content-Type", file["mime"]); self.send_header("Content-Length", str(file["size_bytes"])); self.send_header("X-Content-SHA256", file["sha256"]); self.cors_headers(self.request_origin()); self.end_headers()
         with target.open("rb") as stream:
             while chunk := stream.read(CHUNK_SIZE): self.wfile.write(chunk)
 
 
-def run(host, port, db):
+def run(host, port, db, allowed_origins=None):
+    validate_bind_host(host)
+    configured_origins = parse_allowed_origins(allowed_origins)
     server = ThreadingHTTPServer((host, port), Api)
     server.store = Store(db)
+    server.allowed_origins = configured_origins
     server.files_root = Path(os.environ.get("LUMINA_API_STORAGE", "lumina-files")).resolve()
+    server.sync_lock = threading.RLock()
     (server.files_root / "uploads").mkdir(parents=True, exist_ok=True)
     (server.files_root / "files").mkdir(parents=True, exist_ok=True)
     server.auth_attempts = {}
@@ -497,7 +622,7 @@ def run(host, port, db):
             server.transfer_attempts[address] = attempts
             return True
     server.allow_transfer_attempt = allow_transfer_attempt
-    print(f"Lumina sync API escuchando en http://{host}:{port}", flush=True)
+    print(f"Lumina sync API local escuchando en http://{host}:{port}", flush=True)
     server.serve_forever()
 
 
@@ -506,5 +631,6 @@ if __name__ == "__main__":
     parser.add_argument("--host", default=os.environ.get("LUMINA_API_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("LUMINA_API_PORT", "8765")))
     parser.add_argument("--db", default=os.environ.get("LUMINA_API_DB", str(Path("lumina-sync.db"))))
+    parser.add_argument("--allowed-origin", action="append", dest="allowed_origins", default=None)
     args = parser.parse_args()
-    run(args.host, args.port, args.db)
+    run(args.host, args.port, args.db, args.allowed_origins)

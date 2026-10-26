@@ -17,6 +17,7 @@ const normalizeApiUrl = (value: string) => {
   let parsed: URL;
   try { parsed = new URL(normalized); } catch { throw new Error("La URL de la API no es válida. Usa, por ejemplo, http://127.0.0.1:8765."); }
   if (!parsed.hostname || !["http:", "https:"].includes(parsed.protocol)) throw new Error("La URL de la API debe usar HTTP o HTTPS.");
+  if (parsed.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) throw new Error("Las conexiones HTTP solo están permitidas para servicios locales; usa HTTPS para una API remota.");
   return normalized;
 };
 const networkError = (error: unknown) => {
@@ -92,7 +93,7 @@ export const accountService = {
   syncLibrary: async () => {
     const wallpapers = await wallpaperService.getAll(); const cursors = await cursorService.list(); const playlists = await playlistService.getAll();
     const remote = await accountService.sync(); const key = (kind: string, id: string) => `${kind}:${id}`; const revisions = new Map(remote.records.map(record => [key(record.kind, record.record_id), record.revision]));
-    const states = await invoke<PlaylistSyncState[]>("list_sync_playlist_states").catch(() => [] as PlaylistSyncState[]);
+    const states = await invoke<PlaylistSyncState[]>("list_sync_playlist_states");
     const stateMap = new Map(states.map(state => [state.playlistId, state]));
     const localPlaylistMap = new Map(playlists.map(playlist => [playlist.id, playlist]));
     const localPlaylistPayloads = new Map<string, Record<string, unknown>>();
@@ -112,7 +113,7 @@ export const accountService = {
         try { remoteUnchanged = !!state.basePayload && JSON.stringify(JSON.parse(state.basePayload)) === JSON.stringify(record.payload); } catch { remoteUnchanged = false; }
         if (!remoteUnchanged && record.revision > (state.lastRemoteRevision ?? 0)) await invoke("record_sync_conflict", { kind: "playlist", recordId: record.record_id, localPayload: localPlaylistPayloads.get(record.record_id) || {}, remotePayload: record.payload, baseRevision: state.lastRemoteRevision ?? null, remoteRevision: record.revision });
       } else if (record.deleted) {
-        await invoke("delete_playlist", { playlistId: record.record_id }).catch(() => undefined);
+        await invoke("delete_playlist", { playlistId: record.record_id });
         await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload });
       } else if (record.revision > (state.lastRemoteRevision ?? 0)) {
         await invoke("apply_synced_playlist", { playlistId: record.record_id, name: String(record.payload.name || local.name), wallpaperIds: Array.isArray(record.payload.wallpaper_ids) ? record.payload.wallpaper_ids.filter((id): id is string => typeof id === "string") : [] });
@@ -122,7 +123,7 @@ export const accountService = {
     const changes = wallpapers.map(wallpaper => ({ id: wallpaper.id, kind: "wallpaper", base_revision: revisions.get(key("wallpaper", wallpaper.id)) ?? 0, payload: { name: wallpaper.name, hash: wallpaper.hash ?? null, size_bytes: wallpaper.sizeBytes ?? null, width: wallpaper.width ?? null, height: wallpaper.height ?? null, file_type: wallpaper.fileType ?? null, favorite: wallpaper.favorite } }));
     const cursorChanges = cursors.map(cursor => ({ id: cursor.id, kind: "cursor", base_revision: revisions.get(key("cursor", cursor.id)) ?? 0, payload: { name: cursor.name, resource_type: cursor.resourceType, file_type: cursor.resourceType === "animated" ? "ani" : "cur", hash: cursor.hash ?? null, hotspot_x: cursor.hotspotX, hotspot_y: cursor.hotspotY } }));
     const playlistChanges = playlists.map(playlist => ({ id: playlist.id, kind: "playlist", base_revision: stateMap.get(playlist.id)?.lastRemoteRevision ?? 0, payload: localPlaylistPayloads.get(playlist.id) }));
-    const tombstones = await invoke<Array<[string, string]>>("list_sync_tombstones").catch(() => []);
+    const tombstones = await invoke<Array<[string, string]>>("list_sync_tombstones");
     const deletedChanges = tombstones.map(([id, kind]) => ({ id, kind, base_revision: kind === "playlist" ? stateMap.get(id)?.lastRemoteRevision ?? 0 : revisions.get(key(kind, id)) ?? 0, deleted: true, payload: {} }));
     const outgoing = [...changes, ...cursorChanges, ...playlistChanges, ...deletedChanges];
     const outgoingByKey = new Map(outgoing.map(change => [key(change.kind, change.id), change]));
@@ -133,7 +134,7 @@ export const accountService = {
       await invoke("record_sync_conflict", { kind: conflict.kind, recordId: conflict.id, localPayload: local?.payload || {}, remotePayload: conflict.server_payload, baseRevision: local?.base_revision ?? null, remoteRevision: conflict.server_revision });
     }
     const conflictKeys = new Set(conflicts.map(conflict => key(conflict.kind, conflict.id)));
-    for (const record of result.records.filter(item => item.kind === "playlist" && !conflictKeys.has(key(item.kind, item.record_id)))) await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload }).catch(() => undefined);
+    for (const record of result.records.filter(item => item.kind === "playlist" && !conflictKeys.has(key(item.kind, item.record_id)))) await invoke("mark_playlist_synced", { playlistId: record.record_id, revision: record.revision, payload: record.payload });
     const uploaded: string[] = []; const errors: string[] = [];
     for (const wallpaper of wallpapers) {
       if (conflictKeys.has(key("wallpaper", wallpaper.id))) continue;
