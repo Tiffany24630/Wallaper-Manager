@@ -227,6 +227,41 @@ class ApiClientIntegrationTest {
         try { client.session(); throw AssertionError("invalid JSON was accepted") } catch (_: Exception) { }
     }
 
+    @Test fun resolvesTypedConflictWithExpectedRevisionAndIsolatesActions() {
+        client.token = "resolve-token"
+        val requests = mutableListOf<Request>()
+        server.handler = { request ->
+            requests += request
+            if (request.path == "/v1/sync/resolve") {
+                assertEquals("POST", request.method)
+                assertEquals("Bearer resolve-token", request.headers["authorization"])
+                Response(200, "{\"resolved\":true,\"idempotent\":false,\"kind\":\"wallpaper\",\"record_id\":\"shared-id\",\"revision\":8,\"deleted\":false,\"payload\":{}}")
+            } else Response(404, "{\"error\":\"unexpected\"}")
+        }
+        val conflict = SyncConflict("shared-id", "wallpaper", 7, org.json.JSONObject())
+        val response = client.resolveConflict("android-device", conflict, keepRemote = true, resolutionId = "resolution-1")
+        assertTrue(response.getBoolean("resolved"))
+        val body = requests.single().body
+        assertTrue(body.contains("\"kind\":\"wallpaper\""))
+        assertTrue(body.contains("\"record_id\":\"shared-id\""))
+        assertTrue(body.contains("\"expected_revision\":7"))
+        assertTrue(body.contains("\"action\":\"keep_remote\""))
+        assertTrue(body.contains("\"resolution_id\":\"resolution-1\""))
+
+        server.handler = { request ->
+            assertTrue(request.body.contains("\"action\":\"keep_local\""))
+            assertTrue(request.body.contains("\"kind\":\"cursor\""))
+            Response(409, "{\"error\":\"revision changed\"}")
+        }
+        try {
+            client.resolveConflict("android-device", SyncConflict("shared-id", "cursor", 7, org.json.JSONObject()), keepRemote = false,
+                localPayload = org.json.JSONObject().put("name", "local"), resolutionId = "resolution-2")
+            throw AssertionError("stale resolution was accepted")
+        } catch (error: ApiException) {
+            assertEquals(409, error.status)
+        }
+    }
+
     @Test fun unavailableServerRemainsAConnectionError() {
         val unusedPort = java.net.ServerSocket(0).use { it.localPort }
         try { ApiClient("http://127.0.0.1:$unusedPort").session(); throw AssertionError("offline server was accepted") } catch (_: java.io.IOException) { }

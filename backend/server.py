@@ -157,6 +157,14 @@ class Store:
           status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
           final_file_id TEXT, final_storage_name TEXT
         );
+        CREATE TABLE IF NOT EXISTS sync_resolutions(
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          resolution_id TEXT NOT NULL,
+          kind TEXT NOT NULL, record_id TEXT NOT NULL,
+          expected_revision INTEGER NOT NULL, action TEXT NOT NULL,
+          result_revision INTEGER NOT NULL, created_at INTEGER NOT NULL,
+          PRIMARY KEY(user_id, resolution_id)
+        );
         """)
         self._migrate_typed_devices()
         self._migrate_typed_sync_records()
@@ -419,6 +427,8 @@ class Api(BaseHTTPRequestHandler):
                 return self.device(data)
             if path == "/v1/sync":
                 return self.sync(data)
+            if path == "/v1/sync/resolve":
+                return self.resolve_sync(data)
             if path == "/v1/files/upload/init":
                 with self.upload_guard():
                     self.server.store.cleanup_expired_uploads(self.server.files_root)
@@ -546,6 +556,97 @@ class Api(BaseHTTPRequestHandler):
         with self.server.sync_lock:
             return self._sync_locked(data)
 
+    def resolve_sync(self, data):
+        with self.server.sync_lock:
+            user = self.auth()
+            if not user:
+                return self.json(401, {"error": "SesiÃ³n no vÃ¡lida"})
+            device_id = str(data.get("device_id", "")).strip()
+            if not self.server.store.device_for(device_id, user["id"]):
+                return self.json(403, {"error": "Dispositivo no vinculado o revocado"})
+            kind = str(data.get("kind", "")).strip()
+            record_id = str(data.get("record_id", "")).strip()
+            action = str(data.get("action", "")).strip()
+            resolution_id = str(data.get("resolution_id", "")).strip()
+            if kind not in ("wallpaper", "cursor", "playlist", "playlist_item", "setting") or not record_id or not resolution_id or action not in ("keep_remote", "keep_local"):
+                raise ValueError("Datos de resolución no válidos")
+            try:
+                expected_revision = int(data.get("expected_revision"))
+            except (TypeError, ValueError):
+                raise ValueError("La revisión esperada no es válida")
+            if expected_revision < 1 or len(resolution_id) > 128:
+                raise ValueError("Datos de resolución no válidos")
+            local_payload = data.get("local_payload")
+            if action == "keep_local" and not isinstance(local_payload, dict):
+                raise ValueError("La resolución local requiere metadatos válidos")
+            with self.server.store.conn:
+                previous = self.server.store.conn.execute(
+                    "SELECT kind,record_id,expected_revision,action,result_revision FROM sync_resolutions WHERE user_id=? AND resolution_id=?",
+                    (user["id"], resolution_id),
+                ).fetchone()
+                if previous:
+                    if (previous["kind"], previous["record_id"], previous["expected_revision"], previous["action"]) != (kind, record_id, expected_revision, action):
+                        raise ValueError("El identificador de resolución ya fue usado para otra operación")
+                    return self.json(200, {"resolved": True, "idempotent": True, "kind": kind, "record_id": record_id, "revision": previous["result_revision"]})
+                current = self.server.store.conn.execute(
+                    "SELECT record_id,kind,payload,revision,updated_at,deleted FROM sync_records WHERE user_id=? AND kind=? AND record_id=?",
+                    (user["id"], kind, record_id),
+                ).fetchone()
+                if not current or current["revision"] != expected_revision:
+                    return self.json(409, {"error": "La revisión remota cambió; vuelve a sincronizar antes de resolver"})
+                requested_deleted = bool(data.get("deleted", False))
+                if action == "keep_local" and current["deleted"] and not requested_deleted:
+                    return self.json(409, {"error": "Remote record is deleted; confirm the local tombstone explicitly"})
+                remote_file = None
+                if action == "keep_remote" and kind in ("wallpaper", "cursor") and not current["deleted"]:
+                    remote_file = self.server.store.conn.execute(
+                        "SELECT id,record_id,kind,original_name,mime,extension,size_bytes,sha256,storage_name FROM files WHERE user_id=? AND kind=? AND record_id=? LIMIT 1",
+                        (user["id"], kind, record_id),
+                    ).fetchone()
+                    if not remote_file:
+                        return self.json(409, {"error": "Remote file unavailable"})
+                    target = (self.server.files_root / remote_file["storage_name"]).resolve()
+                    root = self.server.files_root.resolve()
+                    if root not in target.parents or not target.is_file() or target.stat().st_size != remote_file["size_bytes"]:
+                        return self.json(409, {"error": "Remote file is invalid"})
+                    digest = hashlib.sha256()
+                    first = b""
+                    with target.open("rb") as stream:
+                        while chunk := stream.read(CHUNK_SIZE):
+                            if not first:
+                                first = chunk[:512]
+                            digest.update(chunk)
+                    if digest.hexdigest().lower() != remote_file["sha256"].lower() or not valid_file(remote_file["mime"], first):
+                        return self.json(409, {"error": "Remote file does not match its metadata"})
+                    try:
+                        remote_payload = json.loads(current["payload"])
+                    except (TypeError, ValueError):
+                        remote_payload = {}
+                    try:
+                        payload_size = int(remote_payload.get("size_bytes", -1))
+                    except (TypeError, ValueError):
+                        payload_size = -1
+                    if str(remote_payload.get("hash", "")).lower() != remote_file["sha256"].lower() or payload_size != remote_file["size_bytes"]:
+                        return self.json(409, {"error": "Remote file does not match the revision"})
+                result_revision = current["revision"]
+                if action == "keep_local":
+                    result_revision += 1
+                    self.server.store.conn.execute(
+                        "UPDATE sync_records SET payload=?,revision=?,updated_at=?,deleted=? WHERE user_id=? AND kind=? AND record_id=? AND revision=?",
+                        (json.dumps(local_payload, ensure_ascii=False), result_revision, now(), int(requested_deleted), user["id"], kind, record_id, expected_revision),
+                    )
+                    self.server.store.conn.execute("UPDATE devices SET last_sync_at=? WHERE id=? AND user_id=?", (now(), device_id, user["id"]))
+                self.server.store.conn.execute(
+                    "INSERT INTO sync_resolutions VALUES(?,?,?,?,?,?,?,?)",
+                    (user["id"], resolution_id, kind, record_id, expected_revision, action, result_revision, now()),
+                )
+                payload = json.loads(current["payload"]) if action == "keep_remote" else local_payload
+                deleted = bool(current["deleted"]) if action == "keep_remote" else requested_deleted
+            response = {"resolved": True, "idempotent": False, "kind": kind, "record_id": record_id, "revision": result_revision, "deleted": deleted, "payload": payload}
+            if remote_file:
+                response["file"] = dict(remote_file)
+            return self.json(200, response)
+
     def _sync_locked(self, data):
         with self.server.store.conn:
             return self._sync_locked_unmanaged(data)
@@ -661,7 +762,7 @@ class Api(BaseHTTPRequestHandler):
             return self.json(401, {"error": "SesiÃ³n no vÃ¡lida"})
         upload = self.server.store.conn.execute("SELECT * FROM upload_sessions WHERE id=? AND user_id=?", (upload_id, user["id"])).fetchone()
         if upload and upload["status"] == "complete":
-            existing = self.server.store.conn.execute("SELECT id,size_bytes,sha256 FROM files WHERE user_id=? AND sha256=?", (user["id"], upload["expected_sha256"])).fetchone()
+            existing = self.server.store.conn.execute("SELECT id,size_bytes,sha256 FROM files WHERE user_id=? AND kind=? AND sha256=?", (user["id"], upload["kind"], upload["expected_sha256"])).fetchone()
             if existing:
                 return self.json(200, {"file_id": existing["id"], "already_exists": True, "size": existing["size_bytes"], "sha256": existing["sha256"]})
         upload = upload if upload and self.server.store.device_for(upload["device_id"], user["id"]) and upload["status"] == "uploading" else None

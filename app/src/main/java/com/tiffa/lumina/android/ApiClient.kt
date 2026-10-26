@@ -10,6 +10,7 @@ import java.net.URL
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.UUID
 
 class ApiClient(baseUrl: String) {
     var baseUrl: String = normalizeBaseUrl(baseUrl); private set
@@ -48,6 +49,18 @@ class ApiClient(baseUrl: String) {
         val files = json.optJSONArray("files").toList { RemoteFile(it.getString("id"), it.getString("record_id"), it.getString("kind"), it.getString("original_name"), it.optString("mime"), it.optString("extension"), it.getLong("size_bytes"), it.getString("sha256")) }
         val conflicts = json.optJSONArray("conflicts").toList { SyncConflict(it.getString("id"), it.getString("kind"), it.getLong("server_revision"), it.optJSONObject("server_payload") ?: JSONObject()) }
         return SyncSnapshot(records, files, conflicts)
+    }
+
+    fun resolveConflict(deviceId: String, conflict: SyncConflict, keepRemote: Boolean, localPayload: JSONObject? = null, resolutionId: String = UUID.randomUUID().toString()): JSONObject {
+        val body = JSONObject()
+            .put("device_id", deviceId)
+            .put("kind", conflict.kind)
+            .put("record_id", conflict.id)
+            .put("expected_revision", conflict.serverRevision)
+            .put("action", if (keepRemote) "keep_remote" else "keep_local")
+            .put("resolution_id", resolutionId)
+        localPayload?.let { body.put("local_payload", it) }
+        return JSONObject(request("POST", "/v1/sync/resolve", body))
     }
 
     fun publishWallpaper(deviceId: String, recordId: String, file: File, name: String, mime: String, baseRevision: Long, metadataAlreadyCurrent: Boolean = false): PublishResult {

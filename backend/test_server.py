@@ -184,6 +184,7 @@ class AccountSecurityTests(unittest.TestCase):
             self.assertFalse((root / "files" / "u1" / f"{invalid}.png").exists())
             self.assertEqual(store.recover_uploads(root), 0)
             self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM file_records WHERE record_id=?", (after_move,)).fetchone()[0], 1)
+            store.close()
 
     def test_upload_intent_columns_are_added_to_legacy_schema(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -427,6 +428,98 @@ class FileTransferTests(unittest.TestCase):
         self.assertTrue(records[("wallpaper", "same-id")]["deleted"])
         self.assertFalse(records[("playlist", "same-id")]["deleted"])
         self.assertFalse(records[("cursor", "same-id")]["deleted"])
+
+    def test_sync_resolution_is_typed_idempotent_and_rejects_stale_or_missing_files(self):
+        token = self.account("resolve@example.com")
+        other = self.account("other-resolve@example.com")
+        same_id = "shared-resolution-id"
+        self.call("/v1/sync", {"device_id": "resolve@example.com", "changes": [
+            {"id": same_id, "kind": "wallpaper", "base_revision": 0, "payload": {"name": "Wall", "hash": "0" * 64, "size_bytes": 8}},
+            {"id": same_id, "kind": "cursor", "base_revision": 0, "payload": {"name": "Cursor"}},
+            {"id": same_id, "kind": "playlist", "base_revision": 0, "payload": {"name": "Playlist"}},
+        ]}, token)
+
+        remote_request = {"device_id": "resolve@example.com", "kind": "playlist", "record_id": same_id,
+                          "expected_revision": 1, "action": "keep_remote", "resolution_id": "remote-playlist-1"}
+        status, resolved = self.call("/v1/sync/resolve", remote_request, token)
+        self.assertEqual(status, 200)
+        self.assertEqual(resolved["kind"], "playlist")
+        self.assertFalse(resolved["idempotent"])
+        _, repeated = self.call("/v1/sync/resolve", remote_request, token)
+        self.assertTrue(repeated["idempotent"])
+
+        local_request = {"device_id": "resolve@example.com", "kind": "cursor", "record_id": same_id,
+                         "expected_revision": 1, "action": "keep_local", "resolution_id": "local-cursor-1",
+                         "local_payload": {"name": "Cursor local"}}
+        _, local_result = self.call("/v1/sync/resolve", local_request, token)
+        self.assertEqual(local_result["revision"], 2)
+        stale_request = {**local_request, "resolution_id": "local-cursor-stale"}
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.call("/v1/sync/resolve", stale_request, token)
+        self.assertEqual(error.exception.code, 409)
+
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.call("/v1/sync/resolve", {**remote_request, "device_id": "other-resolve@example.com", "resolution_id": "other-account-id"}, other)
+        self.assertEqual(error.exception.code, 409)
+
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.call("/v1/sync/resolve", {"device_id": "resolve@example.com", "kind": "wallpaper", "record_id": same_id,
+                                             "expected_revision": 1, "action": "keep_remote", "resolution_id": "missing-wall-file"}, token)
+        self.assertEqual(error.exception.code, 409)
+
+        rows = {(row["kind"], row["record_id"]): row for row in self.http.store.conn.execute(
+            "SELECT kind,record_id,revision,payload FROM sync_records WHERE user_id=(SELECT id FROM users WHERE email=?)", ("resolve@example.com",))}
+        self.assertEqual(rows[("playlist", same_id)]["revision"], 1)
+        self.assertEqual(json.loads(rows[("playlist", same_id)]["payload"])["name"], "Playlist")
+        self.assertEqual(rows[("cursor", same_id)]["revision"], 2)
+        self.assertEqual(json.loads(rows[("cursor", same_id)]["payload"])["name"], "Cursor local")
+
+        self.call("/v1/sync", {"device_id": "resolve@example.com", "changes": [{
+            "id": same_id, "kind": "playlist", "base_revision": 1, "deleted": True, "payload": {},
+        }]}, token)
+        tombstone_request = {"device_id": "resolve@example.com", "kind": "playlist", "record_id": same_id,
+                             "expected_revision": 2, "action": "keep_local", "resolution_id": "local-tombstone-invalid",
+                             "local_payload": {}}
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.call("/v1/sync/resolve", tombstone_request, token)
+        self.assertEqual(error.exception.code, 409)
+        _, tombstone = self.call("/v1/sync/resolve", {**tombstone_request, "resolution_id": "local-tombstone-valid", "deleted": True}, token)
+        self.assertTrue(tombstone["deleted"])
+
+    def test_remote_resolution_validates_typed_file_before_confirming(self):
+        token = self.account("remote-file@example.com")
+        record_id = "remote-wallpaper"
+        content = b"\x89PNG\r\n\x1a\nfixture"
+        digest = hashlib.sha256(content).hexdigest()
+        self.call("/v1/sync", {"device_id": "remote-file@example.com", "changes": [{
+            "id": record_id, "kind": "wallpaper", "base_revision": 0,
+            "payload": {"hash": digest, "size_bytes": len(content), "name": "fixture.png"},
+        }]}, token)
+        user_id = self.http.store.conn.execute("SELECT id FROM users WHERE email=?", ("remote-file@example.com",)).fetchone()[0]
+        file_id = "remote-file-id"
+        relative = f"files/{user_id}/{file_id}.png"
+        target = self.http.files_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        self.http.store.conn.execute(
+            "INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (file_id, user_id, record_id, "wallpaper", "fixture.png", "image/png", ".png", len(content), digest, relative, 1),
+        )
+        self.http.store.conn.execute("INSERT INTO file_records VALUES(?,?,?,?)", (file_id, user_id, record_id, "wallpaper"))
+        self.http.store.conn.commit()
+
+        status, result = self.call("/v1/sync/resolve", {"device_id": "remote-file@example.com", "kind": "wallpaper",
+            "record_id": record_id, "expected_revision": 1, "action": "keep_remote", "resolution_id": "valid-remote-file"}, token)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["file"]["sha256"], digest)
+        self.assertEqual(result["file"]["kind"], "wallpaper")
+
+        target.write_bytes(b"corrupt")
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.call("/v1/sync/resolve", {"device_id": "remote-file@example.com", "kind": "wallpaper",
+                                             "record_id": record_id, "expected_revision": 1, "action": "keep_remote",
+                                             "resolution_id": "corrupt-remote-file"}, token)
+        self.assertEqual(error.exception.code, 409)
 
 
 if __name__ == "__main__":

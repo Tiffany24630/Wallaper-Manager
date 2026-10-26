@@ -12,6 +12,7 @@ class MainActivity : android.app.Activity() {
     private lateinit var root: LinearLayout
     private lateinit var status: TextView
     private var publishing = false
+    private val resolvingConflicts = mutableSetOf<String>()
 
     override fun onCreate(state: Bundle?) { super.onCreate(state); repository = LuminaRepository(this); showLoading(); repository.restore { result -> runOnUiThread { result.fold({ if (it) showHome() else showLogin() }, { showLogin(friendlyError(it)) }) } } }
     override fun onDestroy() { repository.shutdown(); super.onDestroy() }
@@ -91,6 +92,31 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun showConflicts() {
+        base("Conflicts")
+        val conflicts = repository.snapshot.conflicts
+        conflicts.forEach { conflict ->
+            val key = "${conflict.kind}:${conflict.id}"
+            val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, 12, 0, 12) }
+            box.addView(TextView(this).apply { text = "Pending · ${conflict.kind} · ${conflict.id} · remote revision ${conflict.serverRevision}" })
+            box.addView(Button(this).apply {
+                text = "Accept remote state"
+                isEnabled = !resolvingConflicts.contains(key)
+                setOnClickListener {
+                    if (!resolvingConflicts.add(key)) return@setOnClickListener
+                    isEnabled = false; status.text = "Confirming remote state..."
+                    repository.acceptRemoteConflict(conflict) { result -> runOnUiThread {
+                        resolvingConflicts.remove(key)
+                        result.fold({ showConflicts() }, { if (it is ApiException && it.status in 401..403) showLogin(friendlyError(it)) else { status.text = friendlyError(it); showConflicts() } })
+                    } }
+                }
+            })
+            root.addView(box)
+        }
+        status.text = if (conflicts.isEmpty()) "No pending conflicts." else "The remote state is accepted only if its revision is still current. Files remain available for separate download."
+        addBack()
+    }
+
+    private fun showConflictsLegacy() {
         base("Conflictos")
         val conflicts = repository.snapshot.conflicts
         conflicts.forEach { conflict -> root.addView(TextView(this).apply { text = "Pendiente · ${conflict.kind} · ${conflict.id} · revisión remota ${conflict.serverRevision}"; setPadding(0, 12, 0, 12) }) }

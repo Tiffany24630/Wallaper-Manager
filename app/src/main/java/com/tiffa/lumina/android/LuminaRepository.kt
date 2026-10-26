@@ -33,6 +33,10 @@ class LuminaRepository(context: Context) {
     }
 
     fun refresh(callback: (Result<SyncSnapshot>) -> Unit) = executor.execute { runCatching { refreshInternal() }.fold({ callback(Result.success(it)) }, { if (it is ApiException && it.status in 401..403) clearSession(); callback(Result.failure(it)) }) }
+    fun acceptRemoteConflict(conflict: SyncConflict, callback: (Result<Unit>) -> Unit) = executor.execute {
+        runCatching { client.resolveConflict(deviceId, conflict, keepRemote = true); refreshInternal() }
+            .fold({ callback(Result.success(Unit)) }, { if (it is ApiException && it.status in 401..403) clearSession(); callback(Result.failure(it)) })
+    }
     fun revoke(device: Device, callback: (Result<Unit>) -> Unit) = executor.execute { runCatching { client.revokeDevice(device.id); devices = client.devices() }.fold({ callback(Result.success(Unit)) }, { if (it is ApiException && it.status in 401..403) clearSession(); callback(Result.failure(it)) }) }
     fun download(file: RemoteFile, record: RemoteRecord, callback: (Result<File>) -> Unit) = executor.execute {
         val safeName = "${file.kind}_${file.recordId}_${file.sha256.take(12)}.${file.extension.trimStart('.')}".replace(Regex("[^A-Za-z0-9._-]"), "_")
