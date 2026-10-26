@@ -123,9 +123,9 @@ class Store:
           expires_at INTEGER NOT NULL, revoked_at INTEGER
         );
         CREATE TABLE IF NOT EXISTS devices(
-          id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          id TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           name TEXT NOT NULL, platform TEXT NOT NULL, last_sync_at INTEGER, revoked_at INTEGER,
-          UNIQUE(user_id, id)
+          PRIMARY KEY(user_id, id)
         );
         CREATE TABLE IF NOT EXISTS sync_records(
           user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -156,8 +156,28 @@ class Store:
           status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
         );
         """)
+        self._migrate_typed_devices()
         self._migrate_typed_sync_records()
         self.conn.commit()
+
+    def _migrate_typed_devices(self):
+        columns = self.conn.execute("PRAGMA table_info(devices)").fetchall()
+        primary_key = [row[1] for row in sorted(columns, key=lambda row: row[5]) if row[5]]
+        if primary_key == ["user_id", "id"]:
+            return
+        self.conn.execute("""
+            CREATE TABLE devices_typed(
+              id TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              name TEXT NOT NULL, platform TEXT NOT NULL, last_sync_at INTEGER, revoked_at INTEGER,
+              PRIMARY KEY(user_id, id)
+            )
+        """)
+        self.conn.execute("""
+            INSERT INTO devices_typed(id,user_id,name,platform,last_sync_at,revoked_at)
+            SELECT id,user_id,name,platform,last_sync_at,revoked_at FROM devices
+        """)
+        self.conn.execute("DROP TABLE devices")
+        self.conn.execute("ALTER TABLE devices_typed RENAME TO devices")
 
     def _migrate_typed_sync_records(self):
         columns = self.conn.execute("PRAGMA table_info(sync_records)").fetchall()
@@ -390,8 +410,8 @@ class Api(BaseHTTPRequestHandler):
             raise ValueError("Datos de dispositivo no válidos")
         self.server.store.conn.execute(
             "INSERT INTO devices(id,user_id,name,platform,last_sync_at,revoked_at) VALUES(?,?,?,?,NULL,NULL) "
-            "ON CONFLICT(id) DO UPDATE SET name=excluded.name, platform=excluded.platform, revoked_at=NULL "
-            "WHERE devices.user_id=excluded.user_id", (device_id, user["id"], name, platform))
+            "ON CONFLICT(user_id,id) DO UPDATE SET name=excluded.name, platform=excluded.platform, revoked_at=NULL",
+            (device_id, user["id"], name, platform))
         self.server.store.conn.commit()
         return self.json(200, {"device_id": device_id})
 

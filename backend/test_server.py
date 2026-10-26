@@ -52,8 +52,13 @@ class AccountSecurityTests(unittest.TestCase):
                     payload TEXT NOT NULL, revision INTEGER NOT NULL, updated_at INTEGER NOT NULL,
                     deleted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id, record_id)
                 );
+                CREATE TABLE devices(
+                    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, platform TEXT NOT NULL,
+                    last_sync_at INTEGER, revoked_at INTEGER
+                );
                 INSERT INTO users VALUES('u1','legacy@example.com','not-used',1);
                 INSERT INTO sync_records VALUES('u1','same-id','wallpaper','{}',1,1,0);
+                INSERT INTO devices VALUES('legacy-device','u1','Legacy','windows',NULL,NULL);
                 """
             )
             legacy.commit(); legacy.close()
@@ -68,6 +73,20 @@ class AccountSecurityTests(unittest.TestCase):
                 store.conn.execute("SELECT COUNT(*) FROM sync_records WHERE user_id='u1' AND record_id='same-id'").fetchone()[0],
                 2,
             )
+            self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM devices WHERE id='legacy-device'").fetchone()[0], 1)
+            store.close()
+
+    def test_device_identity_is_scoped_to_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(str(Path(directory) / "sync.db"))
+            store.conn.execute("INSERT INTO users VALUES('u1','a@example.com',?,1)", (password_hash("1234567890"),))
+            store.conn.execute("INSERT INTO users VALUES('u2','b@example.com',?,1)", (password_hash("1234567890"),))
+            store.conn.execute("INSERT INTO devices VALUES('shared-device','u1','Android','android',NULL,NULL)")
+            store.conn.execute("INSERT INTO devices VALUES('shared-device','u2','Android','android',NULL,NULL)")
+            store.conn.commit()
+            self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM devices WHERE id='shared-device'").fetchone()[0], 2)
+            self.assertIsNotNone(store.device_for("shared-device", "u1"))
+            self.assertIsNotNone(store.device_for("shared-device", "u2"))
             store.close()
 
 

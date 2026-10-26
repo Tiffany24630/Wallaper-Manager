@@ -94,6 +94,45 @@ class ApiClientIntegrationTest {
         assertFalse(File(tempDir, "resource.bin.part").exists())
     }
 
+    @Test fun truncatedResponsePreservesPreviousFileAndAllowsRetry() {
+        client.token = "download-token"
+        val bytes = "complete-fixture".toByteArray(StandardCharsets.UTF_8)
+        val metadata = RemoteFile("f2", "r2", "wallpaper", "demo.bin", "application/octet-stream", "bin", bytes.size.toLong(), sha256(bytes))
+        val output = File(tempDir, "resource.bin")
+        output.writeText("previous-valid-content")
+        server.handler = { Response(200, bytes, closeAfterBytes = 4) }
+
+        try {
+            client.download(metadata, 1, output, "android-test-device")
+            throw AssertionError("truncated response was accepted")
+        } catch (_: Exception) { }
+
+        assertEquals("previous-valid-content", output.readText())
+        assertFalse(File(tempDir, "resource.bin.part").exists())
+
+        server.handler = { Response(200, bytes) }
+        assertEquals(output, client.download(metadata, 1, output, "android-test-device"))
+        assertTrue(output.readBytes().contentEquals(bytes))
+        assertFalse(File(tempDir, "resource.bin.part").exists())
+    }
+
+    @Test fun interruptedResponsePreservesPreviousFileAndCleansStaging() {
+        client.token = "download-token"
+        val bytes = "network-fixture".toByteArray(StandardCharsets.UTF_8)
+        val metadata = RemoteFile("f3", "r3", "cursor", "demo.cur", "application/octet-stream", "cur", bytes.size.toLong(), sha256(bytes))
+        val output = File(tempDir, "cursor.cur")
+        output.writeText("previous-cursor")
+        server.handler = { Response(200, bytes, closeAfterBytes = 1) }
+
+        try {
+            client.download(metadata, 2, output, "android-test-device")
+            throw AssertionError("interrupted response was accepted")
+        } catch (_: Exception) { }
+
+        assertEquals("previous-cursor", output.readText())
+        assertFalse(File(tempDir, "cursor.cur.part").exists())
+    }
+
     @Test fun httpErrorsAndInvalidJsonRemainObservable() {
         client.token = "token"
         server.handler = { Response(409, "{\"error\":\"revision changed\"}") }
@@ -115,7 +154,7 @@ class ApiClientIntegrationTest {
 }
 
 private data class Request(val method: String, val path: String, val headers: Map<String, String>, val body: String)
-private data class Response(val status: Int, val body: ByteArray) {
+private data class Response(val status: Int, val body: ByteArray, val closeAfterBytes: Int? = null) {
     constructor(status: Int, body: String) : this(status, body.toByteArray(StandardCharsets.UTF_8))
 }
 
@@ -139,7 +178,7 @@ private class LocalHttpServer {
             val length = headers["content-length"]?.toIntOrNull() ?: 0
             val body = ByteArray(length); input.readFully(body)
             val response = handler(Request(requestParts[0], requestParts[1].substringBefore('?'), headers, String(body, StandardCharsets.UTF_8)))
-            val output = socket.getOutputStream(); output.write("HTTP/1.1 ${response.status} OK\r\nContent-Length: ${response.body.size}\r\nConnection: close\r\n\r\n".toByteArray(StandardCharsets.UTF_8)); output.write(response.body); output.flush()
+            val output = socket.getOutputStream(); output.write("HTTP/1.1 ${response.status} OK\r\nContent-Length: ${response.body.size}\r\nConnection: close\r\n\r\n".toByteArray(StandardCharsets.UTF_8)); val count = response.closeAfterBytes?.coerceIn(0, response.body.size) ?: response.body.size; output.write(response.body, 0, count); output.flush()
         }
     }
 }

@@ -3,6 +3,7 @@ package com.tiffa.lumina.android
 import android.graphics.Color
 import android.os.Bundle
 import android.widget.*
+import java.io.IOException
 
 class MainActivity : android.app.Activity() {
     private lateinit var repository: LuminaRepository
@@ -50,7 +51,8 @@ class MainActivity : android.app.Activity() {
             val file = files.firstOrNull { it.recordId == record.id && it.kind == record.kind }
             addRecord(record, file)
         }
-        if (files.isEmpty()) status.text = "No hay archivos sincronizados."
+        if (repository.snapshot.records.none { it.kind == "wallpaper" || it.kind == "cursor" }) status.text = "No hay fondos ni cursores sincronizados."
+        else if (files.isEmpty()) status.text = "Los registros están sincronizados, pero no hay archivos disponibles."
         addBack()
     }
 
@@ -91,6 +93,6 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun addBack() { root.addView(Button(this).apply { text = "Atrás"; setOnClickListener { showHome() } }) }
-    private fun friendlyError(error: Throwable): String = when (error) { is ApiException -> if (error.status in 401..403) "La sesión expiró o no está autorizada." else error.message ?: "Error del servidor"; else -> error.message ?: "No se pudo completar la operación" }
+    private fun friendlyError(error: Throwable): String = when (error) { is ApiException -> if (error.status in 401..403) "La sesión expiró o no está autorizada." else error.message ?: "Error del servidor"; is IOException -> "No se pudo conectar con el servidor. Comprueba la red y vuelve a intentarlo."; else -> "No se pudo completar la operación" }
 }
 
