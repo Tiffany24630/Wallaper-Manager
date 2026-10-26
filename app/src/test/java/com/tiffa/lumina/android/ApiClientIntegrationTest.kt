@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 class ApiClientIntegrationTest {
     private lateinit var server: LocalHttpServer
@@ -260,6 +261,123 @@ class ApiClientIntegrationTest {
         } catch (error: ApiException) {
             assertEquals(409, error.status)
         }
+    }
+
+    @Test fun preparesWallpaperThenResolvesWithTheSameTypedIdentityAndRevision() {
+        client.token = "keep-local-token"
+        val bytes = "local-wallpaper-bytes".toByteArray(StandardCharsets.UTF_8)
+        val source = File(tempDir, "local.png").apply { writeBytes(bytes) }
+        val hash = sha256(bytes)
+        val conflict = SyncConflict("shared-id", "wallpaper", 7, org.json.JSONObject())
+        val requests = mutableListOf<Request>()
+        server.handler = { request ->
+            requests += request
+            when {
+                request.path == "/v1/files/upload/init" -> {
+                    assertTrue(request.body.contains("\"device_id\":\"android-device\""))
+                    assertTrue(request.body.contains("\"kind\":\"wallpaper\""))
+                    assertTrue(request.body.contains("\"record_id\":\"shared-id\""))
+                    assertTrue(request.body.contains("\"sha256\":\"$hash\""))
+                    assertTrue(request.body.contains("\"defer_resolution\":true"))
+                    assertTrue(request.body.contains("\"resolution_id\":\"stable-resolution\""))
+                    assertTrue(request.body.contains("\"expected_revision\":7"))
+                    Response(201, "{\"upload_id\":\"prepared-1\",\"offset\":0,\"chunk_size\":1024}")
+                }
+                request.path == "/v1/files/upload/prepared-1" -> {
+                    assertEquals("0", request.headers["x-upload-offset"])
+                    Response(200, "{\"upload_id\":\"prepared-1\",\"offset\":${bytes.size},\"complete\":true}")
+                }
+                request.path == "/v1/files/upload/prepared-1/complete" ->
+                    Response(201, "{\"upload_id\":\"prepared-1\",\"prepared\":true,\"status\":\"prepared\"}")
+                request.path == "/v1/sync/resolve" -> {
+                    assertTrue(request.body.contains("\"action\":\"keep_local\""))
+                    assertTrue(request.body.contains("\"prepared_upload_id\":\"prepared-1\""))
+                    assertTrue(request.body.contains("\"resolution_id\":\"stable-resolution\""))
+                    Response(200, "{\"resolved\":true,\"idempotent\":false,\"kind\":\"wallpaper\",\"record_id\":\"shared-id\",\"revision\":8,\"deleted\":false}")
+                }
+                else -> Response(404, "{\"error\":\"unexpected\"}")
+            }
+        }
+
+        val prepared = client.prepareWallpaperConflict("android-device", conflict, source, "local.png", "image/png", "stable-resolution")
+        val resolved = client.resolveConflict(
+            "android-device", conflict, keepRemote = false,
+            localPayload = org.json.JSONObject().put("name", "local.png").put("hash", hash).put("size_bytes", bytes.size),
+            resolutionId = "stable-resolution", preparedUploadId = prepared,
+        )
+
+        assertEquals("prepared-1", prepared)
+        assertTrue(resolved.getBoolean("resolved"))
+        assertEquals(listOf(
+            "POST /v1/files/upload/init", "PUT /v1/files/upload/prepared-1",
+            "POST /v1/files/upload/prepared-1/complete", "POST /v1/sync/resolve",
+        ), requests.map { "${it.method} ${it.path}" })
+        assertTrue(source.readBytes().contentEquals(bytes))
+    }
+
+    @Test fun retriesAfterLostResolveResponseWithTheSameResolutionAndPreparedUpload() {
+        client.token = "retry-token"
+        val bytes = "retry-wallpaper".toByteArray(StandardCharsets.UTF_8)
+        val source = File(tempDir, "retry.png").apply { writeBytes(bytes) }
+        val hash = sha256(bytes)
+        val conflict = SyncConflict("retry-id", "wallpaper", 3, org.json.JSONObject())
+        val resolveAttempts = AtomicInteger(0)
+        var appliedRevision: Long? = null
+        server.handler = { request ->
+            when {
+                request.path == "/v1/files/upload/init" -> Response(201, "{\"upload_id\":\"prepared-retry\",\"offset\":0,\"chunk_size\":1024}")
+                request.path == "/v1/files/upload/prepared-retry" -> Response(200, "{\"offset\":${bytes.size}}")
+                request.path == "/v1/files/upload/prepared-retry/complete" -> Response(201, "{\"prepared\":true}")
+                request.path == "/v1/sync/resolve" -> {
+                    assertTrue(request.body.contains("\"resolution_id\":\"retry-resolution\""))
+                    assertTrue(request.body.contains("\"prepared_upload_id\":\"prepared-retry\""))
+                    if (resolveAttempts.incrementAndGet() == 1) {
+                        appliedRevision = 4L
+                        throw java.io.IOException("simulated lost response")
+                    }
+                    assertEquals(4L, appliedRevision)
+                    Response(200, "{\"resolved\":true,\"idempotent\":true,\"kind\":\"wallpaper\",\"record_id\":\"retry-id\",\"revision\":${appliedRevision}}")
+                }
+                else -> Response(404, "{\"error\":\"unexpected\"}")
+            }
+        }
+
+        val prepared = client.prepareWallpaperConflict("android-device", conflict, source, "retry.png", "image/png", "retry-resolution")
+        try {
+            client.resolveConflict("android-device", conflict, keepRemote = false, resolutionId = "retry-resolution", preparedUploadId = prepared)
+            throw AssertionError("the lost response was accepted")
+        } catch (_: java.io.IOException) {
+            // The caller must retain its pending payload until a later confirmed retry.
+        }
+        val retry = client.resolveConflict("android-device", conflict, keepRemote = false, resolutionId = "retry-resolution", preparedUploadId = prepared)
+        assertTrue(retry.getBoolean("resolved"))
+        assertEquals(2, resolveAttempts.get())
+        assertTrue(source.readBytes().contentEquals(bytes))
+    }
+
+    @Test fun staleKeepLocalResolutionReturns409WithoutChangingThePendingFile() {
+        client.token = "stale-token"
+        val bytes = "pending-local".toByteArray(StandardCharsets.UTF_8)
+        val source = File(tempDir, "pending.png").apply { writeBytes(bytes) }
+        val hash = sha256(bytes)
+        val conflict = SyncConflict("stale-id", "wallpaper", 11, org.json.JSONObject())
+        server.handler = { request ->
+            assertTrue(request.body.contains("\"kind\":\"wallpaper\""))
+            assertTrue(request.body.contains("\"record_id\":\"stale-id\""))
+            assertTrue(request.body.contains("\"expected_revision\":11"))
+            assertTrue(request.body.contains("\"resolution_id\":\"stale-resolution\""))
+            assertTrue(request.body.contains("\"prepared_upload_id\":\"prepared-stale\""))
+            Response(409, "{\"error\":\"revision changed\"}")
+        }
+        try {
+            client.resolveConflict("android-device", conflict, keepRemote = false,
+                localPayload = org.json.JSONObject().put("hash", hash).put("size_bytes", bytes.size),
+                resolutionId = "stale-resolution", preparedUploadId = "prepared-stale")
+            throw AssertionError("stale resolution was accepted")
+        } catch (error: ApiException) {
+            assertEquals(409, error.status)
+        }
+        assertTrue(source.readBytes().contentEquals(bytes))
     }
 
     @Test fun unavailableServerRemainsAConnectionError() {

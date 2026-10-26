@@ -170,6 +170,8 @@ class AccountSecurityTests(unittest.TestCase):
             (root / "files" / "u1" / f"{after_sqlite}.png").write_bytes(content)
             store.conn.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)", (after_sqlite, "u1", after_sqlite, "wallpaper", "recover.png", "image/png", ".png", len(content), digest, f"files/u1/{after_sqlite}.png", 1))
             store.conn.execute("INSERT INTO file_records VALUES(?,?,?,?)", (after_sqlite, "u1", after_sqlite, "wallpaper"))
+            store.conn.execute("UPDATE upload_sessions SET prepared_resolution_id='recovered-resolution',prepared_revision=1 WHERE id=?", (after_sqlite,))
+            store.conn.execute("INSERT INTO sync_resolutions VALUES(?,?,?,?,?,?,?,?)", ("u1", "recovered-resolution", "wallpaper", after_sqlite, 1, "keep_local", 2, 1))
 
             invalid = "d" * 32
             add_session(invalid, "publishing", invalid, f"files/u1/{invalid}.png", f"{invalid}.part")
@@ -521,6 +523,62 @@ class FileTransferTests(unittest.TestCase):
                                              "resolution_id": "corrupt-remote-file"}, token)
         self.assertEqual(error.exception.code, 409)
 
+    def test_keep_local_wallpaper_publishes_prepared_binary_idempotently(self):
+        token = self.account("prepared-local@example.com")
+        record_id = "prepared-wallpaper"
+        content = b"\x89PNG\r\n\x1a\nlocal-conflict-bytes"
+        digest = hashlib.sha256(content).hexdigest()
+        self.call("/v1/sync", {"device_id": "prepared-local@example.com", "changes": [{
+            "id": record_id, "kind": "wallpaper", "base_revision": 0,
+            "payload": {"name": "remote.png", "hash": "0" * 64, "size_bytes": 8},
+        }]}, token)
+        _, init = self.call("/v1/files/upload/init", {
+            "device_id": "prepared-local@example.com", "record_id": record_id, "kind": "wallpaper",
+            "name": "local.png", "mime": "image/png", "size": len(content), "sha256": digest,
+            "defer_resolution": True, "resolution_id": "prepared-resolution", "expected_revision": 1,
+        }, token)
+        upload_id = init["upload_id"]
+        self.call(f"/v1/files/upload/{upload_id}", token=token, method="PUT", body=content,
+                  headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(content)), "X-Upload-Offset": "0"})
+        _, prepared = self.call(f"/v1/files/upload/{upload_id}/complete", token=token, method="POST")
+        self.assertTrue(prepared["prepared"])
+        self.assertEqual(self.http.store.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0], 0)
+        request = {"device_id": "prepared-local@example.com", "kind": "wallpaper", "record_id": record_id,
+                   "expected_revision": 1, "action": "keep_local", "resolution_id": "prepared-resolution",
+                   "prepared_upload_id": upload_id, "local_payload": {"name": "local.png", "hash": digest, "size_bytes": len(content)}}
+        _, resolved = self.call("/v1/sync/resolve", request, token)
+        self.assertTrue(resolved["resolved"])
+        self.assertEqual(resolved["revision"], 2)
+        file_row = self.http.store.conn.execute("SELECT * FROM files WHERE user_id=(SELECT id FROM users WHERE email=?)", ("prepared-local@example.com",)).fetchone()
+        self.assertEqual((self.http.files_root / file_row["storage_name"]).read_bytes(), content)
+        _, retry_upload = self.call("/v1/files/upload/init", {
+            "device_id": "prepared-local@example.com", "record_id": record_id, "kind": "wallpaper",
+            "name": "local.png", "mime": "image/png", "size": len(content), "sha256": digest,
+            "defer_resolution": True, "resolution_id": "prepared-resolution", "expected_revision": 1,
+        }, token)
+        self.assertTrue(retry_upload["prepared"])
+        self.assertEqual(retry_upload["status"], "complete")
+        _, repeated = self.call("/v1/sync/resolve", request, token)
+        self.assertTrue(repeated["idempotent"])
+        self.assertEqual(self.http.store.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0], 1)
+
+    def test_keep_local_binary_failure_restores_prepared_upload(self):
+        token = self.account("prepared-failure@example.com")
+        content = b"\x89PNG\r\n\x1a\nfailure-fixture"
+        digest = hashlib.sha256(content).hexdigest()
+        self.call("/v1/sync", {"device_id": "prepared-failure@example.com", "changes": [{"id": "failure-wall", "kind": "wallpaper", "base_revision": 0, "payload": {"hash": "0" * 64, "size_bytes": 8}}]}, token)
+        _, init = self.call("/v1/files/upload/init", {"device_id": "prepared-failure@example.com", "record_id": "failure-wall", "kind": "wallpaper", "name": "failure.png", "mime": "image/png", "size": len(content), "sha256": digest, "defer_resolution": True, "resolution_id": "failure-resolution", "expected_revision": 1}, token)
+        self.call(f"/v1/files/upload/{init['upload_id']}", token=token, method="PUT", body=content, headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(content)), "X-Upload-Offset": "0"})
+        self.call(f"/v1/files/upload/{init['upload_id']}/complete", token=token, method="POST")
+        self.http.before_resolution_persist = lambda: (_ for _ in ()).throw(RuntimeError("controlled"))
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.call("/v1/sync/resolve", {"device_id": "prepared-failure@example.com", "kind": "wallpaper", "record_id": "failure-wall", "expected_revision": 1, "action": "keep_local", "resolution_id": "failure-resolution", "prepared_upload_id": init["upload_id"], "local_payload": {"hash": digest, "size_bytes": len(content)}}, token)
+        self.assertEqual(error.exception.code, 500)
+        self.http.before_resolution_persist = None
+        row = self.http.store.conn.execute("SELECT status,temp_name FROM upload_sessions WHERE id=?", (init["upload_id"],)).fetchone()
+        self.assertEqual(row["status"], "prepared")
+        self.assertEqual((self.http.files_root / "uploads" / row["temp_name"]).read_bytes(), content)
+        self.assertEqual(self.http.store.conn.execute("SELECT COUNT(*) FROM sync_resolutions").fetchone()[0], 0)
 
 if __name__ == "__main__":
     unittest.main()

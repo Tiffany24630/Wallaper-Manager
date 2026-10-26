@@ -155,7 +155,8 @@ class Store:
           original_name TEXT NOT NULL, mime TEXT NOT NULL, expected_size INTEGER NOT NULL,
           expected_sha256 TEXT NOT NULL, temp_name TEXT NOT NULL UNIQUE, received_bytes INTEGER NOT NULL DEFAULT 0,
           status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-          final_file_id TEXT, final_storage_name TEXT
+          final_file_id TEXT, final_storage_name TEXT,
+          prepared_resolution_id TEXT, prepared_revision INTEGER
         );
         CREATE TABLE IF NOT EXISTS sync_resolutions(
           user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -238,11 +239,15 @@ class Store:
             self.conn.execute("ALTER TABLE upload_sessions ADD COLUMN final_file_id TEXT")
         if "final_storage_name" not in columns:
             self.conn.execute("ALTER TABLE upload_sessions ADD COLUMN final_storage_name TEXT")
+        if "prepared_resolution_id" not in columns:
+            self.conn.execute("ALTER TABLE upload_sessions ADD COLUMN prepared_resolution_id TEXT")
+        if "prepared_revision" not in columns:
+            self.conn.execute("ALTER TABLE upload_sessions ADD COLUMN prepared_revision INTEGER")
 
     def recover_uploads(self, files_root):
         root = Path(files_root).resolve()
         rows = self.conn.execute(
-            "SELECT * FROM upload_sessions WHERE status='publishing' OR (status='uploading' AND final_file_id IS NOT NULL)"
+            "SELECT * FROM upload_sessions WHERE status='publishing' OR (status='uploading' AND final_file_id IS NOT NULL) OR status='prepared'"
         ).fetchall()
         recovered = 0
         for upload in rows:
@@ -261,6 +266,36 @@ class Store:
             )
             source = (root / "uploads" / upload["temp_name"]).resolve()
             source_valid = source.parent == (root / "uploads").resolve()
+            if upload["status"] == "prepared":
+                if not source_valid or not source.is_file():
+                    self.conn.execute("UPDATE upload_sessions SET status='failed',updated_at=? WHERE id=?", (now(), upload["id"]))
+                    continue
+                actual = hashlib.sha256(source.read_bytes()).hexdigest()
+                header = source.read_bytes()[:512]
+                if actual != upload["expected_sha256"] or source.stat().st_size != upload["expected_size"] or not valid_file(upload["mime"], header):
+                    self.conn.execute("UPDATE upload_sessions SET status='failed',updated_at=? WHERE id=?", (now(), upload["id"]))
+                continue
+            if upload["status"] == "publishing" and upload["prepared_resolution_id"]:
+                # A prepared conflict upload is not visible until the resolution transaction commits.
+                # After an abrupt stop, restore the staged bytes and leave the operation retryable.
+                confirmed = self.conn.execute(
+                    "SELECT 1 FROM sync_resolutions WHERE user_id=? AND resolution_id=? AND kind=? AND record_id=?",
+                    (upload["user_id"], upload["prepared_resolution_id"], upload["kind"], upload["record_id"]),
+                ).fetchone()
+                if confirmed and valid_path and final_path and final_path.is_file():
+                    actual = hashlib.sha256(final_path.read_bytes()).hexdigest()
+                    if final_path.stat().st_size == upload["expected_size"] and actual == upload["expected_sha256"]:
+                        self.conn.execute("UPDATE upload_sessions SET status='complete',updated_at=? WHERE id=?", (now(), upload["id"]))
+                        recovered += 1
+                        continue
+                if source_valid and source.is_file():
+                    self.conn.execute("UPDATE upload_sessions SET status='prepared',final_file_id=NULL,final_storage_name=NULL,updated_at=? WHERE id=?", (now(), upload["id"]))
+                elif valid_path and final_path and final_path.is_file():
+                    final_path.replace(source)
+                    self.conn.execute("UPDATE upload_sessions SET status='prepared',final_file_id=NULL,final_storage_name=NULL,updated_at=? WHERE id=?", (now(), upload["id"]))
+                else:
+                    self.conn.execute("UPDATE upload_sessions SET status='failed',updated_at=? WHERE id=?", (now(), upload["id"]))
+                continue
             existing = self.conn.execute(
                 "SELECT * FROM files WHERE id=? AND user_id=?",
                 (final_id, upload["user_id"]),
@@ -304,7 +339,7 @@ class Store:
         uploads_root = Path(files_root).resolve() / "uploads"
         removed = 0
         rows = self.conn.execute(
-            "SELECT id,temp_name FROM upload_sessions WHERE status='uploading' AND final_file_id IS NULL AND updated_at < ?",
+            "SELECT id,temp_name FROM upload_sessions WHERE status IN ('uploading','prepared') AND final_file_id IS NULL AND updated_at < ?",
             (cutoff,),
         ).fetchall()
         for row in rows:
@@ -556,6 +591,77 @@ class Api(BaseHTTPRequestHandler):
         with self.server.sync_lock:
             return self._sync_locked(data)
 
+    def resolve_prepared_local(self, user, device_id, kind, record_id, expected_revision, resolution_id, local_payload, prepared_upload_id):
+        if kind != "wallpaper" or not prepared_upload_id:
+            raise ValueError("La resolución binaria requiere una carga preparada")
+        conn = self.server.store.conn
+        previous = conn.execute("SELECT kind,record_id,expected_revision,action,result_revision FROM sync_resolutions WHERE user_id=? AND resolution_id=?", (user["id"], resolution_id)).fetchone()
+        if previous:
+            if (previous["kind"], previous["record_id"], previous["expected_revision"], previous["action"]) != (kind, record_id, expected_revision, "keep_local"):
+                raise ValueError("El identificador de resolución ya fue usado para otra operación")
+            return self.json(200, {"resolved": True, "idempotent": True, "kind": kind, "record_id": record_id, "revision": previous["result_revision"]})
+        current = conn.execute("SELECT * FROM sync_records WHERE user_id=? AND kind=? AND record_id=?", (user["id"], kind, record_id)).fetchone()
+        if not current or current["revision"] != expected_revision or current["deleted"]:
+            return self.json(409, {"error": "La revisión remota cambió; vuelve a sincronizar antes de resolver"})
+        upload = conn.execute("SELECT * FROM upload_sessions WHERE id=? AND user_id=? AND device_id=? AND kind=? AND record_id=? AND status='prepared'", (prepared_upload_id, user["id"], device_id, kind, record_id)).fetchone()
+        if not upload or upload["prepared_resolution_id"] != resolution_id or upload["prepared_revision"] != expected_revision:
+            return self.json(409, {"error": "La carga preparada no corresponde a este conflicto"})
+        if not isinstance(local_payload, dict):
+            raise ValueError("La resolución local requiere metadatos válidos")
+        if str(local_payload.get("hash", "")).lower() != upload["expected_sha256"].lower() or int(local_payload.get("size_bytes", -1)) != upload["expected_size"]:
+            return self.json(409, {"error": "Los metadatos locales no coinciden con la carga preparada"})
+        root = self.server.files_root.resolve(); source = (root / "uploads" / upload["temp_name"]).resolve()
+        if source.parent != (root / "uploads").resolve() or not source.is_file():
+            return self.json(409, {"error": "La carga preparada no está disponible"})
+        content = source.read_bytes(); first = content[:512]
+        if len(content) != upload["expected_size"] or hashlib.sha256(content).hexdigest() != upload["expected_sha256"] or not valid_file(upload["mime"], first):
+            return self.json(409, {"error": "La carga preparada no coincide con su integridad declarada"})
+        extension = ALLOWED_FILES[upload["mime"]]
+        existing = conn.execute("SELECT * FROM files WHERE user_id=? AND kind=? AND sha256=?", (user["id"], kind, upload["expected_sha256"])).fetchone()
+        if existing:
+            existing_path = (root / existing["storage_name"]).resolve()
+            if existing_path.parent == (root / "files" / user["id"]).resolve() and existing_path.is_file() and existing_path.stat().st_size == upload["expected_size"]:
+                result_revision = expected_revision + 1
+                conn.execute("BEGIN")
+                try:
+                    latest = conn.execute("SELECT revision,deleted FROM sync_records WHERE user_id=? AND kind=? AND record_id=?", (user["id"], kind, record_id)).fetchone()
+                    if not latest or latest["revision"] != expected_revision or latest["deleted"]:
+                        raise RuntimeError("La revisión remota cambió durante la resolución")
+                    conn.execute("INSERT OR IGNORE INTO file_records VALUES(?,?,?,?)", (existing["id"], user["id"], record_id, kind))
+                    conn.execute("UPDATE sync_records SET payload=?,revision=?,updated_at=?,deleted=0 WHERE user_id=? AND kind=? AND record_id=? AND revision=?", (json.dumps(local_payload, ensure_ascii=False), result_revision, now(), user["id"], kind, record_id, expected_revision))
+                    conn.execute("INSERT INTO sync_resolutions VALUES(?,?,?,?,?,?,?,?)", (user["id"], resolution_id, kind, record_id, expected_revision, "keep_local", result_revision, now()))
+                    conn.execute("UPDATE upload_sessions SET status='complete',updated_at=? WHERE id=?", (now(), prepared_upload_id)); conn.commit()
+                except Exception:
+                    conn.rollback(); raise
+                source.unlink(missing_ok=True)
+                return self.json(200, {"resolved": True, "idempotent": False, "kind": kind, "record_id": record_id, "revision": result_revision, "deleted": False, "payload": local_payload, "file": dict(existing)})
+        file_id = secrets.token_hex(16); relative = f"files/{user['id']}/{file_id}{extension}"; target = (root / relative).resolve()
+        conn.execute("UPDATE upload_sessions SET status='publishing',final_file_id=?,final_storage_name=?,updated_at=? WHERE id=? AND status='prepared'", (file_id, relative, now(), prepared_upload_id)); conn.commit()
+        moved = False
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True); source.replace(target); moved = True
+            conn.execute("BEGIN")
+            if getattr(self.server, "before_resolution_persist", None):
+                self.server.before_resolution_persist()
+            latest = conn.execute("SELECT revision,deleted FROM sync_records WHERE user_id=? AND kind=? AND record_id=?", (user["id"], kind, record_id)).fetchone()
+            if not latest or latest["revision"] != expected_revision or latest["deleted"]:
+                raise RuntimeError("La revisión remota cambió durante la resolución")
+            result_revision = expected_revision + 1
+            conn.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)", (file_id, user["id"], record_id, kind, upload["original_name"], upload["mime"], extension, upload["expected_size"], upload["expected_sha256"], relative, now()))
+            conn.execute("INSERT INTO file_records VALUES(?,?,?,?)", (file_id, user["id"], record_id, kind))
+            conn.execute("UPDATE sync_records SET payload=?,revision=?,updated_at=?,deleted=0 WHERE user_id=? AND kind=? AND record_id=? AND revision=?", (json.dumps(local_payload, ensure_ascii=False), result_revision, now(), user["id"], kind, record_id, expected_revision))
+            conn.execute("INSERT INTO sync_resolutions VALUES(?,?,?,?,?,?,?,?)", (user["id"], resolution_id, kind, record_id, expected_revision, "keep_local", result_revision, now()))
+            conn.execute("UPDATE upload_sessions SET status='complete',updated_at=? WHERE id=?", (now(), prepared_upload_id)); conn.commit()
+        except Exception:
+            conn.rollback()
+            try:
+                if moved and target.is_file() and not source.exists(): target.replace(source)
+                conn.execute("UPDATE upload_sessions SET status='prepared',final_file_id=NULL,final_storage_name=NULL,updated_at=? WHERE id=?", (now(), prepared_upload_id)); conn.commit()
+            except Exception:
+                conn.rollback()
+            raise
+        return self.json(200, {"resolved": True, "idempotent": False, "kind": kind, "record_id": record_id, "revision": result_revision, "deleted": False, "payload": local_payload, "file": {"id": file_id, "record_id": record_id, "kind": kind, "original_name": upload["original_name"], "mime": upload["mime"], "extension": extension, "size_bytes": upload["expected_size"], "sha256": upload["expected_sha256"], "storage_name": relative}})
+
     def resolve_sync(self, data):
         with self.server.sync_lock:
             user = self.auth()
@@ -579,6 +685,8 @@ class Api(BaseHTTPRequestHandler):
             local_payload = data.get("local_payload")
             if action == "keep_local" and not isinstance(local_payload, dict):
                 raise ValueError("La resolución local requiere metadatos válidos")
+            if action == "keep_local" and kind == "wallpaper" and not bool(data.get("deleted", False)):
+                return self.resolve_prepared_local(user, device_id, kind, record_id, expected_revision, resolution_id, local_payload, str(data.get("prepared_upload_id", "")).strip())
             with self.server.store.conn:
                 previous = self.server.store.conn.execute(
                     "SELECT kind,record_id,expected_revision,action,result_revision FROM sync_resolutions WHERE user_id=? AND resolution_id=?",
@@ -711,17 +819,38 @@ class Api(BaseHTTPRequestHandler):
             int(sha256, 16)
         except ValueError:
             raise ValueError("Hash de archivo no vÃ¡lido")
+        prepared = bool(data.get("defer_resolution", False))
+        prepared_resolution_id = str(data.get("resolution_id", "")).strip() if prepared else None
+        prepared_revision = data.get("expected_revision") if prepared else None
+        if prepared:
+            if not prepared_resolution_id or len(prepared_resolution_id) > 128:
+                raise ValueError("La carga preparada requiere un identificador de resolución")
+            try:
+                prepared_revision = int(prepared_revision)
+            except (TypeError, ValueError):
+                raise ValueError("La revisión preparada no es válida")
+            if prepared_revision < 1:
+                raise ValueError("La revisión preparada no es válida")
         record = self.server.store.conn.execute("SELECT kind FROM sync_records WHERE user_id=? AND kind=? AND record_id=?", (user["id"], kind, record_id)).fetchone()
         if not record or record["kind"] != kind:
             return self.json(409, {"error": "Sincroniza primero el registro de metadatos"})
-        existing = self.server.store.conn.execute("SELECT id,size_bytes,sha256 FROM files WHERE user_id=? AND kind=? AND sha256=?", (user["id"], kind, sha256)).fetchone()
+        if prepared:
+            previous = self.server.store.conn.execute("SELECT * FROM upload_sessions WHERE user_id=? AND device_id=? AND kind=? AND record_id=? AND prepared_resolution_id=?", (user["id"], device_id, kind, record_id, prepared_resolution_id)).fetchone()
+            if previous:
+                if previous["expected_sha256"] != sha256 or previous["expected_size"] != size or previous["prepared_revision"] != prepared_revision:
+                    raise ValueError("La carga preparada ya fue usada con contenido incompatible")
+                return self.json(200, {"upload_id": previous["id"], "offset": previous["received_bytes"], "chunk_size": CHUNK_SIZE, "prepared": previous["status"] in ("prepared", "complete"), "status": previous["status"]})
+            current = self.server.store.conn.execute("SELECT revision,deleted FROM sync_records WHERE user_id=? AND kind=? AND record_id=?", (user["id"], kind, record_id)).fetchone()
+            if not current or current["revision"] != prepared_revision or current["deleted"]:
+                return self.json(409, {"error": "La revisión remota ya no coincide con la resolución"})
+        existing = None if prepared else self.server.store.conn.execute("SELECT id,size_bytes,sha256 FROM files WHERE user_id=? AND kind=? AND sha256=?", (user["id"], kind, sha256)).fetchone()
         if existing:
             self.server.store.conn.execute("INSERT OR IGNORE INTO file_records VALUES(?,?,?,?)", (existing["id"], user["id"], record_id, kind)); self.server.store.conn.commit()
             return self.json(200, {"file_id": existing["id"], "already_exists": True, "size": existing["size_bytes"], "sha256": existing["sha256"]})
         upload_id = secrets.token_hex(16); temp_name = f"{upload_id}.part"; stamp = now()
         self.server.store.conn.execute(
-            "INSERT INTO upload_sessions(user_id,device_id,record_id,kind,original_name,mime,expected_size,expected_sha256,temp_name,received_bytes,status,created_at,updated_at,final_file_id,final_storage_name,id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (user["id"], device_id, record_id, kind, name, mime, size, sha256, temp_name, 0, "uploading", stamp, stamp, None, None, upload_id),
+            "INSERT INTO upload_sessions(user_id,device_id,record_id,kind,original_name,mime,expected_size,expected_sha256,temp_name,received_bytes,status,created_at,updated_at,final_file_id,final_storage_name,prepared_resolution_id,prepared_revision,id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (user["id"], device_id, record_id, kind, name, mime, size, sha256, temp_name, 0, "uploading", stamp, stamp, None, None, prepared_resolution_id, prepared_revision, upload_id),
         )
         self.server.store.conn.commit()
         (self.server.files_root / "uploads" / temp_name).touch()
@@ -765,6 +894,8 @@ class Api(BaseHTTPRequestHandler):
             existing = self.server.store.conn.execute("SELECT id,size_bytes,sha256 FROM files WHERE user_id=? AND kind=? AND sha256=?", (user["id"], upload["kind"], upload["expected_sha256"])).fetchone()
             if existing:
                 return self.json(200, {"file_id": existing["id"], "already_exists": True, "size": existing["size_bytes"], "sha256": existing["sha256"]})
+        if upload and upload["status"] == "prepared":
+            return self.json(200, {"upload_id": upload_id, "prepared": True, "status": "prepared", "size": upload["expected_size"], "sha256": upload["expected_sha256"]})
         upload = upload if upload and self.server.store.device_for(upload["device_id"], user["id"]) and upload["status"] == "uploading" else None
         if not upload:
             return self.json(403, {"error": "Transferencia no autorizada o expirada"})
@@ -780,6 +911,10 @@ class Api(BaseHTTPRequestHandler):
             source.unlink(missing_ok=True)
             self.server.store.conn.execute("UPDATE upload_sessions SET status='failed',updated_at=? WHERE id=?", (now(), upload_id)); self.server.store.conn.commit()
             return self.json(422, {"error": "El contenido no coincide con el tipo o hash declarado"})
+        if upload["prepared_resolution_id"]:
+            self.server.store.conn.execute("UPDATE upload_sessions SET status='prepared',updated_at=? WHERE id=? AND status='uploading'", (now(), upload_id))
+            self.server.store.conn.commit()
+            return self.json(201, {"upload_id": upload_id, "prepared": True, "status": "prepared", "size": upload["expected_size"], "sha256": upload["expected_sha256"], "resolution_id": upload["prepared_resolution_id"]})
         file_id = secrets.token_hex(16); extension = ALLOWED_FILES[upload["mime"]]; relative = f"files/{user['id']}/{file_id}{extension}"; target = self.server.files_root / relative
         self.server.store.conn.execute("UPDATE upload_sessions SET status='publishing',final_file_id=?,final_storage_name=?,updated_at=? WHERE id=? AND status='uploading'", (file_id, relative, now(), upload_id)); self.server.store.conn.commit()
         target.parent.mkdir(parents=True, exist_ok=True); source.replace(target)
