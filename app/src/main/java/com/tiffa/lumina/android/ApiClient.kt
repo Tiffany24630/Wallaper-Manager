@@ -48,12 +48,13 @@ class ApiClient(baseUrl: String) {
         return SyncSnapshot(records, files, conflicts)
     }
 
-    fun download(file: RemoteFile, expectedRevision: Long, output: File): File {
+    fun download(file: RemoteFile, expectedRevision: Long, output: File, deviceId: String): File {
         output.parentFile?.mkdirs(); val staging = File(output.parentFile, output.name + ".part")
         try {
             val connection = URL(baseUrl + "/v1/files/${encodePathSegment(file.id)}").openConnection() as HttpURLConnection
             connection.requestMethod = "GET"; connection.connectTimeout = 15_000; connection.readTimeout = 60_000; connection.instanceFollowRedirects = false
             token?.let { connection.setRequestProperty("Authorization", "Bearer $it") }
+            connection.setRequestProperty("X-Device-ID", deviceId)
             connection.setRequestProperty("X-Sync-Kind", file.kind); connection.setRequestProperty("X-Sync-Record-ID", file.recordId); connection.setRequestProperty("X-Sync-Revision", expectedRevision.toString())
             if (connection.responseCode !in 200..299) throw ApiException(connection.responseCode, "No se pudo descargar el recurso")
             connection.inputStream.use { input -> FileOutputStream(staging).use { outputStream ->
