@@ -10,10 +10,12 @@ export const syncQueueService = {
 };
 export async function notifyLocalChange(operationType: string, entityId: string) {
   if (!localStorage.getItem("lumina.account.authenticated")) return;
+  const errors: string[] = [];
   if (operationType.endsWith("_delete")) {
     const kind = operationType.startsWith("cursor") ? "cursor" : operationType.startsWith("playlist") ? "playlist" : "wallpaper";
-    await invoke("record_sync_tombstone", { entityId, kind }).catch(() => undefined);
+    try { await invoke("record_sync_tombstone", { entityId, kind }); } catch (error) { errors.push(`No se pudo registrar la eliminación: ${String(error)}`); }
   }
-  await syncQueueService.enqueue(operationType, entityId).catch(() => undefined);
+  try { await syncQueueService.enqueue(operationType, entityId); } catch (error) { errors.push(`No se pudo encolar la sincronización: ${String(error)}`); }
   window.dispatchEvent(new Event("lumina:sync-state"));
+  if (errors.length > 0) throw new Error(errors.join("; "));
 }

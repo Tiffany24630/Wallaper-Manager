@@ -1,10 +1,10 @@
 use crate::{
     commands::{
-        cursor::import_cursor,
+        cursor::{import_cursor, import_cursor_with_id},
         secure_storage::{
             get_secure_session_token, get_secure_session_token_unlocked, session_lock,
         },
-        wallpaper::import_file,
+        wallpaper::{import_file, import_file_with_id},
     },
     db::{app_data_dir, get_connection},
 };
@@ -40,6 +40,7 @@ pub async fn download_and_import_synced_resource(
     expected_hash: String,
     hotspot_x: Option<u16>,
     hotspot_y: Option<u16>,
+    local_id: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         download_and_import_sync(
@@ -52,6 +53,7 @@ pub async fn download_and_import_synced_resource(
             expected_hash,
             hotspot_x,
             hotspot_y,
+            local_id,
         )
     })
     .await
@@ -72,6 +74,38 @@ fn find_existing_resource(kind: &str, hash: &str) -> Result<Option<String>, Stri
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
             other => Err(other.to_string()),
         })
+}
+
+fn attach_pending_playlists(wallpaper_id: &str) -> Result<(), String> {
+    let mut conn = get_connection().map_err(|error| error.to_string())?;
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT OR IGNORE INTO playlist_wallpapers(playlist_id, wallpaper_id, position)
+         SELECT pending.playlist_id, ?1,
+           COALESCE((SELECT MAX(existing.position) + 1 FROM playlist_wallpapers AS existing WHERE existing.playlist_id = pending.playlist_id), 0)
+         FROM sync_pending_playlist_items AS pending WHERE pending.wallpaper_id = ?1",
+        [wallpaper_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM sync_pending_playlist_items WHERE wallpaper_id=?1",
+        [wallpaper_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
+
+fn clear_sync_tombstone(kind: &str, record_id: &str) -> Result<(), String> {
+    if !matches!(kind, "wallpaper" | "cursor") {
+        return Err("El tipo de recurso sincronizado no es compatible".into());
+    }
+    let conn = get_connection().map_err(|error| error.to_string())?;
+    conn.execute(
+        "DELETE FROM sync_tombstones WHERE entity_id=?1 AND kind=?2",
+        rusqlite::params![record_id, kind],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -389,14 +423,31 @@ fn download_and_import_sync(
     expected_hash: String,
     hotspot_x: Option<u16>,
     hotspot_y: Option<u16>,
+    local_id: Option<String>,
 ) -> Result<String, String> {
     if name.trim().is_empty() {
         return Err("Metadatos de descarga no vÃ¡lidos".into());
     }
     if let Some(existing_id) = find_existing_resource(&kind, &expected_hash)? {
+        if let Some(local_id) = local_id.as_deref() {
+            if local_id != existing_id {
+                return Err(
+                    "El contenido ya existe bajo otra identidad local; no se duplicarÃ¡ el recurso"
+                        .into(),
+                );
+            }
+        }
+        if let Some(local_id) = local_id.as_deref() {
+            if local_id == existing_id {
+                clear_sync_tombstone(&kind, local_id)?;
+            }
+        }
+        if kind == "wallpaper" {
+            attach_pending_playlists(&existing_id)?;
+        }
         return Ok(existing_id);
     }
-    with_downloaded_synced_resource(
+    let imported_id = with_downloaded_synced_resource(
         api_url,
         device_id,
         file_id,
@@ -406,15 +457,36 @@ fn download_and_import_sync(
         None,
         |path| {
             if kind == "wallpaper" {
-                import_file(path, Some(name))
+                match local_id.as_deref() {
+                    Some(id) => import_file_with_id(path, Some(name), id.to_string()),
+                    None => import_file(path, Some(name)),
+                }
             } else {
-                import_cursor(
-                    path.to_string_lossy().into_owned(),
-                    Some(name),
-                    hotspot_x,
-                    hotspot_y,
-                )
+                match local_id.as_deref() {
+                    Some(id) => import_cursor_with_id(
+                        path.to_string_lossy().into_owned(),
+                        Some(name),
+                        hotspot_x,
+                        hotspot_y,
+                        id.to_string(),
+                    ),
+                    None => import_cursor(
+                        path.to_string_lossy().into_owned(),
+                        Some(name),
+                        hotspot_x,
+                        hotspot_y,
+                    ),
+                }
             }
         },
-    )
+    )?;
+    if let Some(local_id) = local_id.as_deref() {
+        if local_id == imported_id {
+            clear_sync_tombstone(&kind, local_id)?;
+        }
+    }
+    if kind == "wallpaper" {
+        attach_pending_playlists(&imported_id)?;
+    }
+    Ok(imported_id)
 }

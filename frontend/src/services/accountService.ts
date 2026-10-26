@@ -154,8 +154,8 @@ export const accountService = {
     return request<{ file_id: string; sha256: string }>(`/v1/files/upload/${encodeURIComponent(init.upload_id)}/complete`, { method: "POST" });
   },
   downloadFile: async (fileId: string) => (await fileRequest(`/v1/files/${encodeURIComponent(fileId)}`)).blob(),
-  restoreWallpaper: async (fileId: string, name: string, extension: string, expectedHash: string) => invoke<string>("download_and_import_synced_resource", { apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey), fileId, kind: "wallpaper", name, extension, expectedHash }),
-  restoreCursor: async (fileId: string, name: string, extension: string, expectedHash: string, hotspotX = 0, hotspotY = 0) => invoke<string>("download_and_import_synced_resource", { apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey), fileId, kind: "cursor", name, extension, expectedHash, hotspotX, hotspotY }),
+  restoreWallpaper: async (fileId: string, recordId: string, name: string, extension: string, expectedHash: string) => invoke<string>("download_and_import_synced_resource", { apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey), fileId, kind: "wallpaper", name, extension, expectedHash, localId: recordId }),
+  restoreCursor: async (fileId: string, recordId: string, name: string, extension: string, expectedHash: string, hotspotX = 0, hotspotY = 0) => invoke<string>("download_and_import_synced_resource", { apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey), fileId, kind: "cursor", name, extension, expectedHash, hotspotX, hotspotY, localId: recordId }),
   revokeDevice: (id: string) => request(`/v1/devices/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };
 

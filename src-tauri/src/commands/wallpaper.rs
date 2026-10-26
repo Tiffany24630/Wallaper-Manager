@@ -117,6 +117,39 @@ pub(crate) fn import_file_with_parent(
     display_name: Option<String>,
     parent_wallpaper_id: Option<&str>,
 ) -> Result<String, String> {
+    import_file_with_id_and_parent(
+        source_path,
+        display_name,
+        Uuid::new_v4().to_string(),
+        parent_wallpaper_id,
+    )
+}
+
+pub(crate) fn import_file_with_id(
+    source_path: &Path,
+    display_name: Option<String>,
+    id: String,
+) -> Result<String, String> {
+    if !is_safe_resource_id(&id) {
+        return Err("La identidad remota del wallpaper no es vÃ¡lida".into());
+    }
+    import_file_with_id_and_parent(source_path, display_name, id, None)
+}
+
+fn is_safe_resource_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn import_file_with_id_and_parent(
+    source_path: &Path,
+    display_name: Option<String>,
+    id: String,
+    parent_wallpaper_id: Option<&str>,
+) -> Result<String, String> {
     if !source_path.is_file() {
         return Err("No se encontró el archivo seleccionado".into());
     }
@@ -144,6 +177,17 @@ pub(crate) fn import_file_with_parent(
 
     let hash = file_hash(&source_path.to_string_lossy())?;
     let conn = get_connection().map_err(|e| e.to_string())?;
+    let existing_by_id: Option<String> = conn
+        .query_row("SELECT hash FROM wallpapers WHERE id = ?1", [&id], |row| {
+            row.get(0)
+        })
+        .ok();
+    if let Some(existing_hash) = existing_by_id {
+        if existing_hash.eq_ignore_ascii_case(&hash) {
+            return Ok(id);
+        }
+        return Err("La identidad del wallpaper ya pertenece a otro contenido".into());
+    }
     let exists: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM wallpapers WHERE hash = ?1",
@@ -162,7 +206,6 @@ pub(crate) fn import_file_with_parent(
             .to_string_lossy()
             .into_owned()
     }))?;
-    let id = Uuid::new_v4().to_string();
     let root = app_data_dir().map_err(|e| e.to_string())?;
     let original_path = root
         .join("wallpapers/originals")
@@ -1741,11 +1784,11 @@ pub fn upscale_wallpaper(
 mod tests {
     use super::{
         clear_wallpaper_references, combine_operation_and_cleanup, compensate_import_failure,
-        ensure_asset_available, ensure_rotatable_resource_type, persist_active_wallpaper,
-        persist_monitor_wallpaper_assignment, read_scaling_mode, realesrgan_process_failure,
-        remove_owned_file, rename_wallpaper_in_connection, replace_validated_image,
-        replace_wallpaper_resource_in_connection, rotate_image, target_dimensions,
-        validate_ai_pixels, validate_generated_image, validate_imported_copy,
+        ensure_asset_available, ensure_rotatable_resource_type, is_safe_resource_id,
+        persist_active_wallpaper, persist_monitor_wallpaper_assignment, read_scaling_mode,
+        realesrgan_process_failure, remove_owned_file, rename_wallpaper_in_connection,
+        replace_validated_image, replace_wallpaper_resource_in_connection, rotate_image,
+        target_dimensions, validate_ai_pixels, validate_generated_image, validate_imported_copy,
         validate_realesrgan_resources, validate_wallpaper_name, wallpaper_assigned_monitors,
         EnhancementJobGuard, EnhancementJobState, TemporaryOutput,
     };
@@ -1759,6 +1802,15 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     use uuid::Uuid;
+
+    #[test]
+    fn synced_restore_ids_cannot_escape_resource_directories() {
+        assert!(is_safe_resource_id("remote-wallpaper-1"));
+        assert!(is_safe_resource_id("same.id"));
+        assert!(!is_safe_resource_id("../outside"));
+        assert!(!is_safe_resource_id(""));
+        assert!(!is_safe_resource_id(&"x".repeat(129)));
+    }
 
     #[test]
     fn scaling_mode_reads_valid_configuration() {

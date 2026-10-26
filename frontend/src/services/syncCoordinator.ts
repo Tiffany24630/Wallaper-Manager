@@ -1,5 +1,5 @@
 import { accountService } from "./accountService";
-import { syncQueueService } from "./syncQueueService";
+import { syncQueueService, type QueueItem } from "./syncQueueService";
 
 let started = false;
 let stopped = false;
@@ -14,9 +14,19 @@ const delay = (milliseconds: number) => new Promise<void>(resolve => {
 
 async function processNext() {
   if (processing || !accountService.hasSession()) return false;
-  const items = await syncQueueService.list().catch(() => []);
+  let items: QueueItem[];
+  try { items = await syncQueueService.list(); } catch (error) {
+    window.dispatchEvent(new CustomEvent("lumina:sync-error", { detail: String(error) }));
+    return false;
+  }
   const item = items.find(candidate => candidate.state === "pending" || candidate.state === "retry");
-  if (!item || !await syncQueueService.claim(item.id).catch(() => false)) return false;
+  if (!item) return false;
+  let claimed = false;
+  try { claimed = await syncQueueService.claim(item.id); } catch (error) {
+    window.dispatchEvent(new CustomEvent("lumina:sync-error", { detail: String(error) }));
+    return false;
+  }
+  if (!claimed) return false;
   processing = true; window.dispatchEvent(new Event("lumina:sync-state"));
   const sessionAtStart = accountService.hasSession();
   try {
@@ -24,7 +34,8 @@ async function processNext() {
     const sessionStillValid = sessionAtStart && accountService.hasSession();
     await syncQueueService.finish(item.id, sessionStillValid && result.errors.length === 0, sessionStillValid ? result.errors.join("; ") : "La sesión terminó durante la sincronización");
   } catch (error) {
-    await syncQueueService.finish(item.id, false, String(error)).catch(() => undefined);
+    try { await syncQueueService.finish(item.id, false, String(error)); }
+    catch (finishError) { window.dispatchEvent(new CustomEvent("lumina:sync-error", { detail: `${String(error)}; no se pudo guardar el estado de reintento: ${String(finishError)}` })); }
   } finally {
     processing = false; window.dispatchEvent(new Event("lumina:sync-state"));
   }

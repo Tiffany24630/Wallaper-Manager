@@ -273,6 +273,25 @@ pub fn import_cursor(
     hotspot_x: Option<u16>,
     hotspot_y: Option<u16>,
 ) -> Result<String, String> {
+    import_cursor_with_id(
+        source_path,
+        name,
+        hotspot_x,
+        hotspot_y,
+        Uuid::new_v4().to_string(),
+    )
+}
+
+pub(crate) fn import_cursor_with_id(
+    source_path: String,
+    name: Option<String>,
+    hotspot_x: Option<u16>,
+    hotspot_y: Option<u16>,
+    id: String,
+) -> Result<String, String> {
+    if !is_safe_cursor_id(&id) {
+        return Err("La identidad remota del cursor no es vÃ¡lida".into());
+    }
     let source = Path::new(&source_path);
     if !source.is_file() {
         return Err("No se encontró el archivo seleccionado".into());
@@ -287,13 +306,23 @@ pub fn import_cursor(
         std::io::copy(&mut file, &mut hasher).map_err(|e| e.to_string())?;
         format!("{:x}", hasher.finalize())
     };
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    if let Ok(existing_hash) = conn.query_row(
+        "SELECT hash FROM cursor_resources WHERE id=?1",
+        [&id],
+        |row| row.get::<_, String>(0),
+    ) {
+        if existing_hash.eq_ignore_ascii_case(&source_hash) {
+            return Ok(id);
+        }
+        return Err("La identidad del cursor ya pertenece a otro contenido".into());
+    }
     let display_name = validate_name(name.as_deref().unwrap_or_else(|| {
         source
             .file_stem()
             .and_then(|v| v.to_str())
             .unwrap_or("Cursor")
     }))?;
-    let id = Uuid::new_v4().to_string();
     let root = app_data_dir().map_err(|e| e.to_string())?;
     let source_ext = source
         .extension()
@@ -409,6 +438,14 @@ pub fn import_cursor(
         return Err(error.to_string());
     }
     Ok(id)
+}
+
+fn is_safe_cursor_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 #[tauri::command]
@@ -790,8 +827,8 @@ pub fn delete_cursor(cursor_id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_kind, encode_cur, replace_cursor_resource_in_connection, validate_cursor_file,
-        validate_image_dimensions, CursorKind,
+        detect_kind, encode_cur, is_safe_cursor_id, replace_cursor_resource_in_connection,
+        validate_cursor_file, validate_image_dimensions, CursorKind,
     };
     use image::RgbaImage;
     use rusqlite::Connection;
@@ -800,6 +837,15 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn synced_restore_ids_cannot_escape_resource_directories() {
+        assert!(is_safe_cursor_id("remote-cursor-1"));
+        assert!(is_safe_cursor_id("same.id"));
+        assert!(!is_safe_cursor_id("../outside"));
+        assert!(!is_safe_cursor_id(""));
+        assert!(!is_safe_cursor_id(&"x".repeat(129)));
+    }
 
     #[test]
     fn detects_cursor_formats() {
