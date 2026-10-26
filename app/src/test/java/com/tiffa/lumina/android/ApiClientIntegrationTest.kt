@@ -66,6 +66,88 @@ class ApiClientIntegrationTest {
         assertEquals(listOf("POST /v1/devices", "GET /v1/devices", "POST /v1/sync"), requests)
     }
 
+    @Test fun publishesWallpaperMetadataThenChunksAndConfirmsTheFile() {
+        client.token = "publish-token"
+        val bytes = "synthetic-image".toByteArray(StandardCharsets.UTF_8)
+        val source = File(tempDir, "source.png").apply { writeBytes(bytes) }
+        val hash = sha256(bytes)
+        val requests = mutableListOf<String>()
+        server.handler = { request ->
+            requests += "${request.method} ${request.path}"
+            when {
+                request.path == "/v1/sync" && requests.count { it == "POST /v1/sync" } == 1 -> {
+                    assertTrue(request.body.contains("\"kind\":\"wallpaper\""))
+                    assertTrue(request.body.contains("\"base_revision\":0"))
+                    Response(200, "{\"records\":[{\"record_id\":\"android-wallpaper\",\"kind\":\"wallpaper\",\"payload\":{\"name\":\"source.png\",\"hash\":\"$hash\",\"size_bytes\":${bytes.size}},\"revision\":1,\"deleted\":0}],\"files\":[],\"conflicts\":[]}")
+                }
+                request.path == "/v1/files/upload/init" -> {
+                    assertTrue(request.body.contains("\"record_id\":\"android-wallpaper\""))
+                    assertTrue(request.body.contains("\"sha256\":\"$hash\""))
+                    Response(201, "{\"upload_id\":\"upload-1\",\"offset\":0,\"chunk_size\":1024}")
+                }
+                request.path == "/v1/files/upload/upload-1" && request.method == "PUT" -> {
+                    assertEquals("0", request.headers["x-upload-offset"])
+                    Response(200, "{\"upload_id\":\"upload-1\",\"offset\":${bytes.size},\"complete\":true}")
+                }
+                request.path == "/v1/files/upload/upload-1/complete" -> Response(201, "{\"file_id\":\"file-1\",\"sha256\":\"$hash\"}")
+                request.path == "/v1/sync" -> Response(200, "{\"records\":[{\"record_id\":\"android-wallpaper\",\"kind\":\"wallpaper\",\"payload\":{\"name\":\"source.png\",\"hash\":\"$hash\",\"size_bytes\":${bytes.size}},\"revision\":1,\"deleted\":0}],\"files\":[{\"id\":\"file-1\",\"record_id\":\"android-wallpaper\",\"kind\":\"wallpaper\",\"original_name\":\"source.png\",\"mime\":\"image/png\",\"extension\":\"png\",\"size_bytes\":${bytes.size},\"sha256\":\"$hash\"}],\"conflicts\":[]}")
+                else -> Response(404, "{\"error\":\"not found\"}")
+            }
+        }
+        val result = client.publishWallpaper("android-device", "android-wallpaper", source, "source.png", "image/png", 0)
+        assertEquals("android-wallpaper", result.recordId)
+        assertEquals(1, result.revision)
+        assertEquals("file-1", result.fileId)
+        assertEquals(hash, result.sha256)
+        assertEquals(listOf("POST /v1/sync", "POST /v1/files/upload/init", "PUT /v1/files/upload/upload-1", "POST /v1/files/upload/upload-1/complete", "POST /v1/sync"), requests)
+    }
+
+    @Test fun publicationConflictIsObservableBeforeAnyUpload() {
+        client.token = "publish-token"
+        val source = File(tempDir, "source.png").apply { writeText("local-image") }
+        var uploadStarted = false
+        server.handler = { request ->
+            if (request.path == "/v1/sync") Response(200, "{\"records\":[],\"files\":[],\"conflicts\":[{\"id\":\"android-wallpaper\",\"kind\":\"wallpaper\",\"server_revision\":4,\"server_payload\":{\"hash\":\"remote\"}}]}")
+            else { uploadStarted = true; Response(500, "{\"error\":\"upload must not start\"}") }
+        }
+        try { client.publishWallpaper("android-device", "android-wallpaper", source, "source.png", "image/png", 3); throw AssertionError("conflict was accepted") } catch (error: ApiException) { assertEquals(409, error.status) }
+        assertFalse(uploadStarted)
+        assertEquals("local-image", source.readText())
+    }
+
+    @Test fun retryWithTheSameRemoteHashDoesNotCreateAnotherUpload() {
+        client.token = "publish-token"
+        val bytes = "same-image".toByteArray(StandardCharsets.UTF_8)
+        val source = File(tempDir, "same.png").apply { writeBytes(bytes) }
+        val hash = sha256(bytes)
+        val requests = mutableListOf<String>()
+        server.handler = { request ->
+            requests += "${request.method} ${request.path}"
+            when {
+                request.path == "/v1/sync" -> Response(200, "{\"records\":[{\"record_id\":\"same-wallpaper\",\"kind\":\"wallpaper\",\"payload\":{\"hash\":\"$hash\",\"size_bytes\":${bytes.size}},\"revision\":2,\"deleted\":0}],\"files\":[{\"id\":\"file-same\",\"record_id\":\"same-wallpaper\",\"kind\":\"wallpaper\",\"original_name\":\"same.png\",\"mime\":\"image/png\",\"extension\":\"png\",\"size_bytes\":${bytes.size},\"sha256\":\"$hash\"}],\"conflicts\":[]}")
+                request.path == "/v1/files/upload/init" -> Response(200, "{\"file_id\":\"file-same\",\"already_exists\":true,\"size\":${bytes.size},\"sha256\":\"$hash\"}")
+                else -> Response(500, "{\"error\":\"unexpected upload\"}")
+            }
+        }
+        val result = client.publishWallpaper("android-device", "same-wallpaper", source, "same.png", "image/png", 2, metadataAlreadyCurrent = true)
+        assertEquals("file-same", result.fileId)
+        assertEquals(listOf("POST /v1/sync", "POST /v1/files/upload/init", "POST /v1/sync"), requests)
+    }
+
+    @Test fun reusableWallpaperIdentityRequiresTheTypedFileAssociation() {
+        val hash = sha256("same-image".toByteArray(StandardCharsets.UTF_8))
+        val snapshot = SyncSnapshot(
+            records = listOf(
+                RemoteRecord("without-file", "wallpaper", 1, org.json.JSONObject().put("hash", hash).put("size_bytes", 10), false),
+                RemoteRecord("with-file", "wallpaper", 2, org.json.JSONObject().put("hash", hash).put("size_bytes", 10), false),
+                RemoteRecord("same-id-different-kind", "cursor", 3, org.json.JSONObject().put("hash", hash).put("size_bytes", 10), false),
+            ),
+            files = listOf(RemoteFile("file-1", "with-file", "wallpaper", "same.png", "image/png", "png", 10, hash)),
+            conflicts = emptyList(),
+        )
+        assertEquals("with-file", findReusableWallpaper(snapshot, hash, 10, "without-file")?.id)
+    }
+
     @Test fun conditionalDownloadVerifiesHeadersHashAndPreservesExistingFileOnFailure() {
         client.token = "download-token"
         val bytes = "fixture-content".toByteArray(StandardCharsets.UTF_8)

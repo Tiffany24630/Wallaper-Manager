@@ -2,6 +2,7 @@ package com.tiffa.lumina.android
 
 import android.content.Context
 import java.io.File
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -37,11 +38,45 @@ class LuminaRepository(context: Context) {
         val safeName = "${file.kind}_${file.recordId}_${file.sha256.take(12)}.${file.extension.trimStart('.')}".replace(Regex("[^A-Za-z0-9._-]"), "_")
         runCatching { client.download(file, record.revision, File(appContext.filesDir, "remote-resources/$safeName"), deviceId) }.fold({ callback(Result.success(it)) }, { if (it is ApiException && it.status in 401..403) clearSession(); callback(Result.failure(it)) })
     }
+    fun publishWallpaper(source: File, name: String, mime: String, callback: (Result<PublishResult>) -> Unit) = executor.execute {
+        runCatching {
+            require(source.isFile && source.length() > 0) { "El archivo seleccionado no es válido" }
+            val hash = sha256(source)
+            val pendingHash = preferences.getString("pending_publish_hash", null)
+            val knownHash = pendingHash ?: preferences.getString("last_publish_hash", null)
+            val knownId = preferences.getString(if (pendingHash == hash) "pending_publish_id" else "last_publish_id", null)
+            val snapshot = client.sync(deviceId)
+            val reusable = findReusableWallpaper(snapshot, hash, source.length(), knownId)
+            val recordId = reusable?.id ?: if (knownHash == hash) knownId ?: UUID.randomUUID().toString() else UUID.randomUUID().toString()
+            preferences.edit().putString("pending_publish_hash", hash).putString("pending_publish_id", recordId).apply()
+            val current = snapshot.records.firstOrNull { it.id == recordId && it.kind == "wallpaper" }
+            val unchanged = current != null && !current.deleted && current.payload.optString("hash").equals(hash, true) && current.payload.optLong("size_bytes", -1L) == source.length()
+            val result = client.publishWallpaper(deviceId, recordId, source, name, mime, current?.revision ?: 0L, unchanged)
+            preferences.edit().remove("pending_publish_hash").remove("pending_publish_id").putString("last_publish_hash", hash).putString("last_publish_id", recordId).apply()
+            refreshInternal()
+            result
+        }.fold({ callback(Result.success(it)) }, { if (it is ApiException && it.status in 401..403) clearSession(); callback(Result.failure(it)) })
+    }
 
     fun logout(callback: () -> Unit) = executor.execute { runCatching { client.logout() }; clearSession(); callback() }
     fun clearSession() { client.token = null; secureSession.clear(); snapshot = SyncSnapshot(emptyList(), emptyList(), emptyList()); devices = emptyList() }
     fun shutdown() { executor.shutdownNow() }
 
     private fun refreshInternal(): SyncSnapshot { val result = client.sync(deviceId); snapshot = result; devices = client.devices(); preferences.edit().putLong("last_sync_at", System.currentTimeMillis()).apply(); return result }
+
+    private fun sha256(file: File): String { val digest = MessageDigest.getInstance("SHA-256"); file.inputStream().use { input -> val buffer = ByteArray(8192); var read: Int; while (input.read(buffer).also { read = it } >= 0) if (read > 0) digest.update(buffer, 0, read) }; return digest.digest().joinToString("") { "%02x".format(it) } }
+}
+
+internal fun findReusableWallpaper(snapshot: SyncSnapshot, hash: String, size: Long, preferredId: String?): RemoteRecord? {
+    val candidates = snapshot.records.asSequence().filter { record ->
+        record.kind == "wallpaper" && !record.deleted &&
+            record.payload.optString("hash").equals(hash, true) &&
+            record.payload.optLong("size_bytes", -1L) == size &&
+            snapshot.files.any { file ->
+                file.recordId == record.id && file.kind == "wallpaper" &&
+                    file.sha256.equals(hash, true) && file.size == size
+            }
+    }
+    return candidates.firstOrNull { it.id == preferredId } ?: candidates.firstOrNull()
 }
 

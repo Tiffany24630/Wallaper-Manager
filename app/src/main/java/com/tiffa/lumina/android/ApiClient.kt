@@ -4,6 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.FileInputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -40,12 +41,57 @@ class ApiClient(baseUrl: String) {
     fun devices(): List<Device> = JSONArray(JSONObject(request("GET", "/v1/devices")).optJSONArray("devices")?.toString() ?: "[]").toList { Device(it.getString("id"), it.getString("name"), it.getString("platform"), it.optNullableLong("last_sync_at"), it.optNullableLong("revoked_at")) }
     fun revokeDevice(id: String) { request("DELETE", "/v1/devices/${encodePathSegment(id)}") }
 
-    fun sync(deviceId: String): SyncSnapshot {
-        val json = JSONObject(request("POST", "/v1/sync", JSONObject().put("device_id", deviceId).put("changes", JSONArray())))
+    fun sync(deviceId: String, changes: List<SyncChange> = emptyList()): SyncSnapshot {
+        val encodedChanges = JSONArray().apply { changes.forEach { change -> put(JSONObject().apply { put("id", change.id); put("kind", change.kind); put("base_revision", change.baseRevision); put("payload", change.payload); if (change.deleted) put("deleted", true) }) } }
+        val json = JSONObject(request("POST", "/v1/sync", JSONObject().put("device_id", deviceId).put("changes", encodedChanges)))
         val records = json.optJSONArray("records").toList { RemoteRecord(it.getString("record_id"), it.getString("kind"), it.getLong("revision"), it.optJSONObject("payload") ?: JSONObject(), it.optInt("deleted") != 0) }
         val files = json.optJSONArray("files").toList { RemoteFile(it.getString("id"), it.getString("record_id"), it.getString("kind"), it.getString("original_name"), it.optString("mime"), it.optString("extension"), it.getLong("size_bytes"), it.getString("sha256")) }
         val conflicts = json.optJSONArray("conflicts").toList { SyncConflict(it.getString("id"), it.getString("kind"), it.getLong("server_revision"), it.optJSONObject("server_payload") ?: JSONObject()) }
         return SyncSnapshot(records, files, conflicts)
+    }
+
+    fun publishWallpaper(deviceId: String, recordId: String, file: File, name: String, mime: String, baseRevision: Long, metadataAlreadyCurrent: Boolean = false): PublishResult {
+        require(recordId.isNotBlank() && name.isNotBlank() && file.isFile && file.length() > 0) { "El recurso local no es válido" }
+        val digest = sha256(file)
+        val payload = JSONObject().put("name", name).put("hash", digest).put("size_bytes", file.length()).put("file_type", mime.substringAfter('/', "bin"))
+        val metadata = if (metadataAlreadyCurrent) sync(deviceId) else sync(deviceId, listOf(SyncChange(recordId, "wallpaper", baseRevision, payload)))
+        if (metadata.conflicts.any { it.id == recordId && it.kind == "wallpaper" }) throw ApiException(409, "La revisión remota cambió; conserva el recurso local y vuelve a sincronizar")
+        val record = metadata.records.firstOrNull { it.id == recordId && it.kind == "wallpaper" && !it.deleted }
+            ?: throw ApiException(502, "El servidor no confirmó el registro publicado")
+        val upload = uploadFile(deviceId, recordId, file, name, mime, digest)
+        val confirmed = sync(deviceId).files.firstOrNull { it.id == upload.first && it.recordId == recordId && it.kind == "wallpaper" && it.sha256.equals(digest, true) }
+            ?: throw ApiException(502, "El servidor no confirmó el archivo publicado")
+        return PublishResult(recordId, record.revision, confirmed.id, confirmed.sha256)
+    }
+
+    private fun uploadFile(deviceId: String, recordId: String, file: File, name: String, mime: String, hash: String): Pair<String, String> {
+        val init = JSONObject(request("POST", "/v1/files/upload/init", JSONObject().put("device_id", deviceId).put("record_id", recordId).put("kind", "wallpaper").put("name", name).put("mime", mime).put("size", file.length()).put("sha256", hash)))
+        if (init.optBoolean("already_exists")) return init.getString("file_id") to init.getString("sha256")
+        val uploadId = init.getString("upload_id"); val chunkSize = init.getLong("chunk_size").toInt(); var offset = init.getLong("offset")
+        FileInputStream(file).use { input ->
+            var skipped = 0L
+            while (skipped < offset) { val count = input.skip(offset - skipped); if (count <= 0) throw ApiException(502, "No se pudo reanudar la carga local"); skipped += count }
+            val buffer = ByteArray(chunkSize)
+            while (offset < file.length()) {
+                val wanted = minOf(buffer.size.toLong(), file.length() - offset).toInt(); var read = 0
+                while (read < wanted) { val count = input.read(buffer, read, wanted - read); if (count < 0) throw ApiException(502, "La lectura local se interrumpió"); read += count }
+                val response = binaryRequest("PUT", "/v1/files/upload/${encodePathSegment(uploadId)}", buffer.copyOf(wanted), mapOf("Content-Type" to "application/octet-stream", "X-Upload-Offset" to offset.toString(), "X-Upload-Length" to wanted.toString()))
+                offset = JSONObject(response).getLong("offset")
+            }
+        }
+        val completed = JSONObject(request("POST", "/v1/files/upload/${encodePathSegment(uploadId)}/complete"))
+        return completed.getString("file_id") to completed.getString("sha256")
+    }
+
+    private fun binaryRequest(method: String, path: String, bytes: ByteArray, headers: Map<String, String>): String {
+        val connection = URL(baseUrl + path).openConnection() as HttpURLConnection
+        connection.requestMethod = method; connection.connectTimeout = 15_000; connection.readTimeout = 30_000; connection.instanceFollowRedirects = false; connection.doOutput = true
+        token?.let { connection.setRequestProperty("Authorization", "Bearer $it") }; headers.forEach { (key, value) -> connection.setRequestProperty(key, value) }
+        connection.outputStream.use { it.write(bytes) }
+        val status = connection.responseCode; val stream = if (status in 200..299) connection.inputStream else connection.errorStream
+        val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+        if (status !in 200..299) throw ApiException(status, runCatching { JSONObject(text).optString("error", "Error HTTP $status") }.getOrDefault("Error HTTP $status"))
+        return text
     }
 
     fun download(file: RemoteFile, expectedRevision: Long, output: File, deviceId: String): File {

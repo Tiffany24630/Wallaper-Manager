@@ -1,17 +1,34 @@
 package com.tiffa.lumina.android
 
 import android.graphics.Color
+import android.content.Intent
 import android.os.Bundle
 import android.widget.*
+import java.io.File
 import java.io.IOException
 
 class MainActivity : android.app.Activity() {
     private lateinit var repository: LuminaRepository
     private lateinit var root: LinearLayout
     private lateinit var status: TextView
+    private var publishing = false
 
     override fun onCreate(state: Bundle?) { super.onCreate(state); repository = LuminaRepository(this); showLoading(); repository.restore { result -> runOnUiThread { result.fold({ if (it) showHome() else showLogin() }, { showLogin(friendlyError(it)) }) } } }
     override fun onDestroy() { repository.shutdown(); super.onDestroy() }
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != PICK_WALLPAPER || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val mime = contentResolver.getType(uri) ?: "image/png"
+        if (mime !in setOf("image/png", "image/jpeg", "image/webp", "image/bmp")) { status.text = "Selecciona una imagen PNG, JPEG, WebP o BMP."; return }
+        val extension = when (mime) { "image/jpeg" -> "jpg"; "image/webp" -> "webp"; "image/bmp" -> "bmp"; else -> "png" }
+        val source = File(filesDir, "publish/${System.currentTimeMillis()}.$extension")
+        try {
+            source.parentFile?.mkdirs(); contentResolver.openInputStream(uri).use { input -> requireNotNull(input) { "No se pudo leer la imagen seleccionada" }; source.outputStream().use { output -> input.copyTo(output) } }
+        } catch (error: Throwable) { source.delete(); status.text = friendlyError(error); return }
+        publishing = true; status.text = "Publicando imagen…"
+        repository.publishWallpaper(source, "Android ${source.nameWithoutExtension}", mime) { result -> runOnUiThread { publishing = false; result.fold({ source.delete(); showHome() }, { status.text = friendlyError(it) }) } }
+    }
 
     private fun base(title: String) {
         root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
@@ -35,6 +52,7 @@ class MainActivity : android.app.Activity() {
 
     private fun showHome() {
         base("Lumina · Cuenta")
+        root.addView(Button(this).apply { text = "Publicar imagen"; isEnabled = !publishing; setOnClickListener { startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { type = "image/*"; addCategory(Intent.CATEGORY_OPENABLE) }, PICK_WALLPAPER) } })
         root.addView(Button(this).apply { text = "Actualizar biblioteca"; setOnClickListener { status.text = "Sincronizando…"; repository.refresh { result -> runOnUiThread { result.fold({ showHome() }, { if (it is ApiException && it.status in 401..403) showLogin(friendlyError(it)) else status.text = friendlyError(it) }) } } } })
         root.addView(Button(this).apply { text = "Biblioteca"; setOnClickListener { showLibrary() } })
         root.addView(Button(this).apply { text = "Playlists"; setOnClickListener { showPlaylists() } })
@@ -94,5 +112,7 @@ class MainActivity : android.app.Activity() {
 
     private fun addBack() { root.addView(Button(this).apply { text = "Atrás"; setOnClickListener { showHome() } }) }
     private fun friendlyError(error: Throwable): String = when (error) { is ApiException -> if (error.status in 401..403) "La sesión expiró o no está autorizada." else error.message ?: "Error del servidor"; is IOException -> "No se pudo conectar con el servidor. Comprueba la red y vuelve a intentarlo."; else -> "No se pudo completar la operación" }
+
+    companion object { private const val PICK_WALLPAPER = 1001 }
 }
 
