@@ -51,7 +51,7 @@ class ApiClient(baseUrl: String) {
         return SyncSnapshot(records, files, conflicts)
     }
 
-    fun resolveConflict(deviceId: String, conflict: SyncConflict, keepRemote: Boolean, localPayload: JSONObject? = null, resolutionId: String = UUID.randomUUID().toString()): JSONObject {
+    fun resolveConflict(deviceId: String, conflict: SyncConflict, keepRemote: Boolean, localPayload: JSONObject? = null, resolutionId: String = UUID.randomUUID().toString(), deleted: Boolean = false, preparedUploadId: String? = null): JSONObject {
         val body = JSONObject()
             .put("device_id", deviceId)
             .put("kind", conflict.kind)
@@ -60,7 +60,33 @@ class ApiClient(baseUrl: String) {
             .put("action", if (keepRemote) "keep_remote" else "keep_local")
             .put("resolution_id", resolutionId)
         localPayload?.let { body.put("local_payload", it) }
+        if (deleted) body.put("deleted", true)
+        preparedUploadId?.let { body.put("prepared_upload_id", it) }
         return JSONObject(request("POST", "/v1/sync/resolve", body))
+    }
+
+    fun prepareWallpaperConflict(deviceId: String, conflict: SyncConflict, file: File, name: String, mime: String, resolutionId: String): String {
+        require(file.isFile && file.length() > 0) { "El archivo local no es válido" }
+        val hash = sha256(file)
+        val init = JSONObject(request("POST", "/v1/files/upload/init", JSONObject()
+            .put("device_id", deviceId).put("record_id", conflict.id).put("kind", "wallpaper")
+            .put("name", name).put("mime", mime).put("size", file.length()).put("sha256", hash)
+            .put("defer_resolution", true).put("resolution_id", resolutionId).put("expected_revision", conflict.serverRevision)))
+        if (init.optBoolean("prepared")) return init.getString("upload_id")
+        val uploadId = init.getString("upload_id"); val chunkSize = init.getLong("chunk_size").toInt(); var offset = init.getLong("offset")
+        FileInputStream(file).use { input ->
+            var skipped = 0L
+            while (skipped < offset) { val count = input.skip(offset - skipped); if (count <= 0) throw ApiException(502, "No se pudo reanudar la carga local"); skipped += count }
+            val buffer = ByteArray(chunkSize)
+            while (offset < file.length()) {
+                val wanted = minOf(buffer.size.toLong(), file.length() - offset).toInt(); var read = 0
+                while (read < wanted) { val count = input.read(buffer, read, wanted - read); if (count < 0) throw ApiException(502, "La lectura local se interrumpió"); read += count }
+                offset = JSONObject(binaryRequest("PUT", "/v1/files/upload/${encodePathSegment(uploadId)}", buffer.copyOf(wanted), mapOf("Content-Type" to "application/octet-stream", "X-Upload-Offset" to offset.toString(), "X-Upload-Length" to wanted.toString()))).getLong("offset")
+            }
+        }
+        val completed = JSONObject(request("POST", "/v1/files/upload/${encodePathSegment(uploadId)}/complete"))
+        require(completed.optBoolean("prepared")) { "El servidor no confirmó la carga preparada" }
+        return uploadId
     }
 
     fun publishWallpaper(deviceId: String, recordId: String, file: File, name: String, mime: String, baseRevision: Long, metadataAlreadyCurrent: Boolean = false): PublishResult {

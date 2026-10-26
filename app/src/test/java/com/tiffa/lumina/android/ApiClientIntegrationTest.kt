@@ -267,6 +267,27 @@ class ApiClientIntegrationTest {
         try { ApiClient("http://127.0.0.1:$unusedPort").session(); throw AssertionError("offline server was accepted") } catch (_: java.io.IOException) { }
     }
 
+    @Test fun pendingLocalChangeSeparatesLocalContentFromRemoteAndDetectsMutation() {
+        val local = File(tempDir, "local.png").apply { writeBytes("local-bytes".toByteArray(StandardCharsets.UTF_8)) }
+        val hash = sha256(local.readBytes())
+        val pending = PendingLocalChange(
+            kind = "wallpaper", recordId = "same-id", expectedRevision = 4,
+            payload = org.json.JSONObject().put("name", "Local").put("hash", hash).put("size_bytes", local.length()),
+            filePath = local.absolutePath, fileSize = local.length(), fileSha256 = hash,
+            deleted = false, resolutionId = "stable-resolution",
+        )
+        val conflict = SyncConflict("same-id", "wallpaper", 4, org.json.JSONObject().put("name", "Remote"))
+        assertTrue(pending.matches(conflict))
+        assertTrue(pending.verifyContent())
+        assertEquals("Remote", conflict.serverPayload.getString("name"))
+        assertEquals("Local", pending.payload.getString("name"))
+        assertEquals("stable-resolution", PendingLocalChange.fromJson(pending.toJson()).resolutionId)
+
+        local.appendText("changed")
+        assertFalse(pending.verifyContent())
+        assertTrue(PendingLocalChange("playlist", "same-id", 4, org.json.JSONObject(), null, null, null, true, "tombstone").verifyContent())
+    }
+
     private fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 }
 

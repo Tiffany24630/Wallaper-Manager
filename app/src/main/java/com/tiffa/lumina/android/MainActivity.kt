@@ -110,6 +110,18 @@ class MainActivity : android.app.Activity() {
                     } }
                 }
             })
+            if (repository.keepLocalAvailable(conflict)) box.addView(Button(this).apply {
+                text = "Keep local changes"
+                isEnabled = !resolvingConflicts.contains(key)
+                setOnClickListener {
+                    if (!resolvingConflicts.add(key)) return@setOnClickListener
+                    isEnabled = false; status.text = "Confirming local changes..."
+                    repository.acceptLocalConflict(conflict) { result -> runOnUiThread {
+                        resolvingConflicts.remove(key)
+                        result.fold({ showConflicts() }, { if (it is ApiException && it.status in 401..403) showLogin(friendlyError(it)) else { status.text = friendlyError(it); showConflicts() } })
+                    } }
+                }
+            })
             root.addView(box)
         }
         status.text = if (conflicts.isEmpty()) "No pending conflicts." else "The remote state is accepted only if its revision is still current. Files remain available for separate download."
