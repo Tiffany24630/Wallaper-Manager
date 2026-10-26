@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -146,18 +147,21 @@ class Store:
           file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
           user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           record_id TEXT NOT NULL, kind TEXT NOT NULL,
-          PRIMARY KEY(file_id, record_id)
+          PRIMARY KEY(file_id, record_id, kind)
         );
         CREATE TABLE IF NOT EXISTS upload_sessions(
           id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           device_id TEXT NOT NULL, record_id TEXT NOT NULL, kind TEXT NOT NULL,
           original_name TEXT NOT NULL, mime TEXT NOT NULL, expected_size INTEGER NOT NULL,
           expected_sha256 TEXT NOT NULL, temp_name TEXT NOT NULL UNIQUE, received_bytes INTEGER NOT NULL DEFAULT 0,
-          status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+          status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+          final_file_id TEXT, final_storage_name TEXT
         );
         """)
         self._migrate_typed_devices()
         self._migrate_typed_sync_records()
+        self._migrate_typed_file_records()
+        self._migrate_upload_publication_intent()
         self.conn.commit()
 
     def _migrate_typed_devices(self):
@@ -198,6 +202,118 @@ class Store:
             self.conn.execute("DROP TABLE sync_records")
             self.conn.execute("ALTER TABLE sync_records_typed RENAME TO sync_records")
         self.conn.execute("CREATE INDEX IF NOT EXISTS sync_records_user_revision ON sync_records(user_id, revision)")
+
+    def _migrate_typed_file_records(self):
+        columns = self.conn.execute("PRAGMA table_info(file_records)").fetchall()
+        primary_key = [row[1] for row in sorted(columns, key=lambda row: row[5]) if row[5]]
+        if primary_key == ["file_id", "record_id", "kind"]:
+            return
+        self.conn.execute("DROP TABLE IF EXISTS file_records_typed")
+        self.conn.execute("""
+            CREATE TABLE file_records_typed(
+              file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+              user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              record_id TEXT NOT NULL, kind TEXT NOT NULL,
+              PRIMARY KEY(file_id, record_id, kind)
+            )
+        """)
+        self.conn.execute("""
+            INSERT INTO file_records_typed(file_id,user_id,record_id,kind)
+            SELECT file_id,user_id,record_id,kind FROM file_records
+        """)
+        self.conn.execute("DROP TABLE file_records")
+        self.conn.execute("ALTER TABLE file_records_typed RENAME TO file_records")
+
+    def _migrate_upload_publication_intent(self):
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(upload_sessions)").fetchall()}
+        if "final_file_id" not in columns:
+            self.conn.execute("ALTER TABLE upload_sessions ADD COLUMN final_file_id TEXT")
+        if "final_storage_name" not in columns:
+            self.conn.execute("ALTER TABLE upload_sessions ADD COLUMN final_storage_name TEXT")
+
+    def recover_uploads(self, files_root):
+        root = Path(files_root).resolve()
+        rows = self.conn.execute(
+            "SELECT * FROM upload_sessions WHERE status='publishing' OR (status='uploading' AND final_file_id IS NOT NULL)"
+        ).fetchall()
+        recovered = 0
+        for upload in rows:
+            final_id = upload["final_file_id"]
+            relative = upload["final_storage_name"]
+            extension = ALLOWED_FILES.get(upload["mime"])
+            expected_relative = f"files/{upload['user_id']}/{final_id}{extension or ''}"
+            final_path = (root / relative).resolve() if relative else None
+            valid_path = (
+                isinstance(final_id, str)
+                and bool(re.fullmatch(r"[0-9a-f]{32}", final_id))
+                and extension is not None
+                and relative == expected_relative
+                and final_path is not None
+                and root in final_path.parents
+            )
+            source = (root / "uploads" / upload["temp_name"]).resolve()
+            source_valid = source.parent == (root / "uploads").resolve()
+            existing = self.conn.execute(
+                "SELECT * FROM files WHERE id=? AND user_id=?",
+                (final_id, upload["user_id"]),
+            ).fetchone() if valid_path else None
+            if existing:
+                relation = self.conn.execute(
+                    "SELECT 1 FROM file_records WHERE file_id=? AND user_id=? AND record_id=? AND kind=?",
+                    (final_id, upload["user_id"], upload["record_id"], upload["kind"]),
+                ).fetchone()
+                if relation and existing["sha256"] == upload["expected_sha256"]:
+                    self.conn.execute("UPDATE upload_sessions SET status='complete',updated_at=? WHERE id=?", (now(), upload["id"]))
+                    recovered += 1
+                continue
+            if valid_path and final_path.is_file():
+                actual = hashlib.sha256(final_path.read_bytes()).hexdigest()
+                header = final_path.read_bytes()[:512]
+                if actual == upload["expected_sha256"] and final_path.stat().st_size == upload["expected_size"] and valid_file(upload["mime"], header):
+                    existing_hash = self.conn.execute(
+                        "SELECT id FROM files WHERE user_id=? AND kind=? AND sha256=?",
+                        (upload["user_id"], upload["kind"], upload["expected_sha256"]),
+                    ).fetchone()
+                    relation_file_id = existing_hash["id"] if existing_hash else final_id
+                    if not existing_hash:
+                        self.conn.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)", (final_id, upload["user_id"], upload["record_id"], upload["kind"], upload["original_name"], upload["mime"], extension, upload["expected_size"], upload["expected_sha256"], relative, now()))
+                    self.conn.execute("INSERT OR IGNORE INTO file_records VALUES(?,?,?,?)", (relation_file_id, upload["user_id"], upload["record_id"], upload["kind"]))
+                    self.conn.execute("UPDATE upload_sessions SET status='complete',updated_at=? WHERE id=?", (now(), upload["id"]))
+                    if existing_hash or source_valid:
+                        final_path.unlink(missing_ok=True) if existing_hash else source.unlink(missing_ok=True)
+                    recovered += 1
+                    continue
+                final_path.unlink(missing_ok=True)
+            if source_valid and source.is_file():
+                self.conn.execute("UPDATE upload_sessions SET status='uploading',final_file_id=NULL,final_storage_name=NULL,updated_at=? WHERE id=?", (now(), upload["id"]))
+            else:
+                self.conn.execute("UPDATE upload_sessions SET status='failed',updated_at=? WHERE id=?", (now(), upload["id"]))
+        self.conn.commit()
+        return recovered
+
+    def cleanup_expired_uploads(self, files_root, now_value=None, ttl=24 * 60 * 60):
+        cutoff = (now() if now_value is None else now_value) - ttl
+        uploads_root = Path(files_root).resolve() / "uploads"
+        removed = 0
+        rows = self.conn.execute(
+            "SELECT id,temp_name FROM upload_sessions WHERE status='uploading' AND final_file_id IS NULL AND updated_at < ?",
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            temp_name = row["temp_name"]
+            if (
+                not re.fullmatch(r"[0-9a-f]{32}\.part", temp_name or "")
+                or not temp_name.startswith(row["id"])
+            ):
+                continue
+            candidate = (uploads_root / temp_name).resolve()
+            if uploads_root not in candidate.parents or candidate.parent != uploads_root:
+                continue
+            self.conn.execute("DELETE FROM upload_sessions WHERE id=? AND status='uploading'", (row["id"],))
+            candidate.unlink(missing_ok=True)
+            removed += 1
+        self.conn.commit()
+        return removed
 
     def close(self):
         self.conn.close()
@@ -304,9 +420,12 @@ class Api(BaseHTTPRequestHandler):
             if path == "/v1/sync":
                 return self.sync(data)
             if path == "/v1/files/upload/init":
-                return self.upload_init(data)
+                with self.upload_guard():
+                    self.server.store.cleanup_expired_uploads(self.server.files_root)
+                    return self.upload_init(data)
             if path.startswith("/v1/files/upload/") and path.endswith("/complete"):
-                return self.upload_complete(unquote(path[len("/v1/files/upload/"):-len("/complete")]))
+                with self.upload_guard():
+                    return self.upload_complete(unquote(path[len("/v1/files/upload/"):-len("/complete")]))
             self.json(404, {"error": "Ruta no encontrada"})
         except ValueError as error:
             self.json(400, {"error": str(error)})
@@ -330,7 +449,8 @@ class Api(BaseHTTPRequestHandler):
             rows = self.server.store.conn.execute("SELECT id,name,platform,last_sync_at,revoked_at FROM devices WHERE user_id=?", (user["id"],)).fetchall()
             return self.json(200, {"devices": [dict(row) for row in rows]})
         if path.startswith("/v1/files/upload/"):
-            return self.upload_status(unquote(path[len("/v1/files/upload/"):]))
+            with self.upload_guard():
+                return self.upload_status(unquote(path[len("/v1/files/upload/"):]))
         if path.startswith("/v1/files/"):
             return self.download(unquote(path[len("/v1/files/"):]))
         self.json(404, {"error": "Ruta no encontrada"})
@@ -344,11 +464,18 @@ class Api(BaseHTTPRequestHandler):
         if not getattr(self.server, "allow_transfer_attempt", lambda address: True)(self.client_address[0]):
             return self.json(429, {"error": "Demasiadas transferencias; inténtalo más tarde"})
         try:
-            self.upload_chunk(unquote(path[len("/v1/files/upload/"):]))
+            with self.upload_guard():
+                self.upload_chunk(unquote(path[len("/v1/files/upload/"):]))
         except ValueError as error:
             self.json(400, {"error": str(error)})
         except Exception:
             self.json(500, {"error": "No se pudo recibir la transferencia"})
+
+    def upload_guard(self):
+        # Some tests construct Api manually instead of going through run().
+        if not hasattr(self.server, "upload_lock"):
+            self.server.upload_lock = threading.RLock()
+        return self.server.upload_lock
 
     def do_DELETE(self):
         if self.reject_disallowed_origin():
@@ -420,6 +547,10 @@ class Api(BaseHTTPRequestHandler):
             return self._sync_locked(data)
 
     def _sync_locked(self, data):
+        with self.server.store.conn:
+            return self._sync_locked_unmanaged(data)
+
+    def _sync_locked_unmanaged(self, data):
         user = self.auth()
         if not user:
             return self.json(401, {"error": "Sesión no válida"})
@@ -482,14 +613,14 @@ class Api(BaseHTTPRequestHandler):
         record = self.server.store.conn.execute("SELECT kind FROM sync_records WHERE user_id=? AND kind=? AND record_id=?", (user["id"], kind, record_id)).fetchone()
         if not record or record["kind"] != kind:
             return self.json(409, {"error": "Sincroniza primero el registro de metadatos"})
-        existing = self.server.store.conn.execute("SELECT id,size_bytes,sha256 FROM files WHERE user_id=? AND sha256=?", (user["id"], sha256)).fetchone()
+        existing = self.server.store.conn.execute("SELECT id,size_bytes,sha256 FROM files WHERE user_id=? AND kind=? AND sha256=?", (user["id"], kind, sha256)).fetchone()
         if existing:
             self.server.store.conn.execute("INSERT OR IGNORE INTO file_records VALUES(?,?,?,?)", (existing["id"], user["id"], record_id, kind)); self.server.store.conn.commit()
             return self.json(200, {"file_id": existing["id"], "already_exists": True, "size": existing["size_bytes"], "sha256": existing["sha256"]})
         upload_id = secrets.token_hex(16); temp_name = f"{upload_id}.part"; stamp = now()
         self.server.store.conn.execute(
-            "INSERT INTO upload_sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (upload_id, user["id"], device_id, record_id, kind, name, mime, size, sha256, temp_name, 0, "uploading", stamp, stamp),
+            "INSERT INTO upload_sessions(user_id,device_id,record_id,kind,original_name,mime,expected_size,expected_sha256,temp_name,received_bytes,status,created_at,updated_at,final_file_id,final_storage_name,id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (user["id"], device_id, record_id, kind, name, mime, size, sha256, temp_name, 0, "uploading", stamp, stamp, None, None, upload_id),
         )
         self.server.store.conn.commit()
         (self.server.files_root / "uploads" / temp_name).touch()
@@ -549,11 +680,33 @@ class Api(BaseHTTPRequestHandler):
             self.server.store.conn.execute("UPDATE upload_sessions SET status='failed',updated_at=? WHERE id=?", (now(), upload_id)); self.server.store.conn.commit()
             return self.json(422, {"error": "El contenido no coincide con el tipo o hash declarado"})
         file_id = secrets.token_hex(16); extension = ALLOWED_FILES[upload["mime"]]; relative = f"files/{user['id']}/{file_id}{extension}"; target = self.server.files_root / relative
+        self.server.store.conn.execute("UPDATE upload_sessions SET status='publishing',final_file_id=?,final_storage_name=?,updated_at=? WHERE id=? AND status='uploading'", (file_id, relative, now(), upload_id)); self.server.store.conn.commit()
         target.parent.mkdir(parents=True, exist_ok=True); source.replace(target)
         try:
+            self.server.store.conn.execute("BEGIN")
+            failure_hook = getattr(self.server, "before_upload_persist", None)
+            if failure_hook:
+                failure_hook()
             self.server.store.conn.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)", (file_id, user["id"], upload["record_id"], upload["kind"], upload["original_name"], upload["mime"], extension, upload["expected_size"], upload["expected_sha256"], relative, now()))
             self.server.store.conn.execute("INSERT INTO file_records VALUES(?,?,?,?)", (file_id, user["id"], upload["record_id"], upload["kind"]))
             self.server.store.conn.execute("UPDATE upload_sessions SET status='complete',updated_at=? WHERE id=?", (now(), upload_id)); self.server.store.conn.commit()
+        except Exception as error:
+            self.server.store.conn.rollback()
+            compensation_error = None
+            try:
+                if target.is_file() and not source.exists():
+                    target.replace(source)
+                elif target.is_file():
+                    target.unlink()
+            except Exception as rollback_error:
+                compensation_error = rollback_error
+            try:
+                self.server.store.conn.execute("UPDATE upload_sessions SET status='failed',final_file_id=NULL,final_storage_name=NULL,updated_at=? WHERE id=?", (now(), upload_id)); self.server.store.conn.commit()
+            except Exception:
+                self.server.store.conn.rollback()
+            if compensation_error is not None:
+                raise RuntimeError(f"No se pudo completar la carga ni restaurar su temporal: {compensation_error}") from error
+            raise
         except sqlite3.IntegrityError:
             target.unlink(missing_ok=True); self.server.store.conn.execute("UPDATE upload_sessions SET status='failed',updated_at=? WHERE id=?", (now(), upload_id)); self.server.store.conn.commit(); raise ValueError("El archivo ya existe o el registro no es válido")
         return self.json(201, {"file_id": file_id, "size": upload["expected_size"], "sha256": upload["expected_sha256"]})
@@ -615,8 +768,10 @@ def run(host, port, db, allowed_origins=None):
     server.allowed_origins = configured_origins
     server.files_root = Path(os.environ.get("LUMINA_API_STORAGE", "lumina-files")).resolve()
     server.sync_lock = threading.RLock()
+    server.upload_lock = threading.RLock()
     (server.files_root / "uploads").mkdir(parents=True, exist_ok=True)
     (server.files_root / "files").mkdir(parents=True, exist_ok=True)
+    server.store.recover_uploads(server.files_root)
     server.auth_attempts = {}
     server.transfer_attempts = {}
     server.auth_lock = threading.Lock()

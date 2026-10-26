@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.request
+from types import SimpleNamespace
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 from server import Api, Store, is_loopback_host, parse_allowed_origins, password_hash, password_verify, validate_bind_host
@@ -74,6 +75,133 @@ class AccountSecurityTests(unittest.TestCase):
                 2,
             )
             self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM devices WHERE id='legacy-device'").fetchone()[0], 1)
+            store.close()
+
+    def test_store_migrates_file_relationships_to_typed_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sync.db"
+            legacy = sqlite3.connect(path)
+            legacy.executescript(
+                """
+                CREATE TABLE users(id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+                CREATE TABLE files(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, record_id TEXT NOT NULL, kind TEXT NOT NULL, original_name TEXT NOT NULL, mime TEXT NOT NULL, extension TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, storage_name TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
+                CREATE TABLE file_records(file_id TEXT NOT NULL, user_id TEXT NOT NULL, record_id TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY(file_id, record_id));
+                INSERT INTO users VALUES('u1','legacy@example.com','not-used',1);
+                INSERT INTO files VALUES('f1','u1','same-id','wallpaper','a.png','image/png','.png',8,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','files/u1/f1.png',1);
+                INSERT INTO file_records VALUES('f1','u1','same-id','wallpaper');
+                """
+            )
+            legacy.commit(); legacy.close()
+            store = Store(str(path))
+            store.conn.execute("INSERT INTO file_records VALUES(?,?,?,?)", ("f1", "u1", "same-id", "cursor"))
+            store.conn.commit()
+            rows = store.conn.execute("SELECT kind FROM file_records WHERE file_id='f1' AND record_id='same-id' ORDER BY kind").fetchall()
+            self.assertEqual([row[0] for row in rows], ["cursor", "wallpaper"])
+            store.close()
+            reopened = Store(str(path))
+            self.assertEqual(reopened.conn.execute("SELECT COUNT(*) FROM file_records").fetchone()[0], 2)
+            reopened.close()
+
+    def test_sync_batch_rolls_back_when_a_later_change_is_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(str(Path(directory) / "sync.db"))
+            store.conn.execute("INSERT INTO users VALUES('u1','batch@example.com',?,1)", (password_hash("1234567890"),))
+            store.conn.execute("INSERT INTO devices VALUES('d1','u1','Test','windows',NULL,NULL)")
+            store.conn.commit()
+            class Harness(Api):
+                def auth(self): return store.conn.execute("SELECT * FROM users WHERE id='u1'").fetchone()
+                def json(self, status, payload): return status, payload
+            harness = Harness.__new__(Harness)
+            harness.server = SimpleNamespace(store=store, sync_lock=threading.RLock())
+            with self.assertRaises(ValueError):
+                harness._sync_locked({"device_id": "d1", "changes": [
+                    {"id": "first", "kind": "wallpaper", "base_revision": 0, "payload": {}},
+                    {"id": "second", "kind": "unsupported", "base_revision": 0, "payload": {}},
+                ]})
+            self.assertIsNone(store.conn.execute("SELECT 1 FROM sync_records WHERE record_id='first'").fetchone())
+            store.close()
+
+    def test_expired_upload_cleanup_is_idempotent_and_preserves_active_or_invalid_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "uploads").mkdir()
+            store = Store(str(root / "sync.db"))
+            self.addCleanup(store.close)
+            store.conn.execute("INSERT INTO users VALUES('u1','cleanup@example.com',?,1)", (password_hash("1234567890"),))
+            expired_id = "a" * 32; active_id = "b" * 32; invalid_id = "c" * 32
+            for upload_id, temp_name, updated_at, status in (
+                (expired_id, expired_id + ".part", 1, "uploading"),
+                (active_id, active_id + ".part", 150, "uploading"),
+                (invalid_id, "../outside.part", 1, "uploading"),
+                ("d" * 32, "d" * 32 + ".part", 1, "complete"),
+            ):
+                store.conn.execute("INSERT INTO upload_sessions(user_id,device_id,record_id,kind,original_name,mime,expected_size,expected_sha256,temp_name,received_bytes,status,created_at,updated_at,final_file_id,final_storage_name,id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("u1", "d1", "r1", "wallpaper", "a.png", "image/png", 8, "a" * 64, temp_name, 0, status, 1, updated_at, None, None, upload_id))
+                if temp_name.endswith(".part") and not temp_name.startswith("../"):
+                    (root / "uploads" / temp_name).touch()
+            store.conn.commit()
+            self.assertEqual(store.cleanup_expired_uploads(root, now_value=200, ttl=100), 1)
+            self.assertEqual(store.cleanup_expired_uploads(root, now_value=200, ttl=100), 0)
+            self.assertIsNone(store.conn.execute("SELECT 1 FROM upload_sessions WHERE id=?", (expired_id,)).fetchone())
+            self.assertIsNotNone(store.conn.execute("SELECT 1 FROM upload_sessions WHERE id=?", (active_id,)).fetchone())
+            self.assertIsNotNone(store.conn.execute("SELECT 1 FROM upload_sessions WHERE id=?", (invalid_id,)).fetchone())
+            self.assertTrue((root / "uploads" / (active_id + ".part")).exists())
+            store.close()
+
+    def test_recovery_reconciles_intent_states_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / "uploads").mkdir(); (root / "files" / "u1").mkdir(parents=True)
+            store = Store(str(root / "sync.db"))
+            self.addCleanup(store.close)
+            store.conn.execute("INSERT INTO users VALUES('u1','recover@example.com',?,1)", (password_hash("1234567890"),))
+            content = b"\x89PNG\r\n\x1a\nrecovery"; digest = hashlib.sha256(content).hexdigest()
+
+            def add_session(upload_id, status, final_id, final_name, temp_name):
+                store.conn.execute("INSERT INTO upload_sessions(user_id,device_id,record_id,kind,original_name,mime,expected_size,expected_sha256,temp_name,received_bytes,status,created_at,updated_at,final_file_id,final_storage_name,id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("u1", "d1", upload_id, "wallpaper", "recover.png", "image/png", len(content), digest, temp_name, len(content), status, 1, 1, final_id, final_name, upload_id))
+
+            before_move = "a" * 32
+            add_session(before_move, "publishing", before_move, f"files/u1/{before_move}.png", f"{before_move}.part")
+            (root / "uploads" / f"{before_move}.part").write_bytes(content)
+
+            after_move = "b" * 32
+            add_session(after_move, "publishing", after_move, f"files/u1/{after_move}.png", f"{after_move}.part")
+            (root / "files" / "u1" / f"{after_move}.png").write_bytes(content)
+
+            after_sqlite = "c" * 32
+            add_session(after_sqlite, "publishing", after_sqlite, f"files/u1/{after_sqlite}.png", f"{after_sqlite}.part")
+            (root / "files" / "u1" / f"{after_sqlite}.png").write_bytes(content)
+            store.conn.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)", (after_sqlite, "u1", after_sqlite, "wallpaper", "recover.png", "image/png", ".png", len(content), digest, f"files/u1/{after_sqlite}.png", 1))
+            store.conn.execute("INSERT INTO file_records VALUES(?,?,?,?)", (after_sqlite, "u1", after_sqlite, "wallpaper"))
+
+            invalid = "d" * 32
+            add_session(invalid, "publishing", invalid, f"files/u1/{invalid}.png", f"{invalid}.part")
+            (root / "files" / "u1" / f"{invalid}.png").write_bytes(b"not-an-image")
+            store.conn.commit()
+
+            self.assertEqual(store.recover_uploads(root), 2)
+            self.assertEqual(store.conn.execute("SELECT status FROM upload_sessions WHERE id=?", (before_move,)).fetchone()[0], "uploading")
+            self.assertEqual(store.conn.execute("SELECT status FROM upload_sessions WHERE id=?", (after_move,)).fetchone()[0], "complete")
+            self.assertEqual(store.conn.execute("SELECT status FROM upload_sessions WHERE id=?", (after_sqlite,)).fetchone()[0], "complete")
+            self.assertEqual(store.conn.execute("SELECT status FROM upload_sessions WHERE id=?", (invalid,)).fetchone()[0], "failed")
+            self.assertFalse((root / "files" / "u1" / f"{invalid}.png").exists())
+            self.assertEqual(store.recover_uploads(root), 0)
+            self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM file_records WHERE record_id=?", (after_move,)).fetchone()[0], 1)
+
+    def test_upload_intent_columns_are_added_to_legacy_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.db"
+            legacy = sqlite3.connect(path)
+            legacy.executescript("""
+                CREATE TABLE upload_sessions(
+                  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                  record_id TEXT NOT NULL, kind TEXT NOT NULL, original_name TEXT NOT NULL,
+                  mime TEXT NOT NULL, expected_size INTEGER NOT NULL, expected_sha256 TEXT NOT NULL,
+                  temp_name TEXT NOT NULL UNIQUE, received_bytes INTEGER NOT NULL DEFAULT 0,
+                  status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+            """)
+            legacy.commit(); legacy.close()
+            store = Store(str(path))
+            columns = {row[1] for row in store.conn.execute("PRAGMA table_info(upload_sessions)").fetchall()}
+            self.assertTrue({"final_file_id", "final_storage_name"}.issubset(columns))
             store.close()
 
     def test_device_identity_is_scoped_to_account(self):
@@ -217,6 +345,29 @@ class FileTransferTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.call(f"/v1/files/upload/{init['upload_id']}/complete", token=token, method="POST")
         self.assertEqual(error.exception.code, 409)
+
+    def test_upload_commit_failure_restores_staging_and_allows_clean_retry(self):
+        token = self.account("rollback@example.com")
+        content = b"\x89PNG\r\n\x1a\nrollback"; digest = hashlib.sha256(content).hexdigest()
+        self.call("/v1/sync", {"device_id": "rollback@example.com", "changes": [{"id": "rollback-wall", "kind": "wallpaper", "base_revision": 0, "payload": {}}]}, token)
+        _, init = self.call("/v1/files/upload/init", {"device_id": "rollback@example.com", "record_id": "rollback-wall", "kind": "wallpaper", "name": "rollback.png", "mime": "image/png", "size": len(content), "sha256": digest}, token)
+        upload_id = init["upload_id"]
+        self.call(f"/v1/files/upload/{upload_id}", token=token, method="PUT", body=content, headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(content)), "X-Upload-Offset": "0"})
+        self.http.before_upload_persist = lambda: (_ for _ in ()).throw(RuntimeError("controlled persistence failure"))
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.call(f"/v1/files/upload/{upload_id}/complete", token=token, method="POST")
+        self.assertEqual(error.exception.code, 500)
+        self.assertFalse([path for path in (Path(self.temp.name) / "files" / "files").rglob("*") if path.is_file()])
+        staging = Path(self.temp.name) / "files" / "uploads" / f"{upload_id}.part"
+        self.assertTrue(staging.is_file())
+        self.assertEqual(staging.read_bytes(), content)
+        self.assertEqual(self.http.store.conn.execute("SELECT status FROM upload_sessions WHERE id=?", (upload_id,)).fetchone()[0], "failed")
+        self.http.before_upload_persist = None
+        _, retry = self.call("/v1/files/upload/init", {"device_id": "rollback@example.com", "record_id": "rollback-wall", "kind": "wallpaper", "name": "rollback.png", "mime": "image/png", "size": len(content), "sha256": digest}, token)
+        self.call(f"/v1/files/upload/{retry['upload_id']}", token=token, method="PUT", body=content, headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(content)), "X-Upload-Offset": "0"})
+        _, completed = self.call(f"/v1/files/upload/{retry['upload_id']}/complete", token=token, method="POST")
+        self.assertEqual(self.http.store.conn.execute("SELECT COUNT(*) FROM files WHERE record_id='rollback-wall'").fetchone()[0], 1)
+        self.assertIsNotNone(self.http.store.conn.execute("SELECT id FROM files WHERE id=?", (completed["file_id"],)).fetchone())
 
     def test_file_metadata_limits_and_path_traversal_are_rejected(self):
         token = self.account("d@example.com")
