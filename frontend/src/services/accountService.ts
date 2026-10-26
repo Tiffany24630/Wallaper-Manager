@@ -86,6 +86,9 @@ export const accountService = {
   retry: (id: string) => invoke("retry_sync_operation", { id }),
   listConflicts: () => invoke<SyncConflict[]>("list_sync_conflicts"),
   resolveConflict: (id: string, kind: SyncConflict["kind"]) => invoke("resolve_sync_conflict", { id, kind }),
+  keepLocalConflict: (id: string, kind: SyncConflict["kind"]) => invoke("resolve_sync_conflict_keep_local", { id, kind }),
+  recordConflictError: (id: string, kind: SyncConflict["kind"], error: string) => invoke("record_sync_conflict_error", { id, kind, error: error.slice(0, 500) }),
+  acceptRemoteConflict: async (conflict: SyncConflict, file: SyncResponse["files"][number]) => { try { return await invoke("accept_remote_sync_conflict", { conflictId: conflict.id, kind: conflict.kind, fileId: file.id, apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey) || "", expectedHash: file.sha256, extension: file.extension || "", remoteRevision: conflict.remoteRevision }); } catch (error) { await invoke("record_sync_conflict_error", { id: conflict.id, kind: conflict.kind, error: String(error).slice(0, 500) }).catch(() => undefined); throw error; } },
   syncLibrary: async () => {
     const wallpapers = await wallpaperService.getAll(); const cursors = await cursorService.list(); const playlists = await playlistService.getAll();
     const remote = await accountService.sync(); const key = (kind: string, id: string) => `${kind}:${id}`; const revisions = new Map(remote.records.map(record => [key(record.kind, record.record_id), record.revision]));
@@ -117,7 +120,7 @@ export const accountService = {
       }
     }
     const changes = wallpapers.map(wallpaper => ({ id: wallpaper.id, kind: "wallpaper", base_revision: revisions.get(key("wallpaper", wallpaper.id)) ?? 0, payload: { name: wallpaper.name, hash: wallpaper.hash ?? null, size_bytes: wallpaper.sizeBytes ?? null, width: wallpaper.width ?? null, height: wallpaper.height ?? null, file_type: wallpaper.fileType ?? null, favorite: wallpaper.favorite } }));
-    const cursorChanges = cursors.map(cursor => ({ id: cursor.id, kind: "cursor", base_revision: revisions.get(key("cursor", cursor.id)) ?? 0, payload: { name: cursor.name, resource_type: cursor.resourceType, hotspot_x: cursor.hotspotX, hotspot_y: cursor.hotspotY } }));
+    const cursorChanges = cursors.map(cursor => ({ id: cursor.id, kind: "cursor", base_revision: revisions.get(key("cursor", cursor.id)) ?? 0, payload: { name: cursor.name, resource_type: cursor.resourceType, file_type: cursor.resourceType === "animated" ? "ani" : "cur", hash: cursor.hash ?? null, hotspot_x: cursor.hotspotX, hotspot_y: cursor.hotspotY } }));
     const playlistChanges = playlists.map(playlist => ({ id: playlist.id, kind: "playlist", base_revision: stateMap.get(playlist.id)?.lastRemoteRevision ?? 0, payload: localPlaylistPayloads.get(playlist.id) }));
     const tombstones = await invoke<Array<[string, string]>>("list_sync_tombstones").catch(() => []);
     const deletedChanges = tombstones.map(([id, kind]) => ({ id, kind, base_revision: kind === "playlist" ? stateMap.get(id)?.lastRemoteRevision ?? 0 : revisions.get(key(kind, id)) ?? 0, deleted: true, payload: {} }));

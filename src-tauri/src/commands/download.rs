@@ -272,30 +272,25 @@ fn download_response_to_file(
     Ok(())
 }
 
-fn download_and_import_sync(
+pub(crate) fn with_downloaded_synced_resource<F, T>(
     api_url: String,
     device_id: String,
     file_id: String,
     kind: String,
-    name: String,
     extension: String,
     expected_hash: String,
-    hotspot_x: Option<u16>,
-    hotspot_y: Option<u16>,
-) -> Result<String, String> {
+    condition: Option<(&str, i64)>,
+    callback: F,
+) -> Result<T, String>
+where
+    F: FnOnce(&Path) -> Result<T, String>,
+{
     let _import_lock = IMPORT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .map_err(|_| "El flujo de importación está ocupado".to_string())?;
-    if !valid_file_id(&file_id)
-        || !valid_hash(&expected_hash)
-        || device_id.trim().is_empty()
-        || name.trim().is_empty()
-    {
+    if !valid_file_id(&file_id) || !valid_hash(&expected_hash) || device_id.trim().is_empty() {
         return Err("Metadatos de descarga no válidos".into());
-    }
-    if let Some(existing_id) = find_existing_resource(&kind, &expected_hash)? {
-        return Ok(existing_id);
     }
     let extension = extension.trim_start_matches('.').to_ascii_lowercase();
     if !valid_extension(&kind, &extension) {
@@ -309,10 +304,17 @@ fn download_and_import_sync(
         .redirect(Policy::none())
         .build()
         .map_err(|e| format!("No se pudo preparar la descarga: {e}"))?;
-    let response = client
+    let mut request = client
         .get(url)
         .bearer_auth(&token)
-        .header("X-Device-ID", &device_id)
+        .header("X-Device-ID", &device_id);
+    if let Some((record_id, revision)) = condition {
+        request = request
+            .header("X-Sync-Kind", &kind)
+            .header("X-Sync-Record-ID", record_id)
+            .header("X-Sync-Revision", revision.to_string());
+    }
+    let response = request
         .send()
         .map_err(|e| format!("No se pudo descargar el recurso: {e}"))?;
     if response.status().is_redirection() {
@@ -374,14 +376,45 @@ fn download_and_import_sync(
     if get_secure_session_token_unlocked()?.as_deref() != Some(current_token.as_str()) {
         return Err("La sesión cambió antes de importar el recurso".into());
     }
-    if kind == "wallpaper" {
-        import_file(&temp.0, Some(name))
-    } else {
-        import_cursor(
-            temp.0.to_string_lossy().into_owned(),
-            Some(name),
-            hotspot_x,
-            hotspot_y,
-        )
+    callback(&temp.0)
+}
+
+fn download_and_import_sync(
+    api_url: String,
+    device_id: String,
+    file_id: String,
+    kind: String,
+    name: String,
+    extension: String,
+    expected_hash: String,
+    hotspot_x: Option<u16>,
+    hotspot_y: Option<u16>,
+) -> Result<String, String> {
+    if name.trim().is_empty() {
+        return Err("Metadatos de descarga no vÃ¡lidos".into());
     }
+    if let Some(existing_id) = find_existing_resource(&kind, &expected_hash)? {
+        return Ok(existing_id);
+    }
+    with_downloaded_synced_resource(
+        api_url,
+        device_id,
+        file_id,
+        kind.clone(),
+        extension,
+        expected_hash,
+        None,
+        |path| {
+            if kind == "wallpaper" {
+                import_file(path, Some(name))
+            } else {
+                import_cursor(
+                    path.to_string_lossy().into_owned(),
+                    Some(name),
+                    hotspot_x,
+                    hotspot_y,
+                )
+            }
+        },
+    )
 }

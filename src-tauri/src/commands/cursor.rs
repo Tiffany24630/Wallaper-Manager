@@ -1,7 +1,11 @@
 use chrono::Utc;
 use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgba, RgbaImage};
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -446,6 +450,192 @@ pub fn import_synced_cursor(
     result
 }
 
+pub(crate) fn replace_cursor_resource_in_connection(
+    conn: &mut Connection,
+    root: &Path,
+    cursor_id: &str,
+    source: &Path,
+) -> Result<(), String> {
+    if cursor_id.trim().is_empty() || !source.is_file() {
+        return Err("El recurso de reemplazo del cursor no es válido".into());
+    }
+    let detected = detect_kind(source)?;
+    validate_cursor_file(source, detected)?;
+    let source_hash = {
+        let bytes = fs::read(source).map_err(|error| error.to_string())?;
+        format!("{:x}", Sha256::digest(bytes))
+    };
+    let (path, preview, resource_type): (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT path,preview,resource_type FROM cursor_resources WHERE id=?1",
+            [cursor_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| "El cursor ya no existe en la biblioteca".to_string())?;
+    if resource_type != detected.as_str() {
+        return Err("El tipo del cursor entrante no coincide con el recurso existente".into());
+    }
+    let target = PathBuf::from(path);
+    if !path_is_under(root, &target) || !target.is_file() {
+        return Err("La ruta administrada del cursor no cumple el contrato de reemplazo".into());
+    }
+    let preview_target = if detected == CursorKind::Static {
+        Some(preview.map(PathBuf::from).unwrap_or_else(|| {
+            root.join("cursors/previews")
+                .join(format!("{cursor_id}.jpg"))
+        }))
+    } else {
+        preview.map(PathBuf::from)
+    };
+    if preview_target
+        .as_ref()
+        .is_some_and(|candidate| !path_is_under(root, candidate))
+    {
+        return Err("La ruta de vista previa del cursor no cumple el contrato de reemplazo".into());
+    }
+    let token = Uuid::new_v4().to_string();
+    let staged = target.with_file_name(format!(".lumina-replace-{token}"));
+    let staged_preview = preview_target
+        .as_ref()
+        .map(|path| path.with_file_name(format!(".lumina-replace-{token}.jpg")));
+    let backup = target.with_file_name(format!(".lumina-backup-{token}"));
+    let preview_backup = preview_target
+        .as_ref()
+        .map(|path| path.with_file_name(format!(".lumina-backup-{token}.jpg")));
+    let had_preview = preview_target.as_ref().is_some_and(|path| path.is_file());
+    fs::copy(source, &staged)
+        .map_err(|error| format!("No se pudo preparar el reemplazo del cursor: {error}"))?;
+    if let Err(error) = validate_cursor_file(&staged, detected) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    if let Some(preview) = &staged_preview {
+        if let Err(error) = write_cur_preview(&staged, preview) {
+            let _ = fs::remove_file(&staged);
+            return Err(format!(
+                "No se pudo preparar la vista previa del cursor: {error}"
+            ));
+        }
+    }
+    let operation = (|| {
+        fs::rename(&target, &backup)
+            .map_err(|error| format!("No se pudo respaldar el cursor actual: {error}"))?;
+        if let (Some(path), Some(backup)) = (&preview_target, &preview_backup) {
+            if path.is_file() {
+                fs::rename(path, backup).map_err(|error| {
+                    format!("No se pudo respaldar la vista previa actual: {error}")
+                })?;
+            }
+        }
+        fs::rename(&staged, &target)
+            .map_err(|error| format!("No se pudo colocar el cursor nuevo: {error}"))?;
+        if let Some(preview) = &staged_preview {
+            fs::rename(preview, preview_target.as_ref().unwrap())
+                .map_err(|error| format!("No se pudo colocar la vista previa nueva: {error}"))?;
+        } else if let Some(preview) = &preview_target {
+            if preview.exists() {
+                fs::remove_file(preview).map_err(|error| {
+                    format!("No se pudo retirar la vista previa anterior: {error}")
+                })?;
+            }
+        }
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE cursor_resources SET hash=?1, preview=?2 WHERE id=?3",
+            rusqlite::params![
+                source_hash,
+                staged_preview
+                    .as_ref()
+                    .and_then(|_| preview_target.as_ref())
+                    .map(|path| path.to_string_lossy().into_owned()),
+                cursor_id
+            ],
+        )
+        .map_err(|error| format!("No se pudo persistir el reemplazo del cursor: {error}"))?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = operation {
+        let mut rollback = Vec::new();
+        if target.exists() {
+            let _ = fs::remove_file(&target);
+        }
+        if let Err(restore) = fs::rename(&backup, &target) {
+            rollback.push(format!("no se pudo restaurar el cursor: {restore}"));
+        }
+        if let (Some(path), Some(backup)) = (&preview_target, &preview_backup) {
+            if had_preview && backup.exists() {
+                if path.exists() {
+                    let _ = fs::remove_file(path);
+                }
+                if let Err(restore) = fs::rename(backup, path) {
+                    rollback.push(format!("no se pudo restaurar la vista previa: {restore}"));
+                }
+            } else if !had_preview && path.exists() {
+                let _ = fs::remove_file(path);
+            }
+        }
+        let _ = fs::remove_file(&staged);
+        if let Some(preview) = &staged_preview {
+            let _ = fs::remove_file(preview);
+        }
+        if rollback.is_empty() {
+            Err(error)
+        } else {
+            Err(format!(
+                "{error}; el rollback quedó incompleto: {}",
+                rollback.join("; ")
+            ))
+        }
+    } else {
+        let mut cleanup = Vec::new();
+        if backup.exists() {
+            if let Err(error) = fs::remove_file(&backup) {
+                cleanup.push(format!("{}: {error}", backup.display()));
+            }
+        }
+        if let Some(backup) = preview_backup {
+            if backup.exists() {
+                if let Err(error) = fs::remove_file(backup) {
+                    cleanup.push(format!("vista previa: {error}"));
+                }
+            }
+        }
+        if cleanup.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "El reemplazo se persistió, pero la limpieza quedó incompleta: {}",
+                cleanup.join("; ")
+            ))
+        }
+    }
+}
+
+fn path_is_under(root: &Path, candidate: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let candidate = if candidate.exists() {
+        candidate.canonicalize().ok()
+    } else {
+        candidate
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .map(|parent| parent.join(candidate.file_name().unwrap_or_default()))
+    };
+    candidate.is_some_and(|candidate| candidate.starts_with(root))
+}
+
+#[tauri::command]
+pub fn replace_cursor_resource(cursor_id: String, source_path: String) -> Result<(), String> {
+    let root = app_data_dir().map_err(|error| error.to_string())?;
+    let mut conn = get_connection().map_err(|error| error.to_string())?;
+    replace_cursor_resource_in_connection(&mut conn, &root, &cursor_id, Path::new(&source_path))
+}
+
 #[tauri::command]
 pub fn rename_cursor(cursor_id: String, name: String) -> Result<(), String> {
     let name = validate_name(&name)?;
@@ -600,9 +790,12 @@ pub fn delete_cursor(cursor_id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_kind, encode_cur, validate_cursor_file, validate_image_dimensions, CursorKind,
+        detect_kind, encode_cur, replace_cursor_resource_in_connection, validate_cursor_file,
+        validate_image_dimensions, CursorKind,
     };
     use image::RgbaImage;
+    use rusqlite::Connection;
+    use sha2::Digest;
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -650,6 +843,156 @@ mod tests {
         let path = dir.join("bad.cur");
         fs::write(&path, b"bad").unwrap();
         assert!(validate_cursor_file(&path, CursorKind::Static).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replaces_cursor_content_preserving_identity_and_preview() {
+        let root =
+            std::env::temp_dir().join(format!("lumina-replace-cursor-{}", uuid::Uuid::new_v4()));
+        let resources = root.join("cursors/resources");
+        let previews = root.join("cursors/previews");
+        fs::create_dir_all(&resources).unwrap();
+        fs::create_dir_all(&previews).unwrap();
+        let target = resources.join("cursor.cur");
+        let preview = previews.join("cursor.jpg");
+        let old = encode_cur(
+            &image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                8,
+                8,
+                image::Rgba([1, 2, 3, 255]),
+            )),
+            0,
+            0,
+        )
+        .unwrap();
+        fs::write(&target, &old).unwrap();
+        image::RgbImage::from_pixel(10, 10, image::Rgb([1, 2, 3]))
+            .save(&preview)
+            .unwrap();
+        let source = root.join("incoming.cur");
+        let new_bytes = encode_cur(
+            &image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                12,
+                6,
+                image::Rgba([200, 30, 40, 255]),
+            )),
+            1,
+            1,
+        )
+        .unwrap();
+        fs::write(&source, &new_bytes).unwrap();
+        let old_hash = format!("{:x}", sha2::Sha256::digest(&old));
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE cursor_resources(id TEXT PRIMARY KEY, name TEXT, path TEXT, preview TEXT, resource_type TEXT, source_path TEXT, hash TEXT, hotspot_x INTEGER, hotspot_y INTEGER);").unwrap();
+        conn.execute("INSERT INTO cursor_resources VALUES ('shared-id','Original',?1,?2,'static','source.cur',?3,0,0)", rusqlite::params![target.to_string_lossy(), preview.to_string_lossy(), old_hash]).unwrap();
+
+        replace_cursor_resource_in_connection(&mut conn, &root, "shared-id", &source).unwrap();
+
+        let (name, path, hash, hotspot): (String, String, String, i64) = conn
+            .query_row(
+                "SELECT name,path,hash,hotspot_x FROM cursor_resources WHERE id='shared-id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Original");
+        assert_eq!(path, target.to_string_lossy());
+        assert_ne!(hash, old_hash);
+        assert_eq!(hotspot, 0);
+        assert_eq!(fs::read(&target).unwrap(), new_bytes);
+        assert!(image::open(&preview).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_cursor_replacement_with_wrong_kind_without_touching_the_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumina-replace-cursor-invalid-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.cur");
+        let source = dir.join("source.png");
+        fs::write(
+            &target,
+            encode_cur(
+                &image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                    4,
+                    4,
+                    image::Rgba([1, 2, 3, 255]),
+                )),
+                0,
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        image::RgbImage::from_pixel(4, 4, image::Rgb([9, 9, 9]))
+            .save(&source)
+            .unwrap();
+        let original = fs::read(&target).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE cursor_resources(id TEXT PRIMARY KEY, name TEXT, path TEXT, preview TEXT, resource_type TEXT);").unwrap();
+        conn.execute(
+            "INSERT INTO cursor_resources VALUES ('id','name',?1,NULL,'static')",
+            [&target.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(replace_cursor_resource_in_connection(&mut conn, &dir, "id", &source).is_err());
+        assert_eq!(fs::read(&target).unwrap(), original);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_cursor_persistence_restores_cursor_and_preview() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumina-replace-cursor-rollback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let resources = dir.join("resources");
+        let previews = dir.join("previews");
+        fs::create_dir_all(&resources).unwrap();
+        fs::create_dir_all(&previews).unwrap();
+        let target = resources.join("cursor.cur");
+        let preview = previews.join("cursor.jpg");
+        let old = encode_cur(
+            &image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                4,
+                4,
+                image::Rgba([1, 2, 3, 255]),
+            )),
+            0,
+            0,
+        )
+        .unwrap();
+        fs::write(&target, &old).unwrap();
+        fs::write(&preview, b"old-preview").unwrap();
+        let source = dir.join("new.cur");
+        fs::write(
+            &source,
+            encode_cur(
+                &image::DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                    6,
+                    6,
+                    image::Rgba([9, 8, 7, 255]),
+                )),
+                0,
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE cursor_resources(id TEXT PRIMARY KEY, name TEXT, path TEXT, preview TEXT, resource_type TEXT);").unwrap();
+        conn.execute(
+            "INSERT INTO cursor_resources VALUES ('id','name',?1,?2,'static')",
+            rusqlite::params![target.to_string_lossy(), preview.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(replace_cursor_resource_in_connection(&mut conn, &dir, "id", &source).is_err());
+        assert_eq!(fs::read(&target).unwrap(), old);
+        assert_eq!(fs::read(&preview).unwrap(), b"old-preview");
         let _ = fs::remove_dir_all(dir);
     }
 }

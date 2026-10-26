@@ -1,5 +1,9 @@
 use crate::{
-    db::get_connection,
+    commands::{
+        cursor::replace_cursor_resource_in_connection, download::with_downloaded_synced_resource,
+        wallpaper::replace_wallpaper_resource_in_connection,
+    },
+    db::{app_data_dir, get_connection},
     models::sync::{SyncConflict, SyncPlaylistConflict, SyncPlaylistState, SyncQueueItem},
 };
 use rusqlite::{params, Connection};
@@ -143,6 +147,13 @@ pub fn resolve_sync_conflict(id: String, kind: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn resolve_sync_conflict_keep_local(id: String, kind: String) -> Result<(), String> {
+    validate_conflict_kind(&kind)?;
+    let conn = get_connection().map_err(|e| e.to_string())?;
+    resolve_sync_conflict_in_connection(&conn, &id, &kind)
+}
+
+#[tauri::command]
 pub fn record_sync_conflict_error(id: String, kind: String, error: String) -> Result<(), String> {
     validate_conflict_kind(&kind)?;
     let conn = get_connection().map_err(|e| e.to_string())?;
@@ -158,6 +169,138 @@ pub fn record_sync_conflict_error(id: String, kind: String, error: String) -> Re
     } else {
         Err("El conflicto no existe, ya fue resuelto o su tipo no coincide".into())
     }
+}
+
+#[tauri::command]
+pub async fn accept_remote_sync_conflict(
+    conflict_id: String,
+    kind: String,
+    file_id: String,
+    api_url: String,
+    device_id: String,
+    expected_hash: String,
+    extension: String,
+    remote_revision: i64,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        accept_remote_sync_conflict_sync(
+            conflict_id,
+            kind,
+            file_id,
+            api_url,
+            device_id,
+            expected_hash,
+            extension,
+            remote_revision,
+        )
+    })
+    .await
+    .map_err(|error| format!("La resolución remota terminó inesperadamente: {error}"))?
+}
+
+fn accept_remote_sync_conflict_sync(
+    conflict_id: String,
+    kind: String,
+    file_id: String,
+    api_url: String,
+    device_id: String,
+    expected_hash: String,
+    extension: String,
+    remote_revision: i64,
+) -> Result<(), String> {
+    validate_conflict_kind(&kind)?;
+    if kind == "playlist" {
+        return Err("La aceptación de playlists usa su flujo existente".into());
+    }
+    let (record_id, stored_revision, remote_payload): (String, i64, String) = {
+        let conn = get_connection().map_err(|error| error.to_string())?;
+        conn.query_row(
+            "SELECT record_id,remote_revision,remote_payload FROM sync_conflicts WHERE id=?1 AND kind=?2 AND resolved=0",
+            params![conflict_id, kind],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| "El conflicto no existe, ya fue resuelto o su tipo no coincide".to_string())?
+    };
+    if stored_revision != remote_revision {
+        return Err(
+            "La revisión remota del conflicto cambió; vuelve a sincronizar antes de aceptar".into(),
+        );
+    }
+    let payload: Value = serde_json::from_str(&remote_payload)
+        .map_err(|error| format!("Los metadatos remotos del conflicto no son válidos: {error}"))?;
+    validate_remote_conflict_payload(
+        &kind,
+        &payload,
+        &expected_hash,
+        stored_revision,
+        remote_revision,
+    )?;
+    let payload_hash = payload
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or("El conflicto no contiene el hash remoto necesario para reemplazar el recurso")?;
+    if payload_hash.to_ascii_lowercase() != expected_hash.to_ascii_lowercase() {
+        return Err("El hash solicitado no coincide con el hash del conflicto".into());
+    }
+    if kind == "wallpaper"
+        && payload
+            .get("resource_type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value != "static")
+    {
+        return Err("La aceptación remota de wallpapers Animated no está soportada".into());
+    }
+    let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+    let root = app_data_dir().map_err(|error| error.to_string())?;
+    with_downloaded_synced_resource(
+        api_url,
+        device_id,
+        file_id,
+        kind.clone(),
+        extension,
+        expected_hash,
+        Some((&record_id, remote_revision)),
+        |temporary| {
+            let mut conn = get_connection().map_err(|error| error.to_string())?;
+            if kind == "wallpaper" {
+                replace_wallpaper_resource_in_connection(&mut conn, &root, &record_id, temporary)
+            } else {
+                replace_cursor_resource_in_connection(&mut conn, &root, &record_id, temporary)
+            }
+        },
+    )?;
+    let conn = get_connection().map_err(|error| error.to_string())?;
+    resolve_sync_conflict_in_connection(&conn, &conflict_id, &kind)
+}
+
+fn validate_remote_conflict_payload(
+    kind: &str,
+    payload: &Value,
+    expected_hash: &str,
+    stored_revision: i64,
+    requested_revision: i64,
+) -> Result<(), String> {
+    if stored_revision != requested_revision {
+        return Err(
+            "La revisión remota del conflicto cambió; vuelve a sincronizar antes de aceptar".into(),
+        );
+    }
+    let payload_hash = payload
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or("El conflicto no contiene el hash remoto necesario para reemplazar el recurso")?;
+    if payload_hash.to_ascii_lowercase() != expected_hash.to_ascii_lowercase() {
+        return Err("El hash solicitado no coincide con el hash del conflicto".into());
+    }
+    if kind == "wallpaper"
+        && payload
+            .get("resource_type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value != "static")
+    {
+        return Err("La aceptación remota de wallpapers Animated no está soportada".into());
+    }
+    Ok(())
 }
 
 fn resolve_sync_conflict_in_connection(
@@ -342,7 +485,10 @@ pub fn retry_sync_operation(id: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{record_sync_conflict_in_connection, resolve_sync_conflict_in_connection};
+    use super::{
+        record_sync_conflict_in_connection, resolve_sync_conflict_in_connection,
+        validate_remote_conflict_payload,
+    };
     use rusqlite::Connection;
     use serde_json::json;
 
@@ -419,5 +565,67 @@ mod tests {
         assert_eq!(error, "No se pudo aplicar");
         resolve_sync_conflict_in_connection(&conn, &id, "playlist").unwrap();
         assert!(resolve_sync_conflict_in_connection(&conn, &id, "playlist").is_err());
+    }
+
+    #[test]
+    fn keeping_local_only_changes_the_conflict_row() {
+        let conn = connection();
+        let id = record_sync_conflict_in_connection(
+            &conn,
+            "wallpaper",
+            "same-id",
+            &json!({"name": "local", "hash": "local-hash"}),
+            &json!({"name": "remote", "hash": "remote-hash"}),
+            Some(1),
+            2,
+        )
+        .unwrap();
+        resolve_sync_conflict_in_connection(&conn, &id, "wallpaper").unwrap();
+        let (kind, record_id, local_payload, remote_payload, resolved): (
+            String,
+            String,
+            String,
+            String,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT kind,record_id,local_payload,remote_payload,resolved FROM sync_conflicts WHERE id=?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "wallpaper");
+        assert_eq!(record_id, "same-id");
+        assert!(local_payload.contains("local-hash"));
+        assert!(remote_payload.contains("remote-hash"));
+        assert_eq!(resolved, 1);
+    }
+
+    #[test]
+    fn remote_conflict_validation_rejects_hash_or_revision_mismatch() {
+        let payload = json!({"hash": "a".repeat(64), "resource_type": "static"});
+        assert!(
+            validate_remote_conflict_payload("wallpaper", &payload, &"b".repeat(64), 4, 4).is_err()
+        );
+        assert!(
+            validate_remote_conflict_payload("wallpaper", &payload, &"a".repeat(64), 4, 5).is_err()
+        );
+    }
+
+    #[test]
+    fn remote_conflict_validation_requires_hash_and_rejects_animated_wallpapers() {
+        let without_hash = json!({"resource_type": "static"});
+        assert!(
+            validate_remote_conflict_payload("cursor", &without_hash, &"a".repeat(64), 1, 1)
+                .is_err()
+        );
+        let animated = json!({"hash": "a".repeat(64), "resource_type": "animated"});
+        assert!(
+            validate_remote_conflict_payload("wallpaper", &animated, &"a".repeat(64), 1, 1)
+                .is_err()
+        );
+        assert!(
+            validate_remote_conflict_payload("cursor", &animated, &"a".repeat(64), 1, 1).is_ok()
+        );
     }
 }
