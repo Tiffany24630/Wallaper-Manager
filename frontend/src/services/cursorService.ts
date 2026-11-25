@@ -2,10 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { CursorResource } from "../types/cursor";
 import { notifyLocalChange } from "./syncQueueService";
+import { isTauri } from "./tauri";
 
 export const cursorService = {
-  async list(): Promise<CursorResource[]> { return invoke<CursorResource[]>("list_cursors"); },
+  async list(): Promise<CursorResource[]> { if (!isTauri()) return []; return invoke<CursorResource[]>("list_cursors"); },
   async select(): Promise<string | null> {
+    if (!isTauri()) throw new Error("Los cursores del sistema requieren Tauri/Windows; un navegador no puede cambiar el cursor global.");
     const selected = await open({ multiple: false, filters: [{ name: "Cursores e imágenes", extensions: ["cur", "ani", "png", "jpg", "jpeg", "webp", "bmp"] }] });
     return selected as string | null;
   },
