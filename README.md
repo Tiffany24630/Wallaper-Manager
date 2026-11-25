@@ -83,7 +83,7 @@ cargo clippy --locked -- -D warnings
 
 ## Publicación en Vercel, Render y Neon
 
-Arquitectura: Vercel sirve `frontend/dist`; Render ejecuta `backend/server.py`; Neon guarda cuentas, sesiones y metadatos; el volumen persistente de Render guarda archivos sincronizados. El escritorio actual usa Tauri 2, no Electron, y conserva SQLite local para operaciones nativas.
+Arquitectura gratuita: Vercel sirve `frontend/dist`; Render ejecuta `backend/server.py`; Neon guarda cuentas, sesiones y metadatos. Render Free usa almacenamiento efímero para los archivos sincronizados, por lo que esos archivos pueden desaparecer al reiniciar o redeployar el servicio. El escritorio actual usa Tauri 2, no Electron, y conserva SQLite local para operaciones nativas.
 
 ### Neon
 
@@ -93,9 +93,11 @@ Arquitectura: Vercel sirve `frontend/dist`; Render ejecuta `backend/server.py`; 
 
 ### Render
 
-Importa el `render.yaml` incluido con **New > Blueprint**. Manualmente: **Name** `lumina-api`, **Runtime** `Python 3`, **Root Directory** `backend`, **Build Command** `pip install -r requirements.txt`, **Start Command** `python server.py`, **Health Check Path** `/health`. Crea un **Persistent Disk** llamado `lumina-files`, **Mount Path** `/var/data` y tamaño mínimo `1 GB`.
+En Render selecciona **New > Web Service**; no uses **Blueprint**. Completa **Name** `lumina-api`, **Runtime** `Python 3`, **Root Directory** `backend`, **Build Command** `pip install -r requirements.txt`, **Start Command** `python server.py`, **Health Check Path** `/health` y el plan **Free**. No agregues Persistent Disk: no está disponible en el plan gratuito.
 
-En **Environment Variables** agrega `DATABASE_URL` = cadena pooled de Neon; `LUMINA_API_ALLOWED_ORIGINS` = `https://TU-PROYECTO.vercel.app` (separados por comas, nunca `*`); `LUMINA_API_STORAGE` = `/var/data/lumina-files`; `LUMINA_MAX_FILE_BYTES` = `104857600`. Comprueba `https://TU-SERVICIO.onrender.com/health`.
+En **Environment Variables** agrega `DATABASE_URL` = cadena pooled de Neon; `LUMINA_API_ALLOWED_ORIGINS` = `https://TU-PROYECTO.vercel.app` (separados por comas, nunca `*`); `LUMINA_API_STORAGE` = `lumina-files`; `LUMINA_MAX_FILE_BYTES` = `104857600`. Comprueba `https://TU-SERVICIO.onrender.com/health`.
+
+El plan Free sirve para probar la API y sincronizar metadatos, pero no garantiza la conservación de imágenes, cursores u otros archivos después de reinicios o despliegues. Para persistencia gratuita de archivos hace falta añadir posteriormente un almacenamiento de objetos externo; Neon no debe usarse como almacén de blobs grandes.
 
 ### Vercel
 
