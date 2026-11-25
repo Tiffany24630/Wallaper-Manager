@@ -2,6 +2,8 @@
 /frontend/dist/
 /src-tauri/target/
 *.log
+build_log.txt
+lumina-sync.db
 .idea/
 .vscode/
 __pycache__

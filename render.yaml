@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: lumina-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: LUMINA_API_ALLOWED_ORIGINS
+        sync: false
+      - key: LUMINA_API_STORAGE
+        value: /var/data/lumina-files
+      - key: LUMINA_MAX_FILE_BYTES
+        value: "104857600"
+    disk:
+      name: lumina-files
+      mountPath: /var/data
+      sizeGB: 1

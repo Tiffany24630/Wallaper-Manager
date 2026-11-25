@@ -81,4 +81,48 @@ cargo test --locked
 cargo clippy --locked -- -D warnings
 ```
 
+## Publicación en Vercel, Render y Neon
+
+Arquitectura: Vercel sirve `frontend/dist`; Render ejecuta `backend/server.py`; Neon guarda cuentas, sesiones y metadatos; el volumen persistente de Render guarda archivos sincronizados. El escritorio actual usa Tauri 2, no Electron, y conserva SQLite local para operaciones nativas.
+
+### Neon
+
+1. Crea un proyecto y una base de datos en Neon.
+2. En **Connect**, selecciona **Python / psycopg** y copia la cadena pooled `postgresql://...` con `sslmode=require`.
+3. No la guardes en Git: se pegará como secreto en Render.
+
+### Render
+
+Importa el `render.yaml` incluido con **New > Blueprint**. Manualmente: **Name** `lumina-api`, **Runtime** `Python 3`, **Root Directory** `backend`, **Build Command** `pip install -r requirements.txt`, **Start Command** `python server.py`, **Health Check Path** `/health`. Crea un **Persistent Disk** llamado `lumina-files`, **Mount Path** `/var/data` y tamaño mínimo `1 GB`.
+
+En **Environment Variables** agrega `DATABASE_URL` = cadena pooled de Neon; `LUMINA_API_ALLOWED_ORIGINS` = `https://TU-PROYECTO.vercel.app` (separados por comas, nunca `*`); `LUMINA_API_STORAGE` = `/var/data/lumina-files`; `LUMINA_MAX_FILE_BYTES` = `104857600`. Comprueba `https://TU-SERVICIO.onrender.com/health`.
+
+### Vercel
+
+1. **Add New > Project** e importa el repositorio.
+2. **Framework Preset:** `Vite`; **Root Directory:** `.`.
+3. **Build Command:** `npm run typecheck && npm run build`; **Output Directory:** `frontend/dist`; **Install Command:** `npm ci --prefix frontend` (ya están en `vercel.json`).
+4. **Environment Variables:** `VITE_LUMINA_API_URL` = `https://TU-SERVICIO.onrender.com` para Production, Preview y Development.
+5. Pulsa **Deploy** y actualiza `LUMINA_API_ALLOWED_ORIGINS` en Render con el dominio Vercel definitivo.
+
+### Windows/Tauri
+
+Instala Node 20+, Rust, WebView2 y Visual Studio Build Tools con **Desktop development with C++**. Ejecuta `cd frontend`, `npm ci`, `npm run typecheck`, `npm run build` y `npm run desktop:build`. En **Cuenta > URL de la API** coloca `https://TU-SERVICIO.onrender.com`, guarda, inicia sesión y vincula el equipo. Los instaladores quedan en `src-tauri/target/release/bundle`.
+
+### Android
+
+Abre Android Studio con JDK 17 y SDK 35. Ejecuta `gradlew.bat :app:assembleDebug`, o genera el `.aab` firmado desde **Build > Generate Signed App Bundle / APK**. En la URL del servidor coloca `https://TU-SERVICIO.onrender.com`; nunca HTTP en producción. Para Play Store incrementa `versionCode` y conserva la clave de firma.
+
+### Validación y seguridad
+
+```powershell
+python -m unittest discover -s backend -p 'test*.py'
+cd frontend
+npm ci
+npm run typecheck
+npm run build
+```
+
+Prueba `/health`, registro, login, vinculación, carga/descarga de un PNG y revocación. No publiques `DATABASE_URL`, tokens, keystores Android ni certificados de firma. La web usa `sessionStorage` para su token; Tauri usa el almacén seguro de Windows. Las funciones de disco, monitores, cursores y Real-ESRGAN son nativas y no se simulan en Vercel.
+
 Las preferencias de inicio automático, bandeja y ahorro contextual se almacenan para una futura integración residente. La interfaz las identifica como preferencias y no simula que ya estén activas.

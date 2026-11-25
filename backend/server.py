@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, dependency-free Lumina account/sync service for local or self-hosted use."""
+"""Lumina account/sync service for local SQLite or production Neon PostgreSQL."""
 import argparse
 import hashlib
 import hmac
@@ -14,6 +14,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # SQLite remains available for local development and tests.
+    psycopg = None
+    dict_row = None
 
 TOKEN_TTL = 60 * 60 * 24 * 30
 MAX_BODY = 2 * 1024 * 1024
@@ -108,9 +115,46 @@ def valid_file(mime, header):
     }.get(mime, False)
 
 
+class _PostgresConnection:
+    """Small qmark-SQL compatibility layer so the existing tested store works on Neon."""
+    def __init__(self, connection):
+        self._connection = connection
+
+    @staticmethod
+    def _sql(sql):
+        sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+        if "INSERT INTO" in sql and "ON CONFLICT" not in sql and "INSERT INTO file_records" in sql:
+            sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        return sql.replace("?", "%s")
+
+    def execute(self, sql, params=None):
+        query = self._sql(sql)
+        return self._connection.execute(query, params or ())
+
+    def commit(self):
+        self._connection.commit()
+
+    def rollback(self):
+        self._connection.rollback()
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._connection.__exit__(*args)
+
+
 class Store:
     def __init__(self, path):
         self.path = path
+        self.is_postgres = str(path).startswith(("postgres://", "postgresql://"))
+        if self.is_postgres:
+            if psycopg is None:
+                raise RuntimeError("Neon requiere la dependencia psycopg[binary]")
+            self.conn = _PostgresConnection(psycopg.connect(path, row_factory=dict_row, connect_timeout=15))
+            self._init_postgres()
+            return
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript("""
@@ -171,6 +215,60 @@ class Store:
         self._migrate_typed_sync_records()
         self._migrate_typed_file_records()
         self._migrate_upload_publication_intent()
+        self.conn.commit()
+
+    def _init_postgres(self):
+        """Create the same logical schema in Neon without changing local SQLite tests."""
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+          id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE,
+          password_hash TEXT NOT NULL, created_at BIGINT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions(
+          token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          expires_at BIGINT NOT NULL, revoked_at BIGINT
+        );
+        CREATE TABLE IF NOT EXISTS devices(
+          id TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, platform TEXT NOT NULL, last_sync_at BIGINT, revoked_at BIGINT,
+          PRIMARY KEY(user_id, id)
+        );
+        CREATE TABLE IF NOT EXISTS sync_records(
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          record_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+          revision BIGINT NOT NULL, updated_at BIGINT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY(user_id, kind, record_id)
+        );
+        CREATE INDEX IF NOT EXISTS sync_records_user_revision ON sync_records(user_id, revision);
+        CREATE TABLE IF NOT EXISTS files(
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          record_id TEXT NOT NULL, kind TEXT NOT NULL, original_name TEXT NOT NULL,
+          mime TEXT NOT NULL, extension TEXT NOT NULL, size_bytes BIGINT NOT NULL,
+          sha256 TEXT NOT NULL, storage_name TEXT NOT NULL UNIQUE, created_at BIGINT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS files_user_record ON files(user_id, record_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS files_user_hash ON files(user_id, sha256);
+        CREATE TABLE IF NOT EXISTS file_records(
+          file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          record_id TEXT NOT NULL, kind TEXT NOT NULL,
+          PRIMARY KEY(file_id, record_id, kind)
+        );
+        CREATE TABLE IF NOT EXISTS upload_sessions(
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          device_id TEXT NOT NULL, record_id TEXT NOT NULL, kind TEXT NOT NULL,
+          original_name TEXT NOT NULL, mime TEXT NOT NULL, expected_size BIGINT NOT NULL,
+          expected_sha256 TEXT NOT NULL, temp_name TEXT NOT NULL UNIQUE, received_bytes BIGINT NOT NULL DEFAULT 0,
+          status TEXT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
+          final_file_id TEXT, final_storage_name TEXT, prepared_resolution_id TEXT, prepared_revision BIGINT
+        );
+        CREATE TABLE IF NOT EXISTS sync_resolutions(
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          resolution_id TEXT NOT NULL, kind TEXT NOT NULL, record_id TEXT NOT NULL,
+          expected_revision BIGINT NOT NULL, action TEXT NOT NULL, result_revision BIGINT NOT NULL,
+          created_at BIGINT NOT NULL, PRIMARY KEY(user_id, resolution_id)
+        );
+        """)
         self.conn.commit()
 
     def _migrate_typed_devices(self):
@@ -481,6 +579,8 @@ class Api(BaseHTTPRequestHandler):
         if self.reject_disallowed_origin():
             return
         path = urlparse(self.path).path
+        if path == "/health":
+            return self.json(200, {"ok": True, "service": "lumina-api"})
         if path.startswith("/v1/files/") and not getattr(self.server, "allow_transfer_attempt", lambda address: True)(self.client_address[0]):
             return self.json(429, {"error": "Demasiadas transferencias; inténtalo más tarde"})
         user = self.auth()
@@ -997,7 +1097,9 @@ class Api(BaseHTTPRequestHandler):
 
 
 def run(host, port, db, allowed_origins=None):
-    validate_bind_host(host)
+    # Render terminates TLS and requires 0.0.0.0; local mode stays loopback-only.
+    if host not in ("0.0.0.0", "::"):
+        validate_bind_host(host)
     configured_origins = parse_allowed_origins(allowed_origins)
     server = ThreadingHTTPServer((host, port), Api)
     server.store = Store(db)
@@ -1039,9 +1141,9 @@ def run(host, port, db, allowed_origins=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default=os.environ.get("LUMINA_API_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("LUMINA_API_PORT", "8765")))
-    parser.add_argument("--db", default=os.environ.get("LUMINA_API_DB", str(Path("lumina-sync.db"))))
+    parser.add_argument("--host", default=os.environ.get("LUMINA_API_HOST", "0.0.0.0" if os.environ.get("RENDER") else "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", os.environ.get("LUMINA_API_PORT", "8765"))))
+    parser.add_argument("--db", default=os.environ.get("DATABASE_URL", os.environ.get("LUMINA_API_DB", str(Path("lumina-sync.db")))))
     parser.add_argument("--allowed-origin", action="append", dest="allowed_origins", default=None)
     args = parser.parse_args()
     run(args.host, args.port, args.db, args.allowed_origins)

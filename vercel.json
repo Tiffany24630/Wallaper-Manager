@@ -1,0 +1,6 @@
+{
+  "buildCommand": "npm run typecheck && npm run build",
+  "outputDirectory": "frontend/dist",
+  "installCommand": "npm ci --prefix frontend",
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+}
