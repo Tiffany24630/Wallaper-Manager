@@ -171,6 +171,14 @@ export const accountService = {
     const result = await accountService.sync([...changes, ...playlistChanges]);
     const conflicts = result.conflicts as SyncConflictResponse[];
     const conflictKeys = new Set(conflicts.map(conflict => key(conflict.kind, conflict.id)));
+    for (const record of result.records) {
+      if (record.deleted || conflictKeys.has(key(record.kind, record.record_id))) continue;
+      if (record.kind === "wallpaper") await webStorage.applyRemoteMetadata(record.record_id, record.payload);
+      if (record.kind === "playlist") {
+        const ids = Array.isArray(record.payload.wallpaper_ids) ? record.payload.wallpaper_ids.filter((id): id is string => typeof id === "string") : [];
+        await playlistService.applyRemote(record.record_id, String(record.payload.name || "Lista sincronizada"), ids);
+      }
+    }
     const uploaded: string[] = [];
     const errors: string[] = [];
     for (const wallpaper of wallpapers) {

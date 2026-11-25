@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { accountService, type SyncConflict, type SyncResponse } from "../../services/accountService";
 import { syncCoordinator } from "../../services/syncCoordinator";
 import { syncQueueService, type QueueItem } from "../../services/syncQueueService";
+import { isTauri } from "../../services/tauri";
 import type { AccountUser, Device } from "../../types/account";
 
 export default function Account() {
@@ -51,7 +52,7 @@ export default function Account() {
   useEffect(() => { void load(); }, []);
   useEffect(() => { const onSyncError = (event: Event) => setLoadError((event as CustomEvent<string>).detail); window.addEventListener("lumina:sync-error", onSyncError); return () => window.removeEventListener("lumina:sync-error", onSyncError); }, []);
   async function submit() { setBusy(true); setMessage(null); try { const session = register ? await accountService.register(email, password) : await accountService.login(email, password); setUser(session.user); await accountService.registerDevice(deviceName); setDevices((await accountService.devices()).devices); setPassword(""); } catch (error) { setMessage(String(error)); } finally { setBusy(false); } }
-  async function sync() { setBusy(true); setMessage(null); try { await syncCoordinator.requestNow(); setMessage("Sincronización añadida a la cola."); await refreshQueue(); } catch (error) { setMessage(String(error)); } finally { setBusy(false); } }
+  async function sync() { setBusy(true); setMessage(null); try { await syncCoordinator.requestNow(); setMessage(isTauri() ? "Sincronización añadida a la cola." : "Biblioteca sincronizada correctamente."); await refreshQueue(); } catch (error) { setMessage(String(error)); } finally { setBusy(false); } }
   async function discoverRemote() { setRemoteBusy(true); setMessage(null); try { setRemote(await accountService.remoteResources()); } catch (error) { setMessage(String(error)); } finally { setRemoteBusy(false); } }
   async function restoreRemote(file: SyncResponse["files"][number]) { const record = remote?.records.find(item => item.record_id === file.record_id && item.kind === file.kind); if (!record) return; setRemoteBusy(true); setMessage(null); try { const payload = record.payload; const name = String(payload.name || file.original_name || "Recurso remoto"); const extension = String(payload.file_type || file.extension || file.original_name?.split(".").pop() || "png"); if (file.kind === "wallpaper") await accountService.restoreWallpaper(file.id, file.record_id, name, extension, file.sha256); else await accountService.restoreCursor(file.id, file.record_id, name, extension, file.sha256, Number(payload.hotspot_x || 0), Number(payload.hotspot_y || 0)); setMessage(`${name} restaurado correctamente.`); } catch (error) { setMessage(String(error)); } finally { setRemoteBusy(false); } }
   async function logout() { await accountService.logout(); setUser(null); setDevices([]); setRemote(null); }

@@ -56,6 +56,16 @@ export const playlistService = {
     });
   },
 
+  async applyRemote(playlistId: string, name: string, wallpaperIds: string[]): Promise<void> {
+    if (isTauri()) return;
+    const items = webPlaylists();
+    const existing = items.find(item => item.id === playlistId);
+    const normalizedIds = [...new Set(wallpaperIds)];
+    if (existing) { existing.name = name.trim() || existing.name; existing.wallpaperIds = normalizedIds; existing.wallpaperCount = normalizedIds.length; }
+    else items.push({ id: playlistId, name: name.trim() || "Lista sincronizada", createdAt: new Date().toISOString(), wallpaperCount: normalizedIds.length, wallpaperIds: normalizedIds });
+    saveWebPlaylists(items);
+  },
+
   async removeWallpaper(playlistId: string, wallpaperId: string): Promise<void> {
     if (!isTauri()) { const items = webPlaylists(); const item = items.find(value => value.id === playlistId); if (item) { item.wallpaperIds = item.wallpaperIds.filter(id => id !== wallpaperId); item.wallpaperCount = item.wallpaperIds.length; } saveWebPlaylists(items); return; }
     await tauriInvoke("remove_wallpaper_from_playlist", { playlistId, wallpaperId });

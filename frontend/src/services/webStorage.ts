@@ -100,6 +100,12 @@ export const webStorage = {
   async trash(): Promise<Wallpaper[]> { return (await readTrash()).map(toWallpaper); },
   async restore(id: string): Promise<void> { const db = await openDb(); const item = (await readTrash()).find(value => value.id === id); if (!item) return; await new Promise<void>((resolve, reject) => { const transaction = db.transaction([WALLPAPERS, TRASH], "readwrite"); transaction.objectStore(WALLPAPERS).put(item); transaction.objectStore(TRASH).delete(id); transaction.oncomplete = () => resolve(); transaction.onerror = () => reject(transaction.error); }); },
   async organize(id: string, tags: string[], folder: string): Promise<void> { const item = (await readAll()).find(value => value.id === id); if (item) await write({ ...item, tags: [...new Set(tags.map(tag => tag.trim().toLowerCase()).filter(Boolean))].slice(0, 20), folder: folder.trim().slice(0, 80) || undefined }); },
+  async applyRemoteMetadata(id: string, metadata: { name?: unknown; favorite?: unknown; tags?: unknown; folder?: unknown }): Promise<void> {
+    const item = (await readAll()).find(value => value.id === id);
+    if (!item) return;
+    const tags = Array.isArray(metadata.tags) ? metadata.tags.filter((tag): tag is string => typeof tag === "string").slice(0, 20) : item.tags;
+    await write({ ...item, name: typeof metadata.name === "string" && metadata.name.trim() ? metadata.name : item.name, favorite: typeof metadata.favorite === "boolean" ? metadata.favorite : item.favorite, tags, folder: typeof metadata.folder === "string" ? metadata.folder : item.folder });
+  },
   async getBlob(id: string): Promise<Blob | undefined> { return (await readAll()).find(item => item.id === id)?.blob; },
   async rotate(id: string, degrees: 0 | 90 | 180 | 270): Promise<void> {
     const item = (await readAll()).find(value => value.id === id);
