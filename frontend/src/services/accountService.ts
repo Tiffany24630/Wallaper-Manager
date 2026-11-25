@@ -3,6 +3,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { wallpaperService } from "./wallpaperService";
 import { cursorService } from "./cursorService";
 import { playlistService } from "./playlistService";
+import { isTauri } from "./tauri";
 
 const apiKey = "lumina.account.apiUrl";
 const deviceKey = "lumina.account.deviceId";
@@ -11,7 +12,7 @@ export type SyncResponse = { records: Array<{ record_id: string; kind: string; r
 export type SyncConflict = { id: string; kind: "wallpaper" | "cursor" | "playlist"; recordId: string; localPayload: string; remotePayload: string; baseRevision?: number; remoteRevision: number; lastError?: string };
 type SyncConflictResponse = { id: string; kind: "wallpaper" | "cursor" | "playlist"; server_revision: number; server_payload: Record<string, unknown> };
 type PlaylistSyncState = { playlistId: string; lastRemoteRevision?: number; basePayload?: string; localDirty: boolean; deletedPending: boolean };
-const apiUrl = () => localStorage.getItem(apiKey) || "http://127.0.0.1:8765";
+const apiUrl = () => localStorage.getItem(apiKey) || import.meta.env.VITE_LUMINA_API_URL || "http://127.0.0.1:8765";
 const normalizeApiUrl = (value: string) => {
   const normalized = value.trim().replace(/\/+$/, "");
   let parsed: URL;
@@ -28,6 +29,7 @@ const networkError = (error: unknown) => {
 };
 async function ensureToken(): Promise<string | null> {
   if (tokenCache !== undefined) return tokenCache;
+  if (!isTauri()) { tokenCache = sessionStorage.getItem("lumina.account.webToken"); return tokenCache; }
   try { tokenCache = await invoke<string | null>("get_secure_session_token"); } catch { tokenCache = null; }
   return tokenCache;
 }
@@ -42,7 +44,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw networkError(error);
   }
   const data = await response.json().catch(() => ({ error: "Respuesta no válida del servidor" }));
-  if (response.status === 401) { tokenCache = null; localStorage.removeItem("lumina.account.authenticated"); await invoke("delete_secure_session_token").catch(() => undefined); window.dispatchEvent(new Event("lumina:auth-changed")); }
+  if (response.status === 401) { tokenCache = null; localStorage.removeItem("lumina.account.authenticated"); if (isTauri()) await invoke("delete_secure_session_token").catch(() => undefined); else sessionStorage.removeItem("lumina.account.webToken"); window.dispatchEvent(new Event("lumina:auth-changed")); }
   if (!response.ok) throw new Error(data.error || `Error HTTP ${response.status}`);
   return data as T;
 }
@@ -72,10 +74,10 @@ export const accountService = {
   },
   hasSession: () => tokenCache != null,
   getApiUrl: () => apiUrl(), setApiUrl: (url: string) => localStorage.setItem(apiKey, normalizeApiUrl(url)),
-  register: async (email: string, password: string) => { const session = await request<Session>("/v1/auth/register", { method: "POST", body: JSON.stringify({ email, password }) }); await invoke("set_secure_session_token", { token: session.token }); tokenCache = session.token; localStorage.setItem("lumina.account.authenticated", "1"); window.dispatchEvent(new Event("lumina:auth-changed")); return session; },
-  login: async (email: string, password: string) => { const session = await request<Session>("/v1/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }); await invoke("set_secure_session_token", { token: session.token }); tokenCache = session.token; localStorage.setItem("lumina.account.authenticated", "1"); window.dispatchEvent(new Event("lumina:auth-changed")); return session; },
+  register: async (email: string, password: string) => { const session = await request<Session>("/v1/auth/register", { method: "POST", body: JSON.stringify({ email, password }) }); if (isTauri()) await invoke("set_secure_session_token", { token: session.token }); else sessionStorage.setItem("lumina.account.webToken", session.token); tokenCache = session.token; localStorage.setItem("lumina.account.authenticated", "1"); window.dispatchEvent(new Event("lumina:auth-changed")); return session; },
+  login: async (email: string, password: string) => { const session = await request<Session>("/v1/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }); if (isTauri()) await invoke("set_secure_session_token", { token: session.token }); else sessionStorage.setItem("lumina.account.webToken", session.token); tokenCache = session.token; localStorage.setItem("lumina.account.authenticated", "1"); window.dispatchEvent(new Event("lumina:auth-changed")); return session; },
   session: () => request<{ authenticated: boolean; user?: Session["user"] }>("/v1/auth/session"),
-  logout: async () => { try { await request("/v1/auth/logout", { method: "POST" }); } finally { await invoke("delete_secure_session_token").catch(() => undefined); tokenCache = null; localStorage.removeItem("lumina.account.token"); localStorage.removeItem("lumina.account.authenticated"); window.dispatchEvent(new Event("lumina:auth-changed")); } },
+  logout: async () => { try { await request("/v1/auth/logout", { method: "POST" }); } finally { if (isTauri()) await invoke("delete_secure_session_token").catch(() => undefined); sessionStorage.removeItem("lumina.account.webToken"); tokenCache = null; localStorage.removeItem("lumina.account.token"); localStorage.removeItem("lumina.account.authenticated"); window.dispatchEvent(new Event("lumina:auth-changed")); } },
   devices: () => request<{ devices: Device[] }>("/v1/devices"),
   registerDevice: async (name: string) => { const id = localStorage.getItem(deviceKey) || crypto.randomUUID(); localStorage.setItem(deviceKey, id); return request<{ device_id: string }>("/v1/devices", { method: "POST", body: JSON.stringify({ id, name, platform: "windows" }) }); },
   sync: (changes: unknown[] = []) => request<SyncResponse>("/v1/sync", { method: "POST", body: JSON.stringify({ device_id: localStorage.getItem(deviceKey), changes }) }),

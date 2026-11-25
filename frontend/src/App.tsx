@@ -6,6 +6,7 @@ import { useWallpaperStore } from "./store/wallpaperStore";
 import { accountService } from "./services/accountService";
 import { syncCoordinator } from "./services/syncCoordinator";
 import { syncQueueService } from "./services/syncQueueService";
+import { isTauri } from "./services/tauri";
 
 let smokeExitRequested = false;
 let smokeE2EStarted = false;
@@ -85,7 +86,7 @@ export default function App() {
       __LUMINA_SMOKE_E2E__?: SmokeE2EConfig;
     };
     const isSmoke = smokeWindow.__LUMINA_SMOKE__ === true;
-    if (isSmoke) {
+    if (isSmoke && isTauri()) {
       const diagnostic = invoke("record_smoke_diagnostic", {
         stage: "frontend_app_mounted",
         detail: null,
@@ -111,6 +112,7 @@ export default function App() {
     }
     let stop: (() => void) | undefined;
     let disposed = false;
+    if (!isTauri()) return;
     void initializeActivationEvents().then(cleanup => {
       if (disposed) cleanup();
       else stop = cleanup;

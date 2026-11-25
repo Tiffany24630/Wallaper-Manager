@@ -1,5 +1,6 @@
 import { accountService } from "./accountService";
 import { syncQueueService, type QueueItem } from "./syncQueueService";
+import { isTauri } from "./tauri";
 
 let started = false;
 let stopped = false;
@@ -13,6 +14,10 @@ const delay = (milliseconds: number) => new Promise<void>(resolve => {
 });
 
 async function processNext() {
+  if (!isTauri()) {
+    window.dispatchEvent(new CustomEvent("lumina:sync-error", { detail: "La sincronización de biblioteca requiere la aplicación Electron/Tauri; la cuenta web sí puede administrar la sesión y los dispositivos." }));
+    return false;
+  }
   if (processing || !accountService.hasSession()) return false;
   let items: QueueItem[];
   try { items = await syncQueueService.list(); } catch (error) {

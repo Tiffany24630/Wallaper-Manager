@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
+import { isTauri } from "./tauri";
 
 export type QueueItem = { id: string; operationType: string; state: string; attempts: number; lastError?: string };
 export const syncQueueService = {
-  list: () => invoke<QueueItem[]>("list_sync_queue"),
-  enqueue: (operationType = "library_sync", entityId: string | null = null) => invoke<string>("enqueue_sync_operation", { operationType, entityId, revision: null }),
+  list: () => isTauri() ? invoke<QueueItem[]>("list_sync_queue") : Promise.resolve<QueueItem[]>([]),
+  enqueue: (operationType = "library_sync", entityId: string | null = null) => isTauri() ? invoke<string>("enqueue_sync_operation", { operationType, entityId, revision: null }) : Promise.resolve(`web-${Date.now()}`),
   claim: (id: string) => invoke<boolean>("claim_sync_operation", { id }),
   finish: (id: string, success: boolean, error?: string) => invoke("finish_sync_operation", { id, success, error: error?.slice(0, 500) }),
   retry: (id: string) => invoke("retry_sync_operation", { id }),
