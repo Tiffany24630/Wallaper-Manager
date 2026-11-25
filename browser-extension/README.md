@@ -12,3 +12,5 @@ Extensión independiente para Chrome, Edge y otros navegadores compatibles con M
 6. Usa el botón de la extensión para activar o desactivar la protección.
 
 La lista incluida bloquea algunos dominios conocidos de anuncios y analítica. No pretende sustituir EasyList, uBlock Origin ni una auditoría de cada página. Debe ampliarse y probarse antes de distribuirse públicamente.
+
+Desde el popup también puedes escribir un dominio personalizado, bloquearlo y quitarlo después. La regla se guarda en el almacenamiento local de la extensión y se aplica con `declarativeNetRequest`.

@@ -3,7 +3,7 @@
   "name": "Lumina Privacy Tools",
   "version": "0.1.0",
   "description": "Bloqueo básico y configurable de dominios publicitarios y rastreadores.",
-  "permissions": ["storage", "declarativeNetRequestWithHostAccess"],
+  "permissions": ["storage", "declarativeNetRequest", "declarativeNetRequestWithHostAccess"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_title": "Lumina Privacy Tools",

@@ -4,6 +4,7 @@ import { wallpaperService } from "./wallpaperService";
 import { cursorService } from "./cursorService";
 import { playlistService } from "./playlistService";
 import { isTauri } from "./tauri";
+import { webStorage } from "./webStorage";
 
 const apiKey = "lumina.account.apiUrl";
 const deviceKey = "lumina.account.deviceId";
@@ -93,6 +94,7 @@ export const accountService = {
   recordConflictError: (id: string, kind: SyncConflict["kind"], error: string) => invoke("record_sync_conflict_error", { id, kind, error: error.slice(0, 500) }),
   acceptRemoteConflict: async (conflict: SyncConflict, file: SyncResponse["files"][number]) => { try { return await invoke("accept_remote_sync_conflict", { conflictId: conflict.id, kind: conflict.kind, fileId: file.id, apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey) || "", expectedHash: file.sha256, extension: file.extension || "", remoteRevision: conflict.remoteRevision }); } catch (error) { await invoke("record_sync_conflict_error", { id: conflict.id, kind: conflict.kind, error: String(error).slice(0, 500) }).catch(() => undefined); throw error; } },
   syncLibrary: async () => {
+    if (!isTauri()) return accountService.syncWebLibrary();
     const wallpapers = await wallpaperService.getAll(); const cursors = await cursorService.list(); const playlists = await playlistService.getAll();
     const remote = await accountService.sync(); const key = (kind: string, id: string) => `${kind}:${id}`; const revisions = new Map(remote.records.map(record => [key(record.kind, record.record_id), record.revision]));
     const states = await invoke<PlaylistSyncState[]>("list_sync_playlist_states");
@@ -149,6 +151,40 @@ export const accountService = {
     }
     return { ...result, uploaded, errors: [...errors, ...conflicts.map(conflict => `Conflicto de ${conflict.kind}: ${conflict.id}`)] };
   },
+  syncWebLibrary: async () => {
+    if (!accountService.hasSession()) throw new Error("Inicia sesión para sincronizar la biblioteca");
+    if (!localStorage.getItem(deviceKey)) await accountService.registerDevice("Lumina Web");
+    const wallpapers = await webStorage.list();
+    const playlists = await playlistService.getAll();
+    const remote = await accountService.sync();
+    const key = (kind: string, id: string) => `${kind}:${id}`;
+    const revisions = new Map(remote.records.map(record => [key(record.kind, record.record_id), record.revision]));
+    const playlistPayloads = new Map<string, Record<string, unknown>>();
+    for (const playlist of playlists) playlistPayloads.set(playlist.id, { name: playlist.name, wallpaper_ids: await playlistService.getPlaylistWallpapers(playlist.id) });
+    const changes = wallpapers.map(wallpaper => ({
+      id: wallpaper.id,
+      kind: "wallpaper",
+      base_revision: revisions.get(key("wallpaper", wallpaper.id)) ?? 0,
+      payload: { name: wallpaper.name, hash: wallpaper.hash ?? null, size_bytes: wallpaper.sizeBytes ?? null, width: wallpaper.width ?? null, height: wallpaper.height ?? null, file_type: wallpaper.fileType ?? null, favorite: wallpaper.favorite, tags: wallpaper.tags ?? [], folder: wallpaper.folder ?? null },
+    }));
+    const playlistChanges = playlists.map(playlist => ({ id: playlist.id, kind: "playlist", base_revision: revisions.get(key("playlist", playlist.id)) ?? 0, payload: playlistPayloads.get(playlist.id) }));
+    const result = await accountService.sync([...changes, ...playlistChanges]);
+    const conflicts = result.conflicts as SyncConflictResponse[];
+    const conflictKeys = new Set(conflicts.map(conflict => key(conflict.kind, conflict.id)));
+    const uploaded: string[] = [];
+    const errors: string[] = [];
+    for (const wallpaper of wallpapers) {
+      if (conflictKeys.has(key("wallpaper", wallpaper.id))) continue;
+      if (result.files.some(file => file.record_id === wallpaper.id && file.sha256 === (wallpaper.hash ?? ""))) continue;
+      try {
+        const blob = await webStorage.getBlob(wallpaper.id);
+        if (!blob) throw new Error("No se encontró el archivo local");
+        await accountService.uploadFile(blob, wallpaper.name, wallpaper.id, "wallpaper", mimeFor(wallpaper.fileType, wallpaper.path));
+        uploaded.push(wallpaper.id);
+      } catch (error) { errors.push(`${wallpaper.name}: ${String(error)}`); }
+    }
+    return { ...result, uploaded, errors: [...errors, ...conflicts.map(conflict => `Conflicto de ${conflict.kind}: ${conflict.id}`)] };
+  },
   uploadFile: async (file: Blob, name: string, recordId: string, kind: "wallpaper" | "cursor", mime: string) => {
     const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", await file.arrayBuffer()))).map(value => value.toString(16).padStart(2, "0")).join("");
     const init = await request<{ upload_id: string; offset: number; chunk_size: number }>("/v1/files/upload/init", { method: "POST", body: JSON.stringify({ device_id: localStorage.getItem(deviceKey), record_id: recordId, kind, name, mime, size: file.size, sha256: hash }) });
@@ -156,8 +192,14 @@ export const accountService = {
     return request<{ file_id: string; sha256: string }>(`/v1/files/upload/${encodeURIComponent(init.upload_id)}/complete`, { method: "POST" });
   },
   downloadFile: async (fileId: string) => (await fileRequest(`/v1/files/${encodeURIComponent(fileId)}`)).blob(),
-  restoreWallpaper: async (fileId: string, recordId: string, name: string, extension: string, expectedHash: string) => invoke<string>("download_and_import_synced_resource", { apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey), fileId, kind: "wallpaper", name, extension, expectedHash, localId: recordId }),
-  restoreCursor: async (fileId: string, recordId: string, name: string, extension: string, expectedHash: string, hotspotX = 0, hotspotY = 0) => invoke<string>("download_and_import_synced_resource", { apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey), fileId, kind: "cursor", name, extension, expectedHash, hotspotX, hotspotY, localId: recordId }),
+  restoreWallpaper: async (fileId: string, recordId: string, name: string, extension: string, expectedHash: string) => {
+    if (!isTauri()) { const blob = await accountService.downloadFile(fileId); return webStorage.importFile(new File([blob], name, { type: mimeFor(extension, name) })); }
+    return invoke<string>("download_and_import_synced_resource", { apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey), fileId, kind: "wallpaper", name, extension, expectedHash, localId: recordId });
+  },
+  restoreCursor: async (fileId: string, recordId: string, name: string, extension: string, expectedHash: string, hotspotX = 0, hotspotY = 0) => {
+    if (!isTauri()) throw new Error("Los cursores del sistema solo se pueden restaurar en la aplicación de escritorio.");
+    return invoke<string>("download_and_import_synced_resource", { apiUrl: apiUrl(), deviceId: localStorage.getItem(deviceKey), fileId, kind: "cursor", name, extension, expectedHash, hotspotX, hotspotY, localId: recordId });
+  },
   revokeDevice: (id: string) => request(`/v1/devices/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };
 

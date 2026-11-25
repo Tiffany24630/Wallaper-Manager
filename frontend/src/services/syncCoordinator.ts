@@ -57,6 +57,10 @@ async function loop() {
 export const syncCoordinator = {
   start() { if (started) return; started = true; stopped = false; authHandler = () => wake?.(); window.addEventListener("lumina:auth-changed", authHandler); void loop(); },
   stop() { stopped = true; started = false; if (authHandler) window.removeEventListener("lumina:auth-changed", authHandler); authHandler = null; wake?.(); wake = null; },
-  async requestNow() { if (!accountService.hasSession()) throw new Error("Inicia sesión para sincronizar la biblioteca"); const id = await syncQueueService.enqueue(); wake?.(); window.dispatchEvent(new Event("lumina:sync-state")); return id; },
+  async requestNow() {
+    if (!accountService.hasSession()) throw new Error("Inicia sesión para sincronizar la biblioteca");
+    if (!isTauri()) { await accountService.syncWebLibrary(); return `web-${Date.now()}`; }
+    const id = await syncQueueService.enqueue(); wake?.(); window.dispatchEvent(new Event("lumina:sync-state")); return id;
+  },
   isProcessing: () => processing,
 };
