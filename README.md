@@ -127,4 +127,16 @@ npm run build
 
 Prueba `/health`, registro, login, vinculación, carga/descarga de un PNG y revocación. No publiques `DATABASE_URL`, tokens, keystores Android ni certificados de firma. La web usa `sessionStorage` para su token; Tauri usa el almacén seguro de Windows. Las funciones de disco, monitores, cursores y Real-ESRGAN son nativas y no se simulan en Vercel.
 
+## Extensión de privacidad del navegador
+
+La web no puede bloquear anuncios en otras pestañas. Para esa capacidad se añadió `browser-extension/`, una extensión Manifest V3 independiente para Chrome, Edge y navegadores compatibles.
+
+1. Abre `chrome://extensions` o `edge://extensions`.
+2. Activa **Developer mode / Modo desarrollador**.
+3. Pulsa **Load unpacked / Cargar descomprimida**.
+4. Selecciona la carpeta `browser-extension`.
+5. Fija `Lumina Privacy Tools` y usa su interruptor.
+
+La lista inicial bloquea dominios publicitarios y de analítica conocidos. Antes de distribuirla públicamente hay que ampliar las listas, probar falsos positivos y preparar las políticas de privacidad y permisos de la tienda.
+
 Las preferencias de inicio automático, bandeja y ahorro contextual se almacenan para una futura integración residente. La interfaz las identifica como preferencias y no simula que ya estén activas.

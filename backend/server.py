@@ -25,6 +25,7 @@ except ImportError:  # SQLite remains available for local development and tests.
 TOKEN_TTL = 60 * 60 * 24 * 30
 MAX_BODY = 2 * 1024 * 1024
 MAX_FILE_SIZE = int(os.environ.get("LUMINA_MAX_FILE_BYTES", str(100 * 1024 * 1024)))
+MAX_USER_STORAGE = int(os.environ.get("LUMINA_MAX_USER_BYTES", "0"))
 CHUNK_SIZE = 1024 * 1024
 ALLOWED_FILES = {
     "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/bmp": ".bmp",
@@ -916,6 +917,11 @@ class Api(BaseHTTPRequestHandler):
             raise ValueError("Identidad del archivo no vÃ¡lida")
         if mime not in ALLOWED_FILES or not isinstance(size, int) or size <= 0 or size > MAX_FILE_SIZE or len(sha256) != 64:
             raise ValueError("Tipo, tamaÃ±o o hash de archivo no vÃ¡lido")
+        if MAX_USER_STORAGE > 0:
+            used = self.server.store.conn.execute("SELECT COALESCE(SUM(size_bytes),0) AS used FROM files WHERE user_id=?", (user["id"],)).fetchone()["used"]
+            pending = self.server.store.conn.execute("SELECT COALESCE(SUM(expected_size),0) AS pending FROM upload_sessions WHERE user_id=? AND status IN ('uploading','prepared')", (user["id"],)).fetchone()["pending"]
+            if int(used or 0) + int(pending or 0) + size > MAX_USER_STORAGE:
+                return self.json(413, {"error": "La cuota de almacenamiento de la cuenta fue alcanzada"})
         try:
             int(sha256, 16)
         except ValueError:
