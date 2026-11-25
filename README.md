@@ -102,8 +102,8 @@ El plan Free sirve para probar la API y sincronizar metadatos, pero no garantiza
 ### Vercel
 
 1. **Add New > Project** e importa el repositorio.
-2. **Framework Preset:** `Vite`; **Root Directory:** `.`.
-3. **Build Command:** `npm run typecheck && npm run build`; **Output Directory:** `frontend/dist`; **Install Command:** `npm ci --prefix frontend` (ya están en `vercel.json`).
+2. **Framework Preset:** `Vite`; **Root Directory:** `frontend`.
+3. **Build Command:** `npm run typecheck && npm run build`; **Output Directory:** `dist`; **Install Command:** `npm ci` (la configuración está en `frontend/vercel.json`).
 4. **Environment Variables:** `VITE_LUMINA_API_URL` = `https://TU-SERVICIO.onrender.com` para Production, Preview y Development.
 5. Pulsa **Deploy** y actualiza `LUMINA_API_ALLOWED_ORIGINS` en Render con el dominio Vercel definitivo.
 
