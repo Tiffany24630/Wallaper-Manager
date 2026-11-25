@@ -22,6 +22,7 @@ interface WallpaperState {
   importWallpaper: (path: string) => Promise<string>;
   selectAndImportWallpaper: () => Promise<string | null>;
   selectWallpaperFiles: () => Promise<string[]>;
+  importBrowserFiles: (files: File[]) => Promise<string[]>;
   importWallpapers: (paths: string[], onProgress?: (current: number, total: number) => void) => Promise<{ imported: string[]; failed: string[] }>;
   deleteWallpaper: (id: string) => Promise<void>;
   renameWallpaper: (id: string, name: string) => Promise<void>;
@@ -159,6 +160,12 @@ export const useWallpaperStore =
     },
 
     selectWallpaperFiles: () => wallpaperService.selectWallpaperFiles(),
+
+    importBrowserFiles: async (files) => {
+      const imported = await wallpaperService.importBrowserFiles(files);
+      await fetchLatest();
+      return imported;
+    },
 
     importWallpapers: async (paths, onProgress) => {
       const imported: string[] = [];

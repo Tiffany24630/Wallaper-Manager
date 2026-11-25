@@ -90,6 +90,10 @@ export const wallpaperService = {
     });
     await notifyLocalChange("wallpaper_create", id); return id;
   },
+  async importBrowserFiles(files: File[]): Promise<string[]> {
+    if (isTauri()) throw new Error("La importación directa de archivos web solo está disponible en el navegador.");
+    return Promise.all(files.filter(file => file.type.startsWith("image/")).map(file => webStorage.importFile(file)));
+  },
 
   async deleteWallpaper(id: string): Promise<void> {
     if (!isTauri()) { await webStorage.delete(id); return; }
@@ -105,7 +109,7 @@ export const wallpaperService = {
   },
 
   async rotateWallpaperVersion(id: string, degrees: 0 | 90 | 180 | 270): Promise<void> {
-    if (!isTauri()) throw new Error("La rotación de imágenes en la web aún no está disponible; puedes descargar el fondo y rotarlo desde un editor.");
+    if (!isTauri()) { await webStorage.rotate(id, degrees); return; }
     await tauriInvoke("rotate_wallpaper_version", { wallpaperId: id, degrees }); await notifyLocalChange("wallpaper_update", id);
   },
 
