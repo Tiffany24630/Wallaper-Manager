@@ -1,4 +1,4 @@
-import { Download, Heart, MonitorUp, Pencil, RefreshCw, Trash2 } from "lucide-react";
+import { Download, Edit3, FolderEdit, Heart, MonitorUp, Pencil, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { Wallpaper } from "../../../types/wallpaper";
 import { formatBytes } from "../../../utils/format";
@@ -13,11 +13,13 @@ interface Props {
   onRename: (id: string) => void;
   onRotate: (id: string, degrees: 0 | 90 | 180 | 270) => void;
   onRegenerateThumbnail: (id: string) => void;
+  onOrganize?: (id: string) => void;
+  onEdit?: (id: string) => void;
   isActive?: boolean;
   busy?: boolean;
 }
 
-export default function WallpaperCard({ wallpaper, onActivate, onFavorite, onDelete, onRename, onRotate, onRegenerateThumbnail, isActive, busy }: Props) {
+export default function WallpaperCard({ wallpaper, onActivate, onFavorite, onDelete, onRename, onRotate, onRegenerateThumbnail, onOrganize, onEdit, isActive, busy }: Props) {
   const preview = wallpaperThumbnailSrc(wallpaper);
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   useEffect(() => setThumbnailFailed(false), [preview, wallpaper.hash]);
@@ -49,6 +51,8 @@ export default function WallpaperCard({ wallpaper, onActivate, onFavorite, onDel
             <Heart size={17} className={wallpaper.favorite ? "fill-rose-400 text-rose-400" : ""} />
           </button>
           {!isTauri() && <button className="btn w-11 px-0" aria-label="Descargar fondo" onClick={download} disabled={!thumbnailAvailable}><Download size={16}/></button>}
+          {!isTauri() && onOrganize && <button className="btn w-11 px-0" aria-label="Organizar fondo" onClick={() => onOrganize(wallpaper.id)}><FolderEdit size={16}/></button>}
+          {!isTauri() && onEdit && <button className="btn w-11 px-0" aria-label="Editar fondo" onClick={() => onEdit(wallpaper.id)}><Edit3 size={16}/></button>}
           <button className="btn w-11 px-0" aria-label="Renombrar" onClick={() => onRename(wallpaper.id)} disabled={busy}><Pencil size={16}/></button>
           <label className="sr-only" htmlFor={`rotate-${wallpaper.id}`}>Rotar {wallpaper.name}</label>
           <select id={`rotate-${wallpaper.id}`} className="input max-w-[100px] px-2 text-xs" defaultValue="" disabled={busy || !assetAvailable} onChange={event => { const value = event.target.value; event.target.value = ""; if (value) onRotate(wallpaper.id, Number(value) as 0 | 90 | 180 | 270); }}>

@@ -22,6 +22,11 @@ except ImportError:  # SQLite remains available for local development and tests.
     psycopg = None
     dict_row = None
 
+try:
+    import boto3
+except ImportError:
+    boto3 = None
+
 TOKEN_TTL = 60 * 60 * 24 * 30
 MAX_BODY = 2 * 1024 * 1024
 MAX_FILE_SIZE = int(os.environ.get("LUMINA_MAX_FILE_BYTES", str(100 * 1024 * 1024)))
@@ -115,6 +120,41 @@ def valid_file(mime, header):
         "image/x-icon": header.startswith(b"\x00\x00\x02\x00"),
         "application/octet-stream": header.startswith(b"RIFF") and header[8:12] == b"ACON",
     }.get(mime, False)
+
+
+class ObjectStore:
+    """Optional S3-compatible persistence for Render Free and similar hosts."""
+    def __init__(self):
+        self.bucket = os.environ.get("LUMINA_S3_BUCKET", "").strip()
+        if not self.bucket:
+            self.client = None
+            return
+        if boto3 is None:
+            raise RuntimeError("LUMINA_S3_BUCKET requiere la dependencia boto3")
+        self.client = boto3.client(
+            "s3",
+            endpoint_url=os.environ.get("LUMINA_S3_ENDPOINT_URL") or None,
+            region_name=os.environ.get("LUMINA_S3_REGION", "auto"),
+            aws_access_key_id=os.environ.get("LUMINA_S3_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("LUMINA_S3_SECRET_ACCESS_KEY"),
+        )
+
+    @property
+    def enabled(self):
+        return self.client is not None
+
+    def put(self, path):
+        if self.enabled:
+            self.client.upload_file(str(path), self.bucket, path.name if path.parent.name == "files" else str(path))
+
+    def put_key(self, path, key):
+        if self.enabled:
+            self.client.upload_file(str(path), self.bucket, key)
+
+    def get(self, key):
+        if not self.enabled:
+            return None
+        return self.client.get_object(Bucket=self.bucket, Key=key)["Body"]
 
 
 class _PostgresConnection:
@@ -582,7 +622,13 @@ class Api(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
         if path == "/health":
-            return self.json(200, {"ok": True, "service": "lumina-api"})
+            try:
+                self.server.store.conn.execute("SELECT 1").fetchone()
+                database = "ready"
+            except Exception:
+                database = "error"
+            ready = database == "ready"
+            return self.json(200 if ready else 503, {"ok": ready, "service": "lumina-api", "database": database, "object_storage": "configured" if getattr(self.server, "object_store", None) and self.server.object_store.enabled else "local-ephemeral"})
         if path.startswith("/v1/files/") and not getattr(self.server, "allow_transfer_attempt", lambda address: True)(self.client_address[0]):
             return self.json(429, {"error": "Demasiadas transferencias; inténtalo más tarde"})
         user = self.auth()
@@ -1025,6 +1071,9 @@ class Api(BaseHTTPRequestHandler):
         file_id = secrets.token_hex(16); extension = ALLOWED_FILES[upload["mime"]]; relative = f"files/{user['id']}/{file_id}{extension}"; target = self.server.files_root / relative
         self.server.store.conn.execute("UPDATE upload_sessions SET status='publishing',final_file_id=?,final_storage_name=?,updated_at=? WHERE id=? AND status='uploading'", (file_id, relative, now(), upload_id)); self.server.store.conn.commit()
         target.parent.mkdir(parents=True, exist_ok=True); source.replace(target)
+        object_store = getattr(self.server, "object_store", None)
+        if object_store and object_store.enabled:
+            object_store.put_key(target, relative)
         try:
             self.server.store.conn.execute("BEGIN")
             failure_hook = getattr(self.server, "before_upload_persist", None)
@@ -1086,20 +1135,28 @@ class Api(BaseHTTPRequestHandler):
                 if not payload_hash or payload_hash != file["sha256"].lower():
                     return self.json(409, {"error": "El archivo no coincide con los metadatos de la revisión"})
                 target = (self.server.files_root / file["storage_name"]).resolve(); root = self.server.files_root.resolve()
-                if root not in target.parents or not target.is_file():
+                if root not in target.parents:
+                    return self.json(404, {"error": "Archivo no disponible"})
+                object_store = getattr(self.server, "object_store", None)
+                stream = target.open("rb") if target.is_file() else object_store.get(file["storage_name"]) if object_store else None
+                if stream is None:
                     return self.json(404, {"error": "Archivo no disponible"})
                 self.send_response(200); self.send_header("Content-Type", file["mime"]); self.send_header("Content-Length", str(file["size_bytes"])); self.send_header("X-Content-SHA256", file["sha256"]); self.cors_headers(self.request_origin()); self.end_headers()
-                with target.open("rb") as stream:
+                with stream:
                     while chunk := stream.read(CHUNK_SIZE): self.wfile.write(chunk)
             return
         file = self.server.store.conn.execute("SELECT * FROM files WHERE id=? AND user_id=?", (file_id, user["id"])).fetchone()
         if not file:
             return self.json(404, {"error": "Archivo no encontrado"})
         target = (self.server.files_root / file["storage_name"]).resolve(); root = self.server.files_root.resolve()
-        if root not in target.parents or not target.is_file():
+        if root not in target.parents:
+            return self.json(404, {"error": "Archivo no disponible"})
+        object_store = getattr(self.server, "object_store", None)
+        stream = target.open("rb") if target.is_file() else object_store.get(file["storage_name"]) if object_store else None
+        if stream is None:
             return self.json(404, {"error": "Archivo no disponible"})
         self.send_response(200); self.send_header("Content-Type", file["mime"]); self.send_header("Content-Length", str(file["size_bytes"])); self.send_header("X-Content-SHA256", file["sha256"]); self.cors_headers(self.request_origin()); self.end_headers()
-        with target.open("rb") as stream:
+        with stream:
             while chunk := stream.read(CHUNK_SIZE): self.wfile.write(chunk)
 
 
@@ -1112,6 +1169,7 @@ def run(host, port, db, allowed_origins=None):
     server.store = Store(db)
     server.allowed_origins = configured_origins
     server.files_root = Path(os.environ.get("LUMINA_API_STORAGE", "lumina-files")).resolve()
+    server.object_store = ObjectStore()
     server.sync_lock = threading.RLock()
     server.upload_lock = threading.RLock()
     (server.files_root / "uploads").mkdir(parents=True, exist_ok=True)

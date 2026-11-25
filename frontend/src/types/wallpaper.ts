@@ -29,6 +29,8 @@ export interface Wallpaper {
   createdAt?: string;
   resourceType: WallpaperResourceType;
   parentWallpaperId?: string;
+  tags?: string[];
+  folder?: string;
   asset: WallpaperAsset;
   thumbnailAsset: WallpaperThumbnail;
 }

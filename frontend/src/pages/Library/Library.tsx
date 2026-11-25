@@ -5,12 +5,20 @@ import UpscaleComparisonDialog from "../../components/wallpaper/UpscaleCompariso
 import { monitorService } from "../../services/monitorService";
 import { useWallpaperStore } from "../../store/wallpaperStore";
 import type { Wallpaper } from "../../types/wallpaper";
+import { isTauri } from "../../services/tauri";
+import { wallpaperService } from "../../services/wallpaperService";
+import { webStorage } from "../../services/webStorage";
 
 export default function Library() {
   const store = useWallpaperStore();
   const [query, setQuery] = useState("");
   const [favorites, setFavorites] = useState(false);
   const [filter, setFilter] = useState<"all" | "available" | "missing" | "static" | "derived">("all");
+  const [tagFilter, setTagFilter] = useState("");
+  const [trash, setTrash] = useState<Wallpaper[]>([]);
+  const [showTrash, setShowTrash] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editValues, setEditValues] = useState({ brightness: 100, contrast: 100, saturation: 100 });
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [renameId, setRenameId] = useState<string | null>(null);
@@ -70,10 +78,10 @@ export default function Library() {
         || (filter === "missing" && !w.asset?.available)
         || (filter === "static" && w.resourceType === "static")
         || (filter === "derived" && Boolean(w.parentWallpaperId));
-      return matchesFilter && (!favorites || w.favorite)
+      return matchesFilter && (!favorites || w.favorite) && (!tagFilter || (w.tags ?? []).includes(tagFilter))
         && w.name.normalize("NFKC").toLocaleLowerCase().includes(normalizedQuery);
     });
-  }, [store.wallpapers, query, favorites, filter]);
+  }, [store.wallpapers, query, favorites, filter, tagFilter]);
 
   async function run(action: () => Promise<unknown>, success?: string) {
     setBusy(true); setMessage(null);
@@ -122,6 +130,12 @@ export default function Library() {
     }
   }
   const rotate = (id: string, degrees: 0 | 90 | 180 | 270) => void run(() => store.rotateWallpaperVersion(id, degrees), degrees === 0 ? "Se restauró la orientación original." : `Fondo rotado ${degrees}°.`);
+  const organize = (id: string) => { const item = store.wallpapers.find(wallpaper => wallpaper.id === id); if (!item) return; const tags = window.prompt("Etiquetas separadas por comas", (item.tags ?? []).join(", ")); if (tags === null) return; const folder = window.prompt("Carpeta", item.folder ?? ""); if (folder === null) return; void run(() => wallpaperService.organize(id, tags.split(","), folder), "Organización guardada."); };
+  const toggleTrash = () => { if (isTauri()) return; if (!showTrash) void webStorage.trash().then(setTrash); setShowTrash(value => !value); };
+  const exportOrganization = async () => { const blob = new Blob([await webStorage.exportMetadata()], { type: "application/json" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = "lumina-organizacion.json"; link.click(); URL.revokeObjectURL(url); setMessage("Organización exportada."); };
+  const importOrganization = async (file: File) => { try { const changed = await webStorage.importMetadata(await file.text()); await store.loadWallpapers(); setMessage(`${changed} fondos actualizados desde el respaldo.`); } catch (error) { setMessage(`No se pudo importar el respaldo: ${String(error)}`); } };
+  const editWallpaper = (id: string) => { setEditId(id); setEditValues({ brightness: 100, contrast: 100, saturation: 100 }); };
+  const saveEdit = () => { if (!editId) return; void run(() => wallpaperService.adjust(editId, editValues), "Ajustes aplicados.").then(() => setEditId(null)); };
 
   async function importAndOfferEnhancement() {
     setBusy(true); setMessage(null);
@@ -164,7 +178,7 @@ export default function Library() {
   const original = comparison && store.wallpapers.find(w => w.id === comparison.originalId);
   const enhanced = comparison && store.wallpapers.find(w => w.id === comparison.enhancedId);
 
-  return <div className="page">
+  return <div className="page" onDragOver={event => { if (!isTauri()) event.preventDefault(); }} onDrop={event => { if (isTauri()) return; event.preventDefault(); const files = Array.from(event.dataTransfer.files); if (files.length) void run(async () => { await store.importBrowserFiles(files); }, `${files.length} archivo${files.length === 1 ? "" : "s"} importado${files.length === 1 ? "" : "s"}.`); }}>
     <header className="page-header">
       <div><div className="eyebrow">Colección local</div><h1 className="page-title">Biblioteca</h1><p className="page-subtitle">Importa una o varias imágenes, marca favoritas y aplica un fondo a Windows.</p></div>
       <div className="flex flex-wrap items-center gap-2">
@@ -178,16 +192,23 @@ export default function Library() {
       </div>
     </header>
     {(store.error || monitorError || message) && <div className={store.error || monitorError || message?.startsWith("Error:") ? "status-error" : "status-success"}>{store.error || monitorError || message}</div>}
+    {!isTauri() && <div className="mb-4 rounded-xl border border-dashed border-violet-400/40 bg-violet-500/[.05] p-4 text-center text-sm muted">Arrastra imágenes aquí para importarlas directamente en la biblioteca web.</div>}
     <div className="panel flex flex-wrap items-center gap-3 p-3">
       <label className="relative min-w-[220px] flex-1"><Search size={16} className="absolute left-3 top-3.5 text-slate-500"/><input className="input pl-10" value={query} onChange={e => setQuery(e.target.value)} placeholder="Buscar por nombre…" /></label>
       <button className={`btn ${favorites ? "bg-rose-500/15 text-rose-200" : ""}`} onClick={() => setFavorites(v => !v)}>Favoritos {favorites ? "activados" : ""}</button>
       <select className="input max-w-[190px]" value={filter} onChange={event => setFilter(event.target.value as typeof filter)} aria-label="Filtrar biblioteca">
         <option value="all">Todos</option><option value="available">Disponibles localmente</option><option value="missing">Archivos faltantes</option><option value="static">Estáticos</option><option value="derived">Derivados</option>
       </select>
+      {!isTauri() && <select className="input max-w-[190px]" value={tagFilter} onChange={event => setTagFilter(event.target.value)} aria-label="Filtrar por etiqueta"><option value="">Todas las etiquetas</option>{Array.from(new Set(store.wallpapers.flatMap(wallpaper => wallpaper.tags ?? []))).sort().map(tag => <option key={tag} value={tag}>{tag}</option>)}</select>}
+      {!isTauri() && <button className="btn" onClick={toggleTrash}>Papelera</button>}
+      {!isTauri() && <button className="btn" onClick={() => void exportOrganization()}>Exportar organización</button>}
+      {!isTauri() && <label className="btn cursor-pointer">Importar organización<input className="hidden" type="file" accept="application/json" onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importOrganization(file); }}/></label>}
       <span className="px-2 text-sm muted">{visible.length} de {store.wallpapers.length}</span>
     </div>
+    {showTrash && <section className="panel mt-5 p-4"><h2 className="font-semibold">Papelera local</h2><p className="mt-1 text-sm muted">Los fondos eliminados se pueden restaurar desde este navegador.</p>{trash.length === 0 ? <div className="mt-3 text-sm muted">La papelera está vacía.</div> : <div className="mt-3 grid gap-2">{trash.map(item => <div key={item.id} className="flex items-center justify-between rounded-lg border border-white/10 p-2 text-sm"><span className="truncate">{item.name}</span><button className="text-cyan-300" onClick={() => void webStorage.restore(item.id).then(() => webStorage.trash()).then(setTrash).then(() => store.loadWallpapers())}>Restaurar</button></div>)}</div>}</section>}
+    {editId && <section className="panel mt-5 p-4"><div className="flex items-center justify-between"><div><h2 className="font-semibold">Editor del navegador</h2><p className="text-sm muted">Los ajustes se aplican localmente mediante Canvas.</p></div><button className="text-sm muted" onClick={() => setEditId(null)}>Cancelar</button></div><div className="mt-4 grid gap-4 md:grid-cols-3">{(["brightness", "contrast", "saturation"] as const).map(key => <label key={key} className="text-sm capitalize">{key === "brightness" ? "Brillo" : key === "contrast" ? "Contraste" : "Saturación"}: {editValues[key]}%<input className="mt-2 w-full" type="range" min="0" max="200" value={editValues[key]} onChange={event => setEditValues(current => ({ ...current, [key]: Number(event.target.value) }))}/></label>)}</div><button className="btn btn-primary mt-4" onClick={saveEdit} disabled={busy}>Guardar ajustes</button></section>}
     {store.loading ? <div className="empty">Cargando biblioteca…</div> : store.error ? <div className="empty">No se pudo cargar la biblioteca. Revisa el error anterior y vuelve a intentarlo.</div> : visible.length === 0 ? <div className="empty"><ImagePlus className="mx-auto mb-3"/> {store.wallpapers.length ? "No hay coincidencias." : "Todavía no hay fondos. Importa tu primera imagen para comenzar."}</div> :
-      <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{visible.map(w => <WallpaperCard key={w.id} wallpaper={w} isActive={monitorWallpapers.some(item => item.monitorId === monitorId && item.wallpaperId === w.id)} busy={busy} onActivate={id => void run(async () => { if (!monitorId) throw new Error("Selecciona un monitor de destino antes de aplicar el fondo."); const state = await store.setActive(id, monitorId); setMonitorWallpapers(await monitorService.getWallpapers()); setMessage(state === "pending" ? "Animated en carga; la aplicación física y su visibilidad aún no están confirmadas." : "Fondo aplicado."); })} onFavorite={id => void run(() => store.toggleFavorite(id))} onDelete={remove} onRename={beginRename} onRotate={rotate} onRegenerateThumbnail={id => void run(() => store.regenerateThumbnail(id), "Miniatura regenerada.")}/>)}</section>}
+      <section className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{visible.map(w => <WallpaperCard key={w.id} wallpaper={w} isActive={monitorWallpapers.some(item => item.monitorId === monitorId && item.wallpaperId === w.id)} busy={busy} onActivate={id => void run(async () => { if (!monitorId) throw new Error("Selecciona un monitor de destino antes de aplicar el fondo."); const state = await store.setActive(id, monitorId); setMonitorWallpapers(await monitorService.getWallpapers()); setMessage(state === "pending" ? "Animated en carga; la aplicación física y su visibilidad aún no están confirmadas." : "Fondo aplicado."); })} onFavorite={id => void run(() => store.toggleFavorite(id))} onDelete={remove} onRename={beginRename} onRotate={rotate} onOrganize={organize} onEdit={editWallpaper} onRegenerateThumbnail={id => void run(() => store.regenerateThumbnail(id), "Miniatura regenerada.")}/>)}</section>}
     {renameId && <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="rename-title"><div className="modal-card max-w-lg"><h2 id="rename-title" className="text-xl font-semibold">Renombrar fondo</h2><p className="mt-1 text-sm muted">El nombre visible cambiará en toda la biblioteca, sin mover el archivo.</p><input className="input mt-5" autoFocus value={renameValue} onChange={event => setRenameValue(event.target.value)} maxLength={200} onKeyDown={event => { if (event.key === "Enter") void confirmRename(); if (event.key === "Escape") setRenameId(null); }}/><div className="mt-5 flex justify-end gap-2"><button className="btn" onClick={() => setRenameId(null)} disabled={busy}>Cancelar</button><button className="btn btn-primary" onClick={() => void confirmRename()} disabled={busy}>Guardar</button></div></div></div>}
     {deleteTarget && <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="delete-title" onClick={event => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}><div className="modal-card max-w-lg"><h2 id="delete-title" className="text-xl font-semibold">Eliminar wallpaper</h2><p className="mt-2 text-sm muted">¿Quieres eliminar <strong className="text-slate-200">{deleteTarget.name}</strong> de la biblioteca?</p><p className="mt-2 text-sm muted">Se eliminarán el registro y los archivos administrados por Lumina. Esta acción no se puede deshacer.</p><div className="mt-5 flex justify-end gap-2"><button className="btn" onClick={() => setDeleteTarget(null)} disabled={busy}>Cancelar</button><button className="btn btn-danger" onClick={() => void confirmDelete()} disabled={busy}>{busy ? "Eliminando…" : "Eliminar"}</button></div></div></div>}
     {original && enhanced && <UpscaleComparisonDialog original={original} enhanced={enhanced} busy={busy} onChoose={choice => void chooseVersion(choice)}/>}

@@ -102,6 +102,14 @@ export const wallpaperService = {
     });
     await notifyLocalChange("wallpaper_delete", id);
   },
+  async organize(id: string, tags: string[], folder: string): Promise<void> {
+    if (!isTauri()) { await webStorage.organize(id, tags, folder); return; }
+    throw new Error("La organización avanzada se administra desde la biblioteca local de Tauri en una próxima actualización.");
+  },
+  async adjust(id: string, values: { brightness: number; contrast: number; saturation: number }): Promise<void> {
+    if (!isTauri()) { await webStorage.adjust(id, values); return; }
+    throw new Error("El editor web no está disponible dentro de Tauri.");
+  },
 
   async renameWallpaper(id: string, name: string): Promise<void> {
     if (!isTauri()) { const normalized = name.trim(); if (!normalized) throw new Error("El nombre no puede estar vacío."); await webStorage.update(id, { name: normalized }); return; }
