@@ -99,6 +99,8 @@ En **Environment Variables** agrega `DATABASE_URL` = cadena pooled de Neon; `LUM
 
 El plan Free sirve para probar la API y sincronizar metadatos, pero no garantiza la conservación de imágenes, cursores u otros archivos después de reinicios o despliegues. Para persistencia gratuita de archivos hace falta añadir posteriormente un almacenamiento de objetos externo; Neon no debe usarse como almacén de blobs grandes.
 
+Para persistir archivos sin disco de Render puedes configurar cualquier almacenamiento S3-compatible. En Render agrega `LUMINA_S3_BUCKET`, `LUMINA_S3_ENDPOINT_URL`, `LUMINA_S3_REGION`, `LUMINA_S3_ACCESS_KEY_ID` y `LUMINA_S3_SECRET_ACCESS_KEY`. Para Cloudflare R2, `LUMINA_S3_ENDPOINT_URL` es `https://ACCOUNT_ID.r2.cloudflarestorage.com` y la región es `auto`. El backend sube cada archivo al bucket y, si el archivo local ya no existe después de un reinicio, lo sirve desde el bucket.
+
 ### Vercel
 
 1. **Add New > Project** e importa el repositorio.

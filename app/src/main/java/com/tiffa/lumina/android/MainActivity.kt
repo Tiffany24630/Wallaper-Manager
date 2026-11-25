@@ -1,11 +1,13 @@
 package com.tiffa.lumina.android
 
 import android.graphics.Color
+import android.app.WallpaperManager
 import android.content.Intent
 import android.os.Bundle
 import android.widget.*
 import java.io.File
 import java.io.IOException
+import java.io.FileInputStream
 
 class MainActivity : android.app.Activity() {
     private lateinit var repository: LuminaRepository
@@ -80,7 +82,16 @@ class MainActivity : android.app.Activity() {
         box.addView(TextView(this).apply { text = "${record.kind} · ${record.id} · revisión ${record.revision}"; textSize = 16f })
         box.addView(TextView(this).apply { text = "${record.payload.optString("name", "Sin nombre")}${file?.let { " · ${it.size} bytes · ${it.sha256.take(12)}…" } ?: " · archivo no disponible"}" })
         file?.let { resource -> box.addView(Button(this).apply { text = "Descargar en almacenamiento de Lumina"; setOnClickListener { status.text = "Descargando…"; repository.download(resource, record) { result -> runOnUiThread { result.fold({ status.text = "Recurso disponible localmente: ${it.name}" }, { if (it is ApiException && it.status in 401..403) showLogin(friendlyError(it)) else status.text = friendlyError(it) }) } } } }) }
+        file?.takeIf { record.kind == "wallpaper" }?.let { resource -> box.addView(Button(this).apply {
+            text = "Aplicar como fondo del telÃ©fono"
+            setOnClickListener { status.text = "Descargando y aplicando…"; repository.download(resource, record) { result -> runOnUiThread { result.fold({ applyWallpaper(it) }, { status.text = friendlyError(it) }) } } }
+        }) }
         root.addView(box)
+    }
+
+    private fun applyWallpaper(file: File) {
+        runCatching { WallpaperManager.getInstance(this).setStream(FileInputStream(file)) }
+            .fold({ status.text = "Fondo aplicado en Android." }, { status.text = "No se pudo aplicar el fondo: ${friendlyError(it)}" })
     }
 
     private fun showPlaylists() {
