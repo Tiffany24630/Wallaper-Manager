@@ -69,11 +69,12 @@ def parse_allowed_origins(value=None):
     if not origins:
         return set(DEFAULT_ALLOWED_ORIGINS)
     result = set()
-    for origin in origins:
+    for raw_origin in origins:
+        origin = raw_origin.rstrip("/")
         parsed = urlparse(origin)
-        if origin == "*" or parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.path or parsed.params or parsed.query or parsed.fragment:
+        if not origin or origin == "*" or parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.path or parsed.params or parsed.query or parsed.fragment:
             raise ValueError("Cada origen CORS debe ser una URL explícita sin comodines ni rutas")
-        result.add(origin.rstrip("/"))
+        result.add(origin)
     return result
 
 
