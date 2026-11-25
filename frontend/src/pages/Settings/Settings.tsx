@@ -10,6 +10,8 @@ import { animatedPrototypeService } from "../../services/animatedPrototypeServic
 import { monitorService } from "../../services/monitorService";
 import { settingsService, type DynamicConfigurationDiagnostic } from "../../services/settingsService";
 import type { Monitor } from "../../types/monitor";
+import { isTauri } from "../../services/tauri";
+import { webTools } from "../../services/webTools";
 
 const defaults: SettingsType = { launch_at_startup: false, minimize_to_tray: true, hardware_acceleration: true, pause_on_battery: false, pause_when_maximized: true, scaling_mode: "fill", accent_color: "violet", ui_scale: 100, dynamic_enabled: false, dynamic_playlist_id: null, dynamic_interval_minutes: 5, dynamic_current_wallpaper_id: null, dynamic_last_error: null, cursor_enabled: false, active_cursor_id: null };
 const dynamicIntervals = [1, 5, 10, 15, 30, 60, 120, 360, 720, 1440];
@@ -45,6 +47,7 @@ export default function Settings() {
   const [prototypeBusy, setPrototypeBusy] = useState(false);
   const [prototypeMediaPath, setPrototypeMediaPath] = useState<string | null>(null);
   const [prototypeStatus, setPrototypeStatus] = useState("Selecciona un archivo GIF para comenzar.");
+  const [webMessage, setWebMessage] = useState<string | null>(null);
   const [prototypeMonitors, setPrototypeMonitors] = useState<Monitor[]>([]);
   const [prototypeMonitorId, setPrototypeMonitorId] = useState("");
   const [playlists, setPlaylists] = useState<{ id: string; name: string }[]>([]);
@@ -197,6 +200,7 @@ export default function Settings() {
   return <div className="page">
     <header className="page-header"><div><div className="eyebrow">Preferencias locales</div><h1 className="page-title">Ajustes</h1><p className="page-subtitle">Configura el comportamiento que Lumina conservará entre sesiones.</p></div><button className="btn btn-primary" onClick={() => void save()} disabled={loading}><Save size={16}/> Guardar cambios</button></header>
     {(error || loadError || message) && <div className={error || loadError ? "status-error" : "status-success"}>{error || loadError || message}</div>}
+    {!isTauri() && <section className="panel panel-pad mb-5"><div className="mb-2 flex items-center gap-2"><ShieldCheck size={18} className="text-cyan-300"/><h2 className="font-semibold">Herramientas del navegador</h2></div><p className="text-sm leading-6 muted">La versión web puede administrar su propia biblioteca dentro del navegador, usar pantalla completa e instalarse como PWA. Por seguridad, una página no puede cambiar el fondo del escritorio, cursores globales, extensiones ni bloquear anuncios en otros sitios.</p><div className="mt-4 flex flex-wrap gap-3"><button className="btn btn-secondary" onClick={() => void webTools.fullscreen().then(() => setWebMessage("Pantalla completa alternada.")).catch(error => setWebMessage(String(error)))}>Pantalla completa</button><button className="btn btn-secondary" onClick={() => void webTools.notifications().then(permission => setWebMessage(`Permiso de notificaciones: ${permission}.`))}>Permitir notificaciones</button>{webTools.canInstall() && <button className="btn btn-primary" onClick={() => void webTools.install().then(installed => setWebMessage(installed ? "Lumina se instaló en el navegador." : "La instalación fue cancelada."))}>Instalar Lumina</button>}</div>{webMessage && <div className="mt-3 text-sm muted">{webMessage}</div>}<div className="mt-4 rounded-xl border border-white/10 bg-white/[.03] p-3 text-sm muted"><strong className="text-slate-200">Bloqueo de anuncios:</strong> una web no puede filtrar anuncios de otras páginas. Para eso se necesita una extensión WebExtensions independiente; Lumina puede ofrecer una configuración exportable de listas, pero no instalar ni controlar extensiones por sí misma.</div></section>}
     <div className="grid gap-5 lg:grid-cols-2">
       <section className="panel panel-pad"><div className="mb-2 flex items-center gap-2"><Settings2 size={18} className="text-violet-300"/><h2 className="font-semibold">Aplicación</h2></div>
         <Switch checked={draft.launch_at_startup} onChange={v => patch("launch_at_startup", v)} label="Ejecutar Lumina al iniciar Windows" description="Añade o elimina Lumina del inicio automático de tu usuario de Windows."/>

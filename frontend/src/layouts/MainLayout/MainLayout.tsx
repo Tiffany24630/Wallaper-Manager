@@ -4,11 +4,12 @@ import Sidebar from "../../components/common/Sidebar/Sidebar";
 import { useSettingsStore } from "../../store/settingsStore";
 import { syncCoordinator } from "../../services/syncCoordinator";
 import { accountService } from "../../services/accountService";
+import { isTauri } from "../../services/tauri";
 
 export default function MainLayout() {
   const { settings, loadSettings } = useSettingsStore();
   useEffect(() => { void loadSettings(); }, [loadSettings]);
-  useEffect(() => { void accountService.initialize().finally(() => syncCoordinator.start()); return () => syncCoordinator.stop(); }, []);
+  useEffect(() => { void accountService.initialize().finally(() => { if (isTauri()) syncCoordinator.start(); }); return () => syncCoordinator.stop(); }, []);
   useEffect(() => {
     const root = document.documentElement;
     root.dataset.accent = settings?.accent_color ?? "violet";

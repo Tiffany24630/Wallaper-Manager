@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import App from "./App";
 import "./styles/index.css";
 import { isTauri } from "./services/tauri";
+import { captureInstallPrompt } from "./services/webTools";
 
 const isSmoke = (window as Window & { __LUMINA_SMOKE__?: boolean }).__LUMINA_SMOKE__ === true;
 
@@ -13,6 +14,8 @@ if (isSmoke && isTauri()) {
     detail: null,
   }).catch(() => undefined);
 }
+
+if (!isTauri()) window.addEventListener("beforeinstallprompt", captureInstallPrompt);
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

@@ -1,0 +1,10 @@
+{
+  "name": "Lumina Wallpaper Manager",
+  "short_name": "Lumina",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0d13",
+  "theme_color": "#0b0d13",
+  "description": "Biblioteca de fondos y personalización segura dentro del navegador",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
